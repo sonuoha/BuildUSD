@@ -198,9 +198,37 @@ class PrototypesFromInstances:
 
     # ---------- derive prototype mesh from an occurrence using this repmap ----------
     def _derive_mesh_from_occurrence(self, repmap):
+        """
+        Derive a prototype mesh from an occurrence using this repmap.
+
+        Iterate all IFC products to find one that uses this repmap. Then, tessellate the
+        occurrence rep (LOCAL coords) and build the transform chain to unapply the repmap
+        transform. Return the derived prototype mesh in local coordinates.
+
+        Returns
+        -------
+        dict
+            A dictionary containing the derived prototype mesh in local coordinates.
+        """
+
         import numpy as np
 
         def _norm(v):
+            """
+            Normalize a 3-element vector v to have unit length.
+            
+            If the vector has zero length, return the original vector (to avoid NaNs).
+            
+            Parameters
+            ----------
+            v : numpy.ndarray
+                The vector to be normalized.
+
+            Returns
+            -------
+            numpy.ndarray
+                The normalized vector.
+            """
             n = np.linalg.norm(v); return v / n if n else v
 
         def axis2placement3d_to_matrix(ax):
