@@ -255,6 +255,17 @@ def axis2placement_to_matrix(place, length_to_m=1.0):
 
 
 def compose_object_placement(obj_placement, length_to_m=1.0):
+    """
+    Compose a 4x4 matrix from an IfcObjectPlacement by recursively combining
+    relative placements and their parents.
+
+    Args:
+        obj_placement (IfcObjectPlacement): The object placement to compose.
+        length_to_m (float): The conversion factor from IFC length units to meters.
+
+    Returns:
+        Gf.Matrix4d: The composed 4x4 matrix representing the object placement in world coordinates.
+    """
     if obj_placement is None:
         return Gf.Matrix4d(1)
     local = axis2placement_to_matrix(getattr(obj_placement, "RelativePlacement", None), length_to_m)
@@ -262,16 +273,8 @@ def compose_object_placement(obj_placement, length_to_m=1.0):
     return parent * local
 
 
-def debug_dump_contexts(ifc):
-    for ctx in ifc.by_type("IfcGeometricRepresentationContext") or []:
-        ident = getattr(ctx, "ContextIdentifier", None)
-        ctype = getattr(ctx, "ContextType", None)
-        dim   = getattr(ctx, "CoordinateSpaceDimension", None)
-        ops   = getattr(ctx, "HasCoordinateOperation", None) or []
-        print(f"  • GRC id={ctx.id():<6} type={ctype} ident={ident} dim={dim} ops={len(ops)}")
 
-
-def find_map_conversion_strict(ifc):
+def find_map_conversion_strict(ifc): 
     """Prefer IfcMapConversion from 3D 'Model' context. Fallback to first."""
     best = None
     for ctx in ifc.by_type("IfcGeometricRepresentationContext") or []:
@@ -325,7 +328,16 @@ def map_to_local_XY(ENH, map_conv):
 
 
 def ifc_compound_to_degrees(comp):
-    """IfcSite RefLatitude/RefLongitude: [deg,min,sec,μas] → decimal degrees."""
+    """
+    IfcSite RefLatitude/RefLongitude: [deg,min,sec,μas] → decimal degrees.
+    Returns None if input is None or invalid.
+    
+    Args:
+        comp: IfcCompoundPlaneAngleMeasure (list/tuple of 1-4 numbers)
+    Returns:
+        Decimal degrees (float) or None.
+    
+    """
     if not comp:
         return None
     vals = list(comp)
