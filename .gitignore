@@ -1,4 +1,3 @@
-
 # Python-generated files
 __pycache__/
 src/utils/__pycache__
@@ -14,9 +13,8 @@ wheels/
 
 # Local Development files
 src\dev\*.py
-ifc_to_usd_prototype_iter.py
-ifc_to_usd_standard_local.py
-ifc_to_usd_standard_master.py
+src\dev\__pycache__\*.pyc
+src\dev\__pycache__\*.pyo
 
 # Ignore heavy BIM sample files
 /data/input/rvt/
