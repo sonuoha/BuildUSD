@@ -1,0 +1,25 @@
+
+# Python-generated files
+__pycache__/
+src/utils/__pycache__
+src/__pycache
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local Development files
+src\dev\*.py
+ifc_to_usd_prototype_iter.py
+ifc_to_usd_standard_local.py
+ifc_to_usd_standard_master.py
+
+# Ignore heavy BIM sample files
+/data/input/rvt/
+/data/input/*.rvt
+/data/input/*.usda
+/data/input/*.ifc
