@@ -5,9 +5,9 @@ import numpy as np
 import ifcopenshell
 from pxr import Gf
 
-from typing import Dict, Optional, Union, Literal
-from dataclasses import dataclass
-from collections import defaultdict
+import re
+from typing import Dict, Optional, Union, Literal, List, Tuple, Any
+from dataclasses import dataclass, field
 import hashlib
 
 
@@ -34,7 +34,12 @@ def _is_identity16(mat16, atol=1e-10):
 class MeshProto:
     repmap_id: int
     type_name: Optional[str] = None
+    type_class: Optional[str] = None
+    type_guid: Optional[str] = None
+    repmap_index: Optional[int] = None
     mesh: Optional[dict] = None
+    materials: List[Any] = field(default_factory=list)
+    material_ids: List[int] = field(default_factory=list)
     count: int = 0
 
 @dataclass
@@ -42,6 +47,8 @@ class HashProto:
     digest: str
     name: Optional[str] = None
     mesh: Optional[dict] = None
+    materials: List[Any] = field(default_factory=list)
+    material_ids: List[int] = field(default_factory=list)
     count: int = 0
 
 @dataclass(frozen=True)
@@ -55,6 +62,29 @@ class PrototypeCaches:
     repmap_counts: Counter
     hashes: Dict[str, HashProto]
     step_keys: Dict[int, PrototypeKey]
+    instances: Dict[int, "InstanceRecord"]
+
+
+@dataclass
+class InstanceRecord:
+    step_id: int
+    product_id: Optional[int]
+    prototype: PrototypeKey
+    name: str
+    transform: Optional[Tuple[float, ...]]
+    material_ids: List[int] = field(default_factory=list)
+    materials: List[Any] = field(default_factory=list)
+    attributes: Dict[str, Any] = field(default_factory=dict)
+
+def sanitize_name(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
+    base = str(raw_name or fallback or "Unnamed")
+    name = re.sub(r"[^A-Za-z0-9_]", "_", base)
+    name = re.sub(r"_+", "_", name).strip("_")
+    if not name:
+        name = "Unnamed"
+    if name[0].isdigit():
+        name = "_" + name
+    return name[:63]
 
 # 2. ---------------------------- IFC Geometry Utilities ----------------------------
 
@@ -111,6 +141,139 @@ def get_type_name(prod):
         nm = getattr(t, "Name", None) or getattr(t, "ElementType", None)
         if nm: return nm
     return getattr(prod, "Name", None) or prod.is_a()
+
+
+def _ifc_value_to_python(value):
+    if value is None:
+        return None
+    if hasattr(value, 'wrappedValue'):
+        return _ifc_value_to_python(value.wrappedValue)
+    if hasattr(value, 'ValueComponent'):
+        return _ifc_value_to_python(value.ValueComponent)
+    if isinstance(value, (list, tuple)):
+        return [_ifc_value_to_python(v) for v in value]
+    if isinstance(value, (int, float, bool, str)):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def _extract_property_value(prop):
+    if prop is None:
+        return None
+    try:
+        if prop.is_a('IfcPropertySingleValue'):
+            return _ifc_value_to_python(getattr(prop, 'NominalValue', None))
+        if prop.is_a('IfcPropertyEnumeratedValue'):
+            vals = getattr(prop, 'EnumerationValues', None) or []
+            return [_ifc_value_to_python(v) for v in vals]
+        if prop.is_a('IfcPropertyListValue'):
+            vals = getattr(prop, 'ListValues', None) or []
+            return [_ifc_value_to_python(v) for v in vals]
+        if prop.is_a('IfcPropertyReferenceValue'):
+            ref = getattr(prop, 'PropertyReference', None)
+            if ref is not None:
+                return getattr(ref, 'Name', None) or getattr(ref, 'Description', None) or str(ref)
+        if prop.is_a('IfcComplexProperty'):
+            nested = {}
+            for sub in getattr(prop, 'HasProperties', None) or []:
+                val = _extract_property_value(sub)
+                nested[sub.Name] = val
+            return nested
+    except Exception:
+        pass
+    for attr in ('NominalValue', 'LengthValue', 'AreaValue', 'VolumeValue', 'WeightValue', 'TimeValue', 'IntegerValue', 'RealValue', 'BooleanValue', 'LogicalValue', 'TextValue'):
+        if hasattr(prop, attr):
+            return _ifc_value_to_python(getattr(prop, attr))
+    return None
+
+
+def _extract_quantity_value(quantity):
+    if quantity is None:
+        return None
+    for attr in ('LengthValue', 'AreaValue', 'VolumeValue', 'CountValue', 'WeightValue', 'TimeValue', 'Value', 'NominalValue'):
+        if hasattr(quantity, attr):
+            return _ifc_value_to_python(getattr(quantity, attr))
+    for attr in ('Formula', 'Description'):
+        if hasattr(quantity, attr) and getattr(quantity, attr):
+            return getattr(quantity, attr)
+    return None
+
+
+def collect_instance_attributes(product) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    attrs: Dict[str, Dict[str, Dict[str, Any]]] = {'psets': {}, 'qtos': {}}
+
+    def merge(container: Dict[str, Dict[str, Any]], name: Optional[str], data: Dict[str, Any]):
+        if not data:
+            return
+        key = name or 'Unnamed'
+        entry = container.setdefault(key, {})
+        entry.update({k: v for k, v in data.items() if v is not None})
+
+    for rel in getattr(product, 'IsDefinedBy', []) or []:
+        definition = getattr(rel, 'RelatingPropertyDefinition', None)
+        if definition is None:
+            continue
+        if definition.is_a('IfcPropertySet'):
+            props = {}
+            for prop in getattr(definition, 'HasProperties', None) or []:
+                props[prop.Name] = _extract_property_value(prop)
+            merge(attrs['psets'], getattr(definition, 'Name', None), props)
+        elif definition.is_a('IfcElementQuantity'):
+            quants = {}
+            for qty in getattr(definition, 'Quantities', None) or []:
+                quants[qty.Name] = _extract_quantity_value(qty)
+            merge(attrs['qtos'], getattr(definition, 'Name', None), quants)
+
+    for rel in getattr(product, 'IsTypedBy', []) or []:
+        type_obj = getattr(rel, 'RelatingType', None)
+        if type_obj is None:
+            continue
+        for pset in getattr(type_obj, 'HasPropertySets', None) or []:
+            if pset.is_a('IfcPropertySet'):
+                props = {}
+                for prop in getattr(pset, 'HasProperties', None) or []:
+                    props[prop.Name] = _extract_property_value(prop)
+                merge(attrs['psets'], getattr(pset, 'Name', None), props)
+        for qset in getattr(type_obj, 'HasQuantities', None) or []:
+            if qset.is_a('IfcElementQuantity'):
+                quants = {}
+                for qty in getattr(qset, 'Quantities', None) or []:
+                    quants[qty.Name] = _extract_quantity_value(qty)
+                merge(attrs['qtos'], getattr(qset, 'Name', None), quants)
+
+    return attrs
+
+def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
+    """Resolve an absolute transform for the iterator step as a 16-tuple."""
+    mat = None
+    tr = getattr(shape, "transformation", None)
+    if tr is not None and hasattr(tr, "matrix"):
+        mat = tuple(tr.matrix)
+        if _is_identity16(mat):
+            mat = None
+
+    if mat is None and _HAVE_IFC_UTIL_SHAPE:
+        try:
+            gm = ifc_shape_util.get_shape_matrix(shape)
+            gm = np.array(gm, dtype=float).reshape(4, 4)
+            mat = tuple(gm.flatten().tolist())
+            if _is_identity16(mat):
+                mat = None
+        except Exception:
+            mat = None
+
+    if mat is None and element is not None:
+        try:
+            place = getattr(element, "ObjectPlacement", None)
+            gf = compose_object_placement(place, length_to_m=1.0)
+            mat = gf_to_tuple16(gf)
+        except Exception:
+            mat = None
+
+    return mat
 
 # Fallback when rep-map direct tessellation fails:
 def derive_mesh_from_occurrence(ifc, repmap, settings_local):
@@ -195,6 +358,7 @@ def derive_mesh_from_occurrence(ifc, repmap, settings_local):
     return None
 
 def build_prototypes(ifc_file) -> PrototypeCaches:
+    """Discover prototypes and instances in a single iterator pass."""
     s_local = ifcopenshell.geom.settings()
     safe_set(s_local, "use-world-coords", False)
     safe_set(s_local, "weld-vertices", True)
@@ -205,8 +369,9 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
     repmap_counts: Counter = Counter()
     hashes: Dict[str, HashProto] = {}
     step_keys: Dict[int, PrototypeKey] = {}
+    instances: Dict[int, InstanceRecord] = {}
 
-    repmap_to_type = {}
+    repmap_to_type: Dict[int, Tuple[Optional[Any], Optional[int]]] = {}
     for t in ifc_file.by_type("IfcTypeProduct"):
         for idx, rm in enumerate(getattr(t, "RepresentationMaps", []) or []):
             repmap_to_type[rm.id()] = (t, idx)
@@ -216,53 +381,137 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
         raise RuntimeError("iterator init failed")
 
     while it.next():
-        step = it.get()
-        product = ifc_file.by_id(step.id)
+        shape = it.get()
+        if shape is None:
+            continue
+
+        product = ifc_file.by_id(shape.id)
+        if product is None:
+            continue
+
+        geom = getattr(shape, "geometry", None)
+        if geom is None:
+            continue
+
+        verts = list(getattr(geom, "verts", []) or [])
+        faces = list(getattr(geom, "faces", []) or [])
+        if not verts or not faces:
+            continue
+
+        materials = list(getattr(geom, "materials", []) or [])
+        material_ids = list(getattr(geom, "material_ids", []) or [])
+        abs_mat = resolve_absolute_matrix(shape, product)
+
         rep = getattr(product, "Representation", None)
-        if not rep:
-            continue
+        reps = [r for r in (rep.Representations or []) if r.is_a("IfcShapeRepresentation")] if rep else []
+        body = next((r for r in reps if (r.RepresentationIdentifier or "").lower() == "body"), reps[0] if reps else None)
+        mapped_items = [mi for mi in (body.Items or []) if mi.is_a("IfcMappedItem")] if body else []
 
-        reps = [r for r in (rep.Representations or []) if r.is_a("IfcShapeRepresentation")]
-        body = next((r for r in reps if (r.RepresentationIdentifier or "").lower() == "body"),
-                    reps[0] if reps else None)
-        if not body:
-            continue
+        primary_key: Optional[PrototypeKey] = None
 
-        mapped = [mi for mi in (body.Items or []) if mi.is_a("IfcMappedItem")]
-        if mapped:
-            for mi in mapped:
+        if mapped_items:
+            for mi in mapped_items:
                 rmid = mi.MappingSource.id()
                 repmap_counts[rmid] += 1
-                step_keys[step.id] = PrototypeKey(kind="repmap", identifier=rmid)
                 info = repmaps.get(rmid)
                 if info is None:
                     type_ref, idx = repmap_to_type.get(rmid, (None, None))
                     info = MeshProto(
                         repmap_id=rmid,
                         type_name=getattr(type_ref, "Name", None) if type_ref else None,
-                        mesh=None,
-                        count=0,
+                        type_class=type_ref.is_a() if type_ref else None,
+                        type_guid=getattr(type_ref, "GlobalId", None) if type_ref else None,
+                        repmap_index=idx,
                     )
+                    rm = ifc_file.by_id(rmid)
+                    mesh_payload = None
+                    materials_payload: List[Any] = []
+                    material_ids_payload: List[int] = []
+                    if rm is not None:
+                        repmap_rep = getattr(rm, "MappedRepresentation", None)
+                        if repmap_rep is not None:
+                            try:
+                                sh = ifcopenshell.geom.create_shape(s_local, repmap_rep)
+                                mesh_payload = triangulated_to_dict(sh)
+                                geom_payload = getattr(sh, "geometry", None)
+                                if geom_payload is not None:
+                                    materials_payload = list(getattr(geom_payload, "materials", []) or [])
+                                    material_ids_payload = list(getattr(geom_payload, "material_ids", []) or [])
+                            except Exception:
+                                mesh_payload = derive_mesh_from_occurrence(ifc_file, rm, s_local)
+                    info.mesh = mesh_payload
+                    if materials_payload:
+                        info.materials = materials_payload
+                    if material_ids_payload:
+                        info.material_ids = material_ids_payload
                     repmaps[rmid] = info
                 info.count += 1
+                if not info.materials and materials:
+                    info.materials = list(materials)
+                if not info.material_ids and material_ids:
+                    info.material_ids = list(material_ids)
+            primary_key = PrototypeKey(kind="repmap", identifier=mapped_items[0].MappingSource.id())
         else:
-            mesh = triangulated_to_dict(step.geometry)
+            mesh = triangulated_to_dict(geom)
             digest = mesh_hash(mesh, precision=6)
-            step_keys[step.id] = PrototypeKey(kind="hash", identifier=digest)
+            primary_key = PrototypeKey(kind="hash", identifier=digest)
             bucket = hashes.get(digest)
             if bucket is None:
                 bucket = HashProto(
                     digest=digest,
                     name=get_type_name(product),
                     mesh=mesh,
+                    materials=list(materials),
+                    material_ids=list(material_ids),
                     count=1,
                 )
                 hashes[digest] = bucket
             else:
                 bucket.count += 1
+                if bucket.mesh is None:
+                    bucket.mesh = mesh
+                if not bucket.materials and materials:
+                    bucket.materials = list(materials)
+                if not bucket.material_ids and material_ids:
+                    bucket.material_ids = list(material_ids)
 
-    return PrototypeCaches(repmaps=repmaps, repmap_counts=repmap_counts,
-                           hashes=hashes, step_keys=step_keys)
+        if primary_key is None:
+            continue
+
+        step_id = shape.id
+        step_keys[step_id] = primary_key
+
+        fallback = getattr(product, "GlobalId", None)
+        if not fallback:
+            try:
+                fallback = str(product.id())
+            except Exception:
+                fallback = str(step_id)
+        name = sanitize_name(getattr(product, "Name", None), fallback=fallback)
+        try:
+            product_id = product.id()
+        except Exception:
+            product_id = None
+
+        instances[step_id] = InstanceRecord(
+            step_id=step_id,
+            product_id=product_id,
+            prototype=primary_key,
+            name=name,
+            transform=abs_mat,
+            material_ids=list(material_ids),
+            materials=list(materials),
+            attributes=collect_instance_attributes(product),
+        )
+
+    return PrototypeCaches(
+        repmaps=repmaps,
+        repmap_counts=repmap_counts,
+        hashes=hashes,
+        step_keys=step_keys,
+        instances=instances,
+    )
+
 
 
 def _as_float(v, default=0.0):
@@ -367,32 +616,7 @@ def generate_mesh_data(ifc_file, settings):
                 materials    = list(getattr(geom, "materials", []) or [])
                 material_ids = list(getattr(geom, "material_ids", []) or [])
 
-                # ----- absolute matrix resolution -----
-                mat = None
-                tr = getattr(shape, "transformation", None)
-                if tr is not None and hasattr(tr, "matrix"):
-                    mat = tuple(tr.matrix)
-                    if _is_identity16(mat):
-                        mat = None
-
-                if mat is None and _HAVE_IFC_UTIL_SHAPE:
-                    try:
-                        gm = ifc_shape_util.get_shape_matrix(shape)  # list or 4x4
-                        gm = np.array(gm, dtype=float).reshape(4, 4)
-                        mat = tuple(gm.flatten().tolist())
-                        if _is_identity16(mat):
-                            mat = None
-                    except Exception:
-                        mat = None
-
-                if mat is None:
-                    try:
-                        place = getattr(element, "ObjectPlacement", None)
-                        gf = compose_object_placement(place, length_to_m=1.0)
-                        mat = gf_to_tuple16(gf)
-                    except Exception:
-                        mat = None
-                # --------------------------------------
+                mat = resolve_absolute_matrix(shape, element)
 
                 yield element, faces, verts, mat, materials, material_ids
 
@@ -403,4 +627,8 @@ def generate_mesh_data(ifc_file, settings):
                     print(f"⚠️ Iterator error: {e}")
             if not it.next():
                 break
+
+
+
+
 
