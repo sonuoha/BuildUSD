@@ -89,6 +89,28 @@ def triangulated_to_dict(shape_geom) -> dict:
     return {"vertices": verts, "faces": faces}
 
 def mesh_hash(mesh: dict, precision: int = 6) -> str:
+    """
+    Compute a SHA256 hash of a mesh, given as a dictionary
+    containing "vertices" and "faces" keys.
+
+    The hash is computed by first rounding the vertices to the given
+    precision, then computing the unique vertices and their indices
+    in the original mesh. The faces are then recomputed using these
+    indices, sorted, and the resulting array is hashed along with
+    the unique vertices.
+
+    Parameters
+    ----------
+    mesh : dict
+        A dictionary containing "vertices" and "faces" keys.
+    precision : int, optional
+        The precision to round the vertices to, by default 6.
+
+    Returns
+    -------
+    str
+        A SHA256 hash of the mesh as a hexadecimal string.
+    """
     verts = np.round(mesh["vertices"], precision)
     uniq, inv = np.unique(verts, axis=0, return_inverse=True)
     faces = inv[mesh["faces"]]
