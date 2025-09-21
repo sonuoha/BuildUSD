@@ -5,6 +5,7 @@ import numpy as np
 import ifcopenshell
 from pxr import Gf
 
+import math
 import re
 from typing import Dict, Optional, Union, Literal, List, Tuple, Any
 from dataclasses import dataclass, field
@@ -46,9 +47,12 @@ class MeshProto:
 class HashProto:
     digest: str
     name: Optional[str] = None
+    type_name: Optional[str] = None
+    type_guid: Optional[str] = None
     mesh: Optional[dict] = None
     materials: List[Any] = field(default_factory=list)
     material_ids: List[int] = field(default_factory=list)
+    signature: Optional[Tuple[Any, ...]] = None
     count: int = 0
 
 @dataclass(frozen=True)
@@ -57,13 +61,13 @@ class PrototypeKey:
     identifier: Union[int, str]
 
 @dataclass
-class PrototypeCaches:
-    repmaps: Dict[int, MeshProto]
-    repmap_counts: Counter
-    hashes: Dict[str, HashProto]
-    step_keys: Dict[int, PrototypeKey]
-    instances: Dict[int, "InstanceRecord"]
-
+class MapConversionData:
+    eastings: float = 0.0
+    northings: float = 0.0
+    orthogonal_height: float = 0.0
+    x_axis_abscissa: float = 1.0
+    x_axis_ordinate: float = 0.0
+    scale: float = 1.0
 
 @dataclass
 class InstanceRecord:
@@ -75,6 +79,68 @@ class InstanceRecord:
     material_ids: List[int] = field(default_factory=list)
     materials: List[Any] = field(default_factory=list)
     attributes: Dict[str, Any] = field(default_factory=dict)
+    
+@dataclass
+class PrototypeCaches:
+    repmaps: Dict[int, MeshProto]
+    repmap_counts: Counter
+    hashes: Dict[str, HashProto]
+    step_keys: Dict[int, PrototypeKey]
+    instances: Dict[int, "InstanceRecord"]
+    map_conversion: Optional[MapConversionData] = None
+
+
+    def normalized_axes(self) -> Tuple[float, float]:
+        ax = float(self.x_axis_abscissa) or 0.0
+        ay = float(self.x_axis_ordinate) or 0.0
+        length = math.hypot(ax, ay)
+        if length <= 1e-12:
+            return 1.0, 0.0
+        return ax / length, ay / length
+
+    def rotation_degrees(self) -> float:
+        ax, ay = self.normalized_axes()
+        return math.degrees(math.atan2(ay, ax))
+
+    def map_to_local_xy(self, easting: float, northing: float) -> Tuple[float, float]:
+        ax, ay = self.normalized_axes()
+        scale = self.scale or 1.0
+        d_e = float(easting) - float(self.eastings)
+        d_n = float(northing) - float(self.northings)
+        x = scale * (ax * d_e + ay * d_n)
+        y = scale * (-ay * d_e + ax * d_n)
+        return x, y
+
+
+
+def _select_map_conversion_entity(ifc_file) -> Optional[Any]:
+    best = None
+    for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not op.is_a("IfcMapConversion"):
+                continue
+            if getattr(ctx, "ContextType", None) == "Model" and getattr(ctx, "CoordinateSpaceDimension", None) == 3:
+                return op
+            if best is None:
+                best = op
+    return best
+
+
+def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    entity = _select_map_conversion_entity(ifc_file)
+    if entity is None:
+        return None
+    return MapConversionData(
+        eastings=_as_float(getattr(entity, "Eastings", 0.0), 0.0),
+        northings=_as_float(getattr(entity, "Northings", 0.0), 0.0),
+        orthogonal_height=_as_float(getattr(entity, "OrthogonalHeight", 0.0), 0.0),
+        x_axis_abscissa=_as_float(getattr(entity, "XAxisAbscissa", 1.0), 1.0),
+        x_axis_ordinate=_as_float(getattr(entity, "XAxisOrdinate", 0.0), 0.0),
+        scale=_as_float(getattr(entity, "Scale", 1.0), 1.0) or 1.0,
+    )
+
+
 
 def sanitize_name(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
     base = str(raw_name or fallback or "Unnamed")
@@ -357,6 +423,7 @@ def derive_mesh_from_occurrence(ifc, repmap, settings_local):
                 return {"vertices": v_loc, "faces": f}
     return None
 
+
 def build_prototypes(ifc_file) -> PrototypeCaches:
     """Discover prototypes and instances in a single iterator pass."""
     s_local = ifcopenshell.geom.settings()
@@ -375,6 +442,44 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
     for t in ifc_file.by_type("IfcTypeProduct"):
         for idx, rm in enumerate(getattr(t, "RepresentationMaps", []) or []):
             repmap_to_type[rm.id()] = (t, idx)
+
+    signature_to_digest: Dict[Tuple[Any, ...], str] = {}
+    type_to_digest: Dict[Tuple[str, str], str] = {}
+
+    def ensure_repmap_entry(rmid: int) -> MeshProto:
+        info = repmaps.get(rmid)
+        if info is None:
+            type_ref, idx = repmap_to_type.get(rmid, (None, None))
+            info = MeshProto(
+                repmap_id=rmid,
+                type_name=getattr(type_ref, "Name", None) if type_ref else None,
+                type_class=type_ref.is_a() if type_ref else None,
+                type_guid=getattr(type_ref, "GlobalId", None) if type_ref else None,
+                repmap_index=idx,
+            )
+            rm_entity = ifc_file.by_id(rmid)
+            mesh_payload = None
+            materials_payload: List[Any] = []
+            material_ids_payload: List[int] = []
+            if rm_entity is not None:
+                repmap_rep = getattr(rm_entity, "MappedRepresentation", None)
+                if repmap_rep is not None:
+                    try:
+                        sh = ifcopenshell.geom.create_shape(s_local, repmap_rep)
+                        mesh_payload = triangulated_to_dict(sh)
+                        geom_payload = getattr(sh, "geometry", None)
+                        if geom_payload is not None:
+                            materials_payload = list(getattr(geom_payload, "materials", []) or [])
+                            material_ids_payload = list(getattr(geom_payload, "material_ids", []) or [])
+                    except Exception:
+                        mesh_payload = derive_mesh_from_occurrence(ifc_file, rm_entity, s_local)
+            info.mesh = mesh_payload
+            if materials_payload:
+                info.materials = materials_payload
+            if material_ids_payload:
+                info.material_ids = material_ids_payload
+            repmaps[rmid] = info
+        return info
 
     it = ifcopenshell.geom.iterator(s_local, ifc_file, multiprocessing.cpu_count())
     if not it.initialize():
@@ -407,44 +512,24 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
         body = next((r for r in reps if (r.RepresentationIdentifier or "").lower() == "body"), reps[0] if reps else None)
         mapped_items = [mi for mi in (body.Items or []) if mi.is_a("IfcMappedItem")] if body else []
 
+        type_ref = None
+        type_guid = None
+        type_name = None
+        for rel in (getattr(product, "IsTypedBy", []) or []):
+            rel_type = getattr(rel, "RelatingType", None)
+            if rel_type is not None:
+                type_ref = rel_type
+                type_guid = getattr(rel_type, "GlobalId", None)
+                type_name = getattr(rel_type, "Name", None)
+                break
+
         primary_key: Optional[PrototypeKey] = None
 
         if mapped_items:
             for mi in mapped_items:
                 rmid = mi.MappingSource.id()
                 repmap_counts[rmid] += 1
-                info = repmaps.get(rmid)
-                if info is None:
-                    type_ref, idx = repmap_to_type.get(rmid, (None, None))
-                    info = MeshProto(
-                        repmap_id=rmid,
-                        type_name=getattr(type_ref, "Name", None) if type_ref else None,
-                        type_class=type_ref.is_a() if type_ref else None,
-                        type_guid=getattr(type_ref, "GlobalId", None) if type_ref else None,
-                        repmap_index=idx,
-                    )
-                    rm = ifc_file.by_id(rmid)
-                    mesh_payload = None
-                    materials_payload: List[Any] = []
-                    material_ids_payload: List[int] = []
-                    if rm is not None:
-                        repmap_rep = getattr(rm, "MappedRepresentation", None)
-                        if repmap_rep is not None:
-                            try:
-                                sh = ifcopenshell.geom.create_shape(s_local, repmap_rep)
-                                mesh_payload = triangulated_to_dict(sh)
-                                geom_payload = getattr(sh, "geometry", None)
-                                if geom_payload is not None:
-                                    materials_payload = list(getattr(geom_payload, "materials", []) or [])
-                                    material_ids_payload = list(getattr(geom_payload, "material_ids", []) or [])
-                            except Exception:
-                                mesh_payload = derive_mesh_from_occurrence(ifc_file, rm, s_local)
-                    info.mesh = mesh_payload
-                    if materials_payload:
-                        info.materials = materials_payload
-                    if material_ids_payload:
-                        info.material_ids = material_ids_payload
-                    repmaps[rmid] = info
+                info = ensure_repmap_entry(rmid)
                 info.count += 1
                 if not info.materials and materials:
                     info.materials = list(materials)
@@ -452,28 +537,60 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
                     info.material_ids = list(material_ids)
             primary_key = PrototypeKey(kind="repmap", identifier=mapped_items[0].MappingSource.id())
         else:
-            mesh = triangulated_to_dict(geom)
-            digest = mesh_hash(mesh, precision=6)
-            primary_key = PrototypeKey(kind="hash", identifier=digest)
-            bucket = hashes.get(digest)
-            if bucket is None:
-                bucket = HashProto(
-                    digest=digest,
-                    name=get_type_name(product),
-                    mesh=mesh,
-                    materials=list(materials),
-                    material_ids=list(material_ids),
-                    count=1,
-                )
-                hashes[digest] = bucket
+            repmap_from_type = None
+            if type_ref is not None:
+                for rm in getattr(type_ref, "RepresentationMaps", None) or []:
+                    repmap_from_type = rm
+                    break
+            if repmap_from_type is not None:
+                rmid = repmap_from_type.id()
+                repmap_counts[rmid] += 1
+                info = ensure_repmap_entry(rmid)
+                info.count += 1
+                if not info.materials and materials:
+                    info.materials = list(materials)
+                if not info.material_ids and material_ids:
+                    info.material_ids = list(material_ids)
+                primary_key = PrototypeKey(kind="repmap", identifier=rmid)
             else:
-                bucket.count += 1
-                if bucket.mesh is None:
-                    bucket.mesh = mesh
-                if not bucket.materials and materials:
-                    bucket.materials = list(materials)
-                if not bucket.material_ids and material_ids:
-                    bucket.material_ids = list(material_ids)
+                mesh = triangulated_to_dict(geom)
+                signature = compute_mesh_signature(mesh)
+                type_key = None
+                if type_guid or type_name:
+                    type_key = (type_guid or "", type_name or "")
+                canonical_digest = None
+                if type_key and type_key in type_to_digest:
+                    canonical_digest = type_to_digest[type_key]
+                else:
+                    canonical_digest = signature_to_digest.get(signature)
+                if canonical_digest is None:
+                    digest = mesh_hash(mesh, precision=6)
+                    signature_to_digest[signature] = digest
+                    if type_key:
+                        type_to_digest[type_key] = digest
+                    bucket = HashProto(
+                        digest=digest,
+                        name=get_type_name(product),
+                        type_name=type_name,
+                        type_guid=type_guid,
+                        mesh=mesh,
+                        materials=list(materials),
+                        material_ids=list(material_ids),
+                        signature=signature,
+                        count=1,
+                    )
+                    hashes[digest] = bucket
+                    canonical_digest = digest
+                else:
+                    bucket = hashes[canonical_digest]
+                    bucket.count += 1
+                    if bucket.mesh is None:
+                        bucket.mesh = mesh
+                    if not bucket.materials and materials:
+                        bucket.materials = list(materials)
+                    if not bucket.material_ids and material_ids:
+                        bucket.material_ids = list(material_ids)
+                primary_key = PrototypeKey(kind="hash", identifier=canonical_digest)
 
         if primary_key is None:
             continue
@@ -504,13 +621,19 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
             attributes=collect_instance_attributes(product),
         )
 
+    map_conversion = extract_map_conversion(ifc_file)
+
     return PrototypeCaches(
         repmaps=repmaps,
         repmap_counts=repmap_counts,
         hashes=hashes,
         step_keys=step_keys,
         instances=instances,
+        map_conversion=map_conversion,
     )
+
+
+
 
 
 
