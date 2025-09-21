@@ -755,3 +755,62 @@ def generate_mesh_data(ifc_file, settings):
 
 
 
+
+
+def compute_mesh_signature(mesh: Dict[str, Any], precision: int = 5) -> Tuple[Any, ...]:
+    """Return a rotation/translation-robust signature for a triangulated mesh."""
+    if mesh is None:
+        return tuple()
+    verts = mesh.get("vertices")
+    faces = mesh.get("faces")
+    if verts is None or faces is None:
+        return tuple()
+    try:
+        v = np.asarray(verts, dtype=float).reshape(-1, 3)
+    except Exception:
+        return tuple()
+    if v.size == 0:
+        return (0,)
+    try:
+        f = np.asarray(faces, dtype=int).reshape(-1, 3)
+    except Exception:
+        f = np.zeros((0, 3), dtype=int)
+    centroid = v.mean(axis=0) if len(v) else np.zeros(3, dtype=float)
+    centered = v - centroid
+    bbox = np.max(v, axis=0) - np.min(v, axis=0) if len(v) else np.zeros(3, dtype=float)
+    bbox_sig = tuple(np.round(np.sort(np.abs(bbox)), precision).tolist())
+    cov = centered.T @ centered
+    if len(v):
+        cov /= float(len(v))
+    try:
+        eigvals = np.linalg.eigvalsh(cov)
+    except Exception:
+        eigvals = np.zeros(3, dtype=float)
+    eig_sig = tuple(np.round(np.sort(np.abs(eigvals)), precision).tolist())
+    try:
+        tris = v[f.astype(int)] if len(f) else np.zeros((0, 3, 3), dtype=float)
+        cross = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0]) if len(tris) else np.zeros((0, 3), dtype=float)
+        areas = 0.5 * np.linalg.norm(cross, axis=1) if len(cross) else np.zeros(0, dtype=float)
+        total_area = float(np.sum(areas))
+        area_sq = float(np.sum(areas ** 2))
+    except Exception:
+        total_area = 0.0
+        area_sq = 0.0
+    try:
+        radii = np.linalg.norm(centered, axis=1) if len(centered) else np.zeros(0, dtype=float)
+        if radii.size:
+            q = np.quantile(radii, [0.0, 0.25, 0.5, 0.75, 1.0])
+            radial_sig = tuple(np.round(q, precision).tolist())
+        else:
+            radial_sig = (0.0, 0.0, 0.0, 0.0, 0.0)
+    except Exception:
+        radial_sig = (0.0, 0.0, 0.0, 0.0, 0.0)
+    return (
+        int(v.shape[0]),
+        int(f.shape[0]),
+        bbox_sig,
+        eig_sig,
+        radial_sig,
+        round(float(total_area), precision),
+        round(float(area_sq), precision),
+    )
