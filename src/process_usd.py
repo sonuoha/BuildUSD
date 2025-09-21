@@ -479,7 +479,8 @@ def author_material_layer(
                     shader.CreateInput("ior", Sdf.ValueTypeNames.Float).Set(float(params["ior"]))
                 if "emissiveColor" in params:
                     shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*params["emissiveColor"]))
-                material_prim.CreateSurfaceOutput().ConnectToSource(shader, "surface")
+                surface_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+                material_prim.CreateSurfaceOutput().ConnectToSource(surface_output)
 
                 material_entries.append(mat_path)
             if material_entries:
@@ -523,15 +524,14 @@ def _author_namespaced_dictionary_attributes(prim: Usd.Prim, namespace: str, ent
         if value is None:
             continue
         token = _sanitize_identifier(raw_name, fallback="Unnamed")
-        attr_name = f"ifc:{namespace}:{token}"
+        key = f"ifc:{namespace}:{token}"
         if isinstance(value, dict):
             payload = {k: v for k, v in value.items() if v is not None}
             if not payload:
                 continue
         else:
             payload = {"value": value}
-        attr = prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Dictionary)
-        attr.Set(payload)
+        prim.SetCustomDataByKey(key, payload)
 
 
 def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, Any]]) -> None:
