@@ -8,6 +8,12 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 from src.process_ifc import PrototypeCaches, PrototypeKey
 from src.utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
 
+try:
+    from pyproj import CRS, Transformer
+    _HAVE_PYPROJ = True
+except Exception:
+    _HAVE_PYPROJ = False
+
 
 _UNIT_FACTORS = {
     "m": 1.0,
@@ -132,12 +138,109 @@ def _iter_prototypes(caches: PrototypeCaches) -> Iterable[Tuple[PrototypeKey, An
         yield PrototypeKey(kind="hash", identifier=digest), proto
 
 
+
 # 3. ---------------------------- Material helpers ----------------------------
+
+_MATERIAL_PRESET_LIBRARY = [
+    {
+        "keywords": {"stainless", "steel"},
+        "color": (0.58, 0.58, 0.6),
+        "metallic": 1.0,
+        "roughness": 0.28,
+        "specular": 0.55,
+    },
+    {
+        "keywords": {"steel"},
+        "color": (0.45, 0.45, 0.45),
+        "metallic": 1.0,
+        "roughness": 0.35,
+        "specular": 0.5,
+    },
+    {
+        "keywords": {"aluminium", "aluminum"},
+        "color": (0.77, 0.77, 0.78),
+        "metallic": 1.0,
+        "roughness": 0.22,
+        "specular": 0.55,
+    },
+    {
+        "keywords": {"concrete"},
+        "color": (0.55, 0.55, 0.52),
+        "metallic": 0.0,
+        "roughness": 0.9,
+    },
+    {
+        "keywords": {"asphalt"},
+        "color": (0.08, 0.08, 0.08),
+        "metallic": 0.0,
+        "roughness": 0.95,
+    },
+    {
+        "keywords": {"glass"},
+        "color": (0.92, 0.95, 0.98),
+        "metallic": 0.0,
+        "roughness": 0.05,
+        "opacity": 0.12,
+        "ior": 1.45,
+        "specular": 0.1,
+    },
+    {
+        "keywords": {"timber"},
+        "color": (0.63, 0.45, 0.32),
+        "metallic": 0.0,
+        "roughness": 0.65,
+    },
+    {
+        "keywords": {"wood"},
+        "color": (0.6, 0.43, 0.3),
+        "metallic": 0.0,
+        "roughness": 0.6,
+    },
+    {
+        "keywords": {"brick"},
+        "color": (0.65, 0.28, 0.23),
+        "metallic": 0.0,
+        "roughness": 0.75,
+    },
+    {
+        "keywords": {"plaster"},
+        "color": (0.83, 0.83, 0.8),
+        "metallic": 0.0,
+        "roughness": 0.7,
+    },
+    {
+        "keywords": {"paint"},
+        "metallic": 0.0,
+        "roughness": 0.4,
+    },
+    {
+        "keywords": {"gypsum"},
+        "color": (0.85, 0.84, 0.81),
+        "metallic": 0.0,
+        "roughness": 0.7,
+    },
+    {
+        "keywords": {"plastic"},
+        "metallic": 0.0,
+        "roughness": 0.35,
+        "specular": 0.6,
+    },
+    {
+        "keywords": {"ceramic"},
+        "metallic": 0.0,
+        "roughness": 0.15,
+        "specular": 0.5,
+    },
+]
+
+def _normalize_color(color: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    return tuple(max(0.0, min(1.0, float(c))) for c in color)
+
 
 def _material_color(material: Any) -> Tuple[float, float, float]:
     candidates = [
         "Diffuse", "diffuse", "DiffuseColor", "diffuseColor",
-        "SurfaceColour", "surfaceColour", "surface_colour", "Color"
+        "SurfaceColour", "surfaceColour", "surface_colour", "Color",
     ]
     for attr in candidates:
         value = getattr(material, attr, None)
@@ -150,7 +253,7 @@ def _material_color(material: Any) -> Tuple[float, float, float]:
                 continue
         if isinstance(value, (list, tuple)) and len(value) >= 3:
             try:
-                return (float(value[0]), float(value[1]), float(value[2]))
+                return _normalize_color((value[0], value[1], value[2]))
             except Exception:
                 continue
     return (0.8, 0.8, 0.8)
@@ -182,6 +285,63 @@ def _material_display_name(material: Any, fallback: str) -> str:
             break
     return _sanitize_identifier(name, fallback=fallback)
 
+
+def _material_strings(material: Any) -> List[str]:
+    tokens: List[str] = []
+    def _consume(text: Optional[str]) -> None:
+        if not text:
+            return
+        for piece in re.split(r"[^A-Za-z0-9]+", text.lower()):
+            if piece:
+                tokens.append(piece)
+    if isinstance(material, str):
+        _consume(material)
+    else:
+        for attr in ("Name", "name", "Category", "CategoryName", "Description", "MaterialCategory"):
+            value = getattr(material, attr, None)
+            if isinstance(value, str):
+                _consume(value)
+        if hasattr(material, "is_a"):
+            try:
+                isa = material.is_a()
+                if isinstance(isa, str):
+                    _consume(isa)
+            except Exception:
+                pass
+    return tokens
+
+
+def _match_material_preset(material: Any) -> Optional[Dict[str, Any]]:
+    tokens = set(_material_strings(material))
+    for preset in _MATERIAL_PRESET_LIBRARY:
+        if preset["keywords"].issubset(tokens):
+            return preset
+    return None
+
+
+def _material_pbr_parameters(material: Any) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "color": _material_color(material),
+        "metallic": 0.0,
+        "roughness": 0.6,
+        "opacity": _material_opacity(material),
+        "specular": 0.5,
+    }
+    preset = _match_material_preset(material)
+    if preset:
+        if "color" in preset:
+            params["color"] = preset["color"]
+        for key in ("metallic", "roughness", "opacity", "specular", "ior", "emissiveColor"):
+            if key in preset:
+                params[key] = preset[key]
+    params["color"] = _normalize_color(params["color"])
+    if "emissiveColor" in params:
+        params["emissiveColor"] = _normalize_color(params["emissiveColor"])
+    params["metallic"] = max(0.0, min(1.0, float(params.get("metallic", 0.0))))
+    params["roughness"] = max(0.0, min(1.0, float(params.get("roughness", 0.6))))
+    params["opacity"] = max(0.0, min(1.0, float(params.get("opacity", 1.0))))
+    params["specular"] = max(0.0, min(1.0, float(params.get("specular", 0.5))))
+    return params
 
 # 4. ---------------------------- Prototype authoring ----------------------------
 
@@ -309,9 +469,16 @@ def author_material_layer(
                 material_prim = UsdShade.Material.Define(stage, mat_path)
                 shader = UsdShade.Shader.Define(stage, shader_path)
                 shader.CreateIdAttr("UsdPreviewSurface")
-                color = _material_color(material)
-                shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
-                shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(_material_opacity(material))
+                params = _material_pbr_parameters(material)
+                shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*params["color"]))
+                shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(params["opacity"]))
+                shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(params["metallic"]))
+                shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(params["roughness"]))
+                shader.CreateInput("specular", Sdf.ValueTypeNames.Float).Set(float(params.get("specular", 0.5)))
+                if "ior" in params:
+                    shader.CreateInput("ior", Sdf.ValueTypeNames.Float).Set(float(params["ior"]))
+                if "emissiveColor" in params:
+                    shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*params["emissiveColor"]))
                 material_prim.CreateSurfaceOutput().ConnectToSource(shader, "surface")
 
                 material_entries.append(mat_path)
@@ -438,27 +605,73 @@ def _length_to_meters(value: float, unit_hint: str) -> float:
     return float(value) * factor
 
 
+
 def apply_stage_anchor_transform(
     stage: Usd.Stage,
     caches: PrototypeCaches,
-    map_easting: float,
-    map_northing: float,
-    map_height: float,
+    map_easting: Optional[float] = None,
+    map_northing: Optional[float] = None,
+    map_height: Optional[float] = 0.0,
     unit_hint: str = "m",
     align_axes_to_map: bool = False,
+    enable_geo_anchor: bool = True,
+    longitude: Optional[float] = None,
+    latitude: Optional[float] = None,
+    altitude: float = 0.0,
+    coordinate_system: Optional[str] = None,
 ) -> None:
+    """Anchor the /World prim so a supplied geospatial point sits at the origin."""
+    if not enable_geo_anchor:
+        return
+
     map_conv = caches.map_conversion
     meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
     meters_to_stage = 1.0 / meters_per_unit if meters_per_unit else 1.0
 
-    e_m = _length_to_meters(map_easting, unit_hint)
-    n_m = _length_to_meters(map_northing, unit_hint)
-    h_m = _length_to_meters(map_height, unit_hint)
+    anchor_e = map_easting
+    anchor_n = map_northing
+    anchor_h = map_height if map_height is not None else 0.0
+
+    if (anchor_e is None or anchor_n is None) and longitude is not None and latitude is not None:
+        if coordinate_system is None:
+            raise ValueError("coordinate_system is required when supplying longitude/latitude")
+        if not _HAVE_PYPROJ:
+            raise RuntimeError("pyproj is required to convert geographic coordinates; install pyproj or provide map_easting/map_northing")
+        try:
+            dest = CRS.from_user_input(coordinate_system)
+        except Exception as exc:
+            raise ValueError(f"Unable to interpret coordinate_system '{coordinate_system}': {exc}") from exc
+        if dest.is_geographic and not dest.is_projected:
+            raise ValueError(f"Coordinate system '{dest.name}' is geographic; provide a projected system for east/north conversion")
+        transformer = Transformer.from_crs(CRS.from_epsg(4326), dest, always_xy=True)
+        try:
+            result = transformer.transform(float(longitude), float(latitude), float(altitude), errcheck=False)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to transform lon/lat using {dest}: {exc}") from exc
+        if isinstance(result, (list, tuple)):
+            if len(result) >= 2:
+                anchor_e = float(result[0])
+                anchor_n = float(result[1])
+            if len(result) >= 3:
+                anchor_h = float(result[2])
+        else:
+            raise RuntimeError("Unexpected transform result when converting geographic coordinates")
+        unit_hint = "m"
+
+    if anchor_e is None or anchor_n is None:
+        print("?? apply_stage_anchor_transform: missing anchoring coordinates; skipping geo alignment")
+        return
+
+    e_m = _length_to_meters(anchor_e, unit_hint)
+    n_m = _length_to_meters(anchor_n, unit_hint)
+    h_m = _length_to_meters(anchor_h or 0.0, unit_hint)
 
     if map_conv:
         x_local, y_local = map_conv.map_to_local_xy(e_m, n_m)
     else:
         x_local, y_local = e_m, n_m
+        if align_axes_to_map:
+            print("?? align_axes_to_map=True but no map conversion available; skipping axis alignment")
 
     translation = Gf.Matrix4d().SetTranslate(
         Gf.Vec3d(-x_local * meters_to_stage, -y_local * meters_to_stage, -h_m * meters_to_stage)
