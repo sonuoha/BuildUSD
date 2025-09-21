@@ -17,6 +17,8 @@ src\dev\__pycache__\*.pyc
 src\dev\__pycache__\*.pyo
 
 # Ignore heavy BIM sample files
+/output/*.usd*
+
 /data/input/rvt/
 /data/input/*.rvt
 /data/input/*.usda

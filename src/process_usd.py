@@ -347,6 +347,36 @@ def bind_materials_to_prototypes(
             UsdShade.MaterialBindingAPI(mesh_prim).Bind(UsdShade.Material(mat_prim))
 
 
+
+
+def _author_namespaced_dictionary_attributes(prim: Usd.Prim, namespace: str, entries: Dict[str, Any]) -> None:
+    if not entries:
+        return
+    for raw_name, value in entries.items():
+        if value is None:
+            continue
+        token = _sanitize_identifier(raw_name, fallback="Unnamed")
+        attr_name = f"ifc:{namespace}:{token}"
+        if isinstance(value, dict):
+            payload = {k: v for k, v in value.items() if v is not None}
+            if not payload:
+                continue
+        else:
+            payload = {"value": value}
+        attr = prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Dictionary)
+        attr.Set(payload)
+
+
+def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, Any]]) -> None:
+    if not attributes:
+        return
+    if not isinstance(attributes, dict):
+        return
+    psets = attributes.get("psets", {})
+    qtos = attributes.get("qtos", {})
+    _author_namespaced_dictionary_attributes(prim, "pset", psets)
+    _author_namespaced_dictionary_attributes(prim, "qto", qtos)
+
 # 7. ---------------------------- Instance authoring ----------------------------
 
 def author_instance_layer(
@@ -381,6 +411,7 @@ def author_instance_layer(
 
             xform = UsdGeom.Xform.Define(stage, inst_path)
             xform.ClearXformOpOrder()
+            inst_prim = xform.GetPrim()
             if record.transform:
                 try:
                     xf = np_to_gf_matrix(record.transform)
@@ -388,16 +419,14 @@ def author_instance_layer(
                 except Exception as exc:
                     print(f"?? Failed to author transform for instance {record.step_id}: {exc}")
 
+            _author_instance_attributes(inst_prim, record.attributes)
+
             ref_path = inst_path.AppendChild("Prototype")
             ref_prim = stage.DefinePrim(ref_path, "Xform")
-            ref_prim.GetReferences().AddReference("", proto_path)
+            refs = ref_prim.GetReferences()
+            refs.ClearReferences()
+            refs.AddReference("", proto_path)
             ref_prim.SetInstanceable(True)
-
-            if record.attributes:
-                try:
-                    xform.GetPrim().SetCustomDataByKey("ifc:attributes", record.attributes)
-                except Exception:
-                    pass
 
     return inst_layer
 
