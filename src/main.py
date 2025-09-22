@@ -1,5 +1,6 @@
 ﻿from pathlib import Path
 import sys
+import argparse
 
 ROOT = Path(__file__).resolve().parents[1]  # -> c:\Users\samue\_dev\usdx
 if str(ROOT) not in sys.path:
@@ -13,6 +14,7 @@ from src.process_usd import (
     bind_materials_to_prototypes,
     author_instance_layer,
     apply_stage_anchor_transform,
+    assign_world_geolocation,
 )
 
 DATA_PATH = Path(r"\Users\samue\_dev\usd_root\usdex\data\SRL-WPD-TVC-UTU8-MOD-CTU-BUW-000001.ifc").resolve()
@@ -27,8 +29,21 @@ OPTIONS = ConversionOptions(
     convert_metadata=True,
 )
 
-def main():
+def parse_args():
+    parser = argparse.ArgumentParser(description="Convert IFC to USD")
+    parser.add_argument(
+        "--map-coordinate-system",
+        "--map-epsg",
+        dest="map_coordinate_system",
+        default="EPSG:7855",
+        help="EPSG code or CRS string for map_easting/map_northing (default: %(default)s)",
+    )
+    return parser.parse_args()
+
+def main(map_coordinate_system: str = "EPSG:7855"):
     import ifcopenshell
+
+    coordinate_system = map_coordinate_system
 
     print(f"Loading IFC from {DATA_PATH}")
     ifc = ifcopenshell.open(DATA_PATH.as_posix())
@@ -53,6 +68,17 @@ def main():
         align_axes_to_map=True,
     )
 
+    print(f"Assigning world geolocation using {coordinate_system}")
+
+    assign_world_geolocation(
+        stage,
+        easting=333800.4900,
+        northing=5809101.4680,
+        height=0.0,
+        coordinate_system=coordinate_system,
+        unit_hint="m",
+    )
+
     stage.Save()
     proto_layer.Save()
     mat_layer.Save()
@@ -64,4 +90,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(map_coordinate_system=args.map_coordinate_system)
