@@ -1,4 +1,4 @@
-import re
+﻿import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -380,12 +380,13 @@ def author_prototype_layer(
     if proto_layer.identifier not in root_layer.subLayerPaths:
         root_layer.subLayerPaths.append(proto_layer.identifier)
 
-    proto_root = Sdf.Path("/__Prototypes")
+    proto_root = Sdf.Path("/World/__Prototypes")
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
     used_names: Dict[str, int] = {}
 
     with Usd.EditContext(stage, proto_layer):
-        UsdGeom.Scope.Define(stage, proto_root)
+        proto_root_xf = UsdGeom.Xform.Define(stage, proto_root)
+        proto_root_xf.ClearXformOpOrder()
 
         for key, proto in _iter_prototypes(caches):
             mesh_data = _flatten_mesh_arrays(getattr(proto, "mesh", None))
@@ -447,12 +448,13 @@ def author_material_layer(
     if material_layer.identifier not in proto_layer.subLayerPaths:
         proto_layer.subLayerPaths.append(material_layer.identifier)
 
-    material_root = Sdf.Path("/__Materials")
+    material_root = Sdf.Path("/World/__Materials")
     material_paths: Dict[PrototypeKey, List[Sdf.Path]] = {}
     used_names: Dict[str, int] = {}
 
     with Usd.EditContext(stage, material_layer):
-        UsdGeom.Scope.Define(stage, material_root)
+        material_root_xf = UsdGeom.Xform.Define(stage, material_root)
+        material_root_xf.ClearXformOpOrder()
 
         for key, proto_path in proto_paths.items():
             materials = _prototype_materials(caches, key)
