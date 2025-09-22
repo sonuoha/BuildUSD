@@ -80,7 +80,8 @@ class InstanceRecord:
     material_ids: List[int] = field(default_factory=list)
     materials: List[Any] = field(default_factory=list)
     attributes: Dict[str, Any] = field(default_factory=dict)
-    
+    prototype_delta: Optional[Tuple[float, ...]] = None
+
 @dataclass
 class PrototypeCaches:
     repmaps: Dict[int, MeshProto]
@@ -425,8 +426,8 @@ def derive_mesh_from_occurrence(ifc, repmap, settings_local):
     return None
 
 
-def build_prototypes(ifc_file) -> PrototypeCaches:
-    """Discover prototypes and instances in a single iterator pass."""
+def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
+    """Discover prototypes and instances respecting conversion options."""
     s_local = ifcopenshell.geom.settings()
     safe_set(s_local, "use-world-coords", False)
     safe_set(s_local, "weld-vertices", True)
@@ -443,9 +444,6 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
     for t in ifc_file.by_type("IfcTypeProduct"):
         for idx, rm in enumerate(getattr(t, "RepresentationMaps", []) or []):
             repmap_to_type[rm.id()] = (t, idx)
-
-    signature_to_digest: Dict[Tuple[Any, ...], str] = {}
-    type_to_digest: Dict[Tuple[str, str], str] = {}
 
     def ensure_repmap_entry(rmid: int) -> MeshProto:
         info = repmaps.get(rmid)
@@ -481,6 +479,10 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
                 info.material_ids = material_ids_payload
             repmaps[rmid] = info
         return info
+
+    use_hash_dedup = options.enable_instancing and options.enable_hash_dedup
+    signature_to_digest: Dict[Tuple[Any, ...], str] = {} if use_hash_dedup else {}
+    type_to_digest: Dict[Tuple[str, str], str] = {} if use_hash_dedup else {}
 
     it = ifcopenshell.geom.iterator(s_local, ifc_file, multiprocessing.cpu_count())
     if not it.initialize():
@@ -525,6 +527,12 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
                 break
 
         primary_key: Optional[PrototypeKey] = None
+        abs_np = np.eye(4, dtype=float)
+        if abs_mat is not None:
+            try:
+                abs_np = np.array(abs_mat, dtype=float).reshape(4, 4)
+            except Exception:
+                abs_np = np.eye(4, dtype=float)
 
         if mapped_items:
             for mi in mapped_items:
@@ -540,7 +548,7 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
         else:
             repmap_from_type = None
             if type_ref is not None:
-                for rm in getattr(type_ref, "RepresentationMaps", None) or []:
+                for rm in getattr(type_ref, "RepresentationMaps", []) or []:
                     repmap_from_type = rm
                     break
             if repmap_from_type is not None:
@@ -555,44 +563,53 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
                 primary_key = PrototypeKey(kind="repmap", identifier=rmid)
             else:
                 mesh = triangulated_to_dict(geom)
-                signature = compute_mesh_signature(mesh)
-                type_key = None
-                if type_guid or type_name:
-                    type_key = (type_guid or "", type_name or "")
-                canonical_digest = None
-                if type_key and type_key in type_to_digest:
-                    canonical_digest = type_to_digest[type_key]
+                try:
+                    abs_inv = np.linalg.inv(abs_np)
+                except np.linalg.LinAlgError:
+                    abs_inv = np.eye(4, dtype=float)
+                localized_mesh = _localize_mesh(mesh, abs_inv)
+                signature = compute_mesh_signature(localized_mesh) if use_hash_dedup else None
+                type_key = (type_guid or "", type_name or "") if (type_guid or type_name) else None
+                digest = None
+                if use_hash_dedup:
+                    digest = type_to_digest.get(type_key) if type_key else None
+                    if digest is None and signature is not None:
+                        digest = signature_to_digest.get(signature)
+                    if digest is None:
+                        digest = mesh_hash(localized_mesh, precision=6)
+                        if signature is not None:
+                            signature_to_digest[signature] = digest
+                        if type_key:
+                            type_to_digest[type_key] = digest
                 else:
-                    canonical_digest = signature_to_digest.get(signature)
-                placement_tuple = tuple(placement_np.reshape(-1).tolist())
-                if canonical_digest is None:
-                    digest = mesh_hash(mesh, precision=6)
-                    signature_to_digest[signature] = digest
-                    if type_key:
-                        type_to_digest[type_key] = digest
+                    digest = f"unique_{shape.id}"
+
+                bucket = hashes.get(digest)
+                if bucket is None:
                     bucket = HashProto(
                         digest=digest,
                         name=get_type_name(product),
                         type_name=type_name,
                         type_guid=type_guid,
-                        mesh=mesh,
+                        mesh=localized_mesh,
                         materials=list(materials),
                         material_ids=list(material_ids),
                         signature=signature,
+                        canonical_frame=tuple(abs_np.reshape(-1).tolist()),
                         count=1,
                     )
                     hashes[digest] = bucket
-                    canonical_digest = digest
                 else:
-                    bucket = hashes[canonical_digest]
                     bucket.count += 1
                     if bucket.mesh is None:
-                        bucket.mesh = mesh
+                        bucket.mesh = localized_mesh
                     if not bucket.materials and materials:
                         bucket.materials = list(materials)
                     if not bucket.material_ids and material_ids:
                         bucket.material_ids = list(material_ids)
-                primary_key = PrototypeKey(kind="hash", identifier=canonical_digest)
+                    if bucket.canonical_frame is None:
+                        bucket.canonical_frame = tuple(abs_np.reshape(-1).tolist())
+                primary_key = PrototypeKey(kind="hash", identifier=digest)
 
         if primary_key is None:
             continue
@@ -612,6 +629,20 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
         except Exception:
             product_id = None
 
+        proto_delta_tuple: Optional[Tuple[float, ...]] = None
+        if options.enable_instancing and abs_mat is not None and primary_key.kind == "hash":
+            bucket = hashes.get(primary_key.identifier)
+            if bucket and bucket.canonical_frame is not None:
+                try:
+                    canonical_np = np.array(bucket.canonical_frame, dtype=float).reshape(4, 4)
+                    delta_np = np.matmul(np.linalg.inv(canonical_np), abs_np)
+                    if not np.allclose(delta_np, np.eye(4), atol=1e-8):
+                        proto_delta_tuple = tuple(delta_np.reshape(-1).tolist())
+                except Exception:
+                    proto_delta_tuple = None
+
+        attributes = collect_instance_attributes(product) if options.convert_metadata else {}
+
         instances[step_id] = InstanceRecord(
             step_id=step_id,
             product_id=product_id,
@@ -620,7 +651,8 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
             transform=abs_mat,
             material_ids=list(material_ids),
             materials=list(materials),
-            attributes=collect_instance_attributes(product),
+            attributes=attributes,
+            prototype_delta=proto_delta_tuple,
         )
 
     map_conversion = extract_map_conversion(ifc_file)
@@ -633,11 +665,6 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
         instances=instances,
         map_conversion=map_conversion,
     )
-
-
-
-
-
 
 def _as_float(v, default=0.0):
     """
