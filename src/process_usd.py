@@ -5,7 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
-from src.process_ifc import PrototypeCaches, PrototypeKey
+from src.process_ifc import PrototypeCaches, PrototypeKey, ConversionOptions
 from src.utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
 
 try:
@@ -372,6 +372,7 @@ def author_prototype_layer(
     caches: PrototypeCaches,
     output_dir: Path,
     base_name: str,
+    options: ConversionOptions,
 ) -> Tuple[Sdf.Layer, Dict[PrototypeKey, Sdf.Path]]:
     proto_file = (output_dir / f"{base_name}_prototypes.usda").resolve()
     proto_layer = Sdf.Layer.CreateNew(proto_file.as_posix())
@@ -438,6 +439,7 @@ def author_material_layer(
     output_dir: Path,
     base_name: str,
     proto_layer: Sdf.Layer,
+    options: ConversionOptions,
 ) -> Tuple[Sdf.Layer, Dict[PrototypeKey, List[Sdf.Path]]]:
     material_file = (output_dir / f"{base_name}_materials.usda").resolve()
     material_layer = Sdf.Layer.CreateNew(material_file.as_posix())
@@ -554,6 +556,7 @@ def author_instance_layer(
     proto_paths: Dict[PrototypeKey, Sdf.Path],
     output_dir: Path,
     base_name: str,
+    options: ConversionOptions,
 ) -> Sdf.Layer:
     inst_file = (output_dir / f"{base_name}_instances.usda").resolve()
     inst_layer = Sdf.Layer.CreateNew(inst_file.as_posix())
@@ -588,14 +591,24 @@ def author_instance_layer(
                 except Exception as exc:
                     print(f"?? Failed to author transform for instance {record.step_id}: {exc}")
 
-            _author_instance_attributes(inst_prim, record.attributes)
+            if options.convert_metadata and record.attributes:
+                _author_instance_attributes(inst_prim, record.attributes)
 
             ref_path = inst_path.AppendChild("Prototype")
             ref_prim = stage.DefinePrim(ref_path, "Xform")
             refs = ref_prim.GetReferences()
             refs.ClearReferences()
             refs.AddReference("", proto_path)
-            ref_prim.SetInstanceable(True)
+
+            ref_xform = UsdGeom.Xform(ref_prim)
+            ref_xform.ClearXformOpOrder()
+            if record.prototype_delta:
+                try:
+                    ref_xform.AddTransformOp().Set(np_to_gf_matrix(record.prototype_delta))
+                except Exception as exc:
+                    print(f"?? Failed to apply prototype delta for instance {record.step_id}: {exc}")
+
+            ref_prim.SetInstanceable(bool(options.enable_instancing))
 
     return inst_layer
 

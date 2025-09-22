@@ -5,8 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]  # -> c:\Users\samue\_dev\usdx
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-
-from src.process_ifc import build_prototypes
+from src.process_ifc import build_prototypes, ConversionOptions
 from src.process_usd import (
     create_usd_stage,
     author_prototype_layer,
@@ -18,10 +17,15 @@ from src.process_usd import (
 
 DATA_PATH = Path(r"\Users\samue\_dev\usd_root\usdex\data\SRL-WPD-TVC-UTU8-MOD-CTU-BUW-000001.ifc").resolve()
 OUTPUT_DIR = ROOT / "data" / "output"  # -> c:\Users\samue\_dev\usdx\data\output"
-# OUTPUT_DIR = DATA_PATH.parent / "output" --- IGNORE ---
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 BASE_NAME = DATA_PATH.stem
 STAGE_PATH = OUTPUT_DIR / f"{BASE_NAME}.usda"
+
+OPTIONS = ConversionOptions(
+    enable_instancing=True,
+    enable_hash_dedup=True,
+    convert_metadata=True,
+)
 
 def main():
     import ifcopenshell
@@ -29,15 +33,15 @@ def main():
     print(f"Loading IFC from {DATA_PATH}")
     ifc = ifcopenshell.open(DATA_PATH.as_posix())
 
-    caches = build_prototypes(ifc)
+    caches = build_prototypes(ifc, OPTIONS)
     print(f"Discovered {len(caches.repmaps)} repmap prototypes and {len(caches.hashes)} fallback meshes")
     print(f"Captured {len(caches.instances)} instances")
 
     stage = create_usd_stage(STAGE_PATH)
-    proto_layer, proto_paths = author_prototype_layer(stage, caches, OUTPUT_DIR, BASE_NAME)
-    mat_layer, material_paths = author_material_layer(stage, caches, proto_paths, OUTPUT_DIR, BASE_NAME, proto_layer)
+    proto_layer, proto_paths = author_prototype_layer(stage, caches, OUTPUT_DIR, BASE_NAME, OPTIONS)
+    mat_layer, material_paths = author_material_layer(stage, caches, proto_paths, OUTPUT_DIR, BASE_NAME, proto_layer, OPTIONS)
     bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
-    inst_layer = author_instance_layer(stage, caches, proto_paths, OUTPUT_DIR, BASE_NAME)
+    inst_layer = author_instance_layer(stage, caches, proto_paths, OUTPUT_DIR, BASE_NAME, OPTIONS)
 
     apply_stage_anchor_transform(
         stage,
@@ -61,4 +65,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
