@@ -1,4 +1,4 @@
-# 0 . ---------------------------- Imports ----------------------------
+﻿# 0 . ---------------------------- Imports ----------------------------
 from collections import Counter
 import multiprocessing
 import numpy as np
@@ -53,6 +53,7 @@ class HashProto:
     materials: List[Any] = field(default_factory=list)
     material_ids: List[int] = field(default_factory=list)
     signature: Optional[Tuple[Any, ...]] = None
+    canonical_frame: Optional[Tuple[float, ...]] = None
     count: int = 0
 
 @dataclass(frozen=True)
@@ -563,6 +564,7 @@ def build_prototypes(ifc_file) -> PrototypeCaches:
                     canonical_digest = type_to_digest[type_key]
                 else:
                     canonical_digest = signature_to_digest.get(signature)
+                placement_tuple = tuple(placement_np.reshape(-1).tolist())
                 if canonical_digest is None:
                     digest = mesh_hash(mesh, precision=6)
                     signature_to_digest[signature] = digest
