@@ -17,7 +17,8 @@ from src.process_usd import (
 )
 
 DATA_PATH = Path(r"\Users\samue\_dev\usd_root\usdex\data\SRL-WPD-TVC-UTU8-MOD-CTU-BUW-000001.ifc").resolve()
-OUTPUT_DIR = DATA_PATH.parent / "output"
+OUTPUT_DIR = ROOT / "data" / "output"  # -> c:\Users\samue\_dev\usdx\data\output"
+# OUTPUT_DIR = DATA_PATH.parent / "output" --- IGNORE ---
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 BASE_NAME = DATA_PATH.stem
 STAGE_PATH = OUTPUT_DIR / f"{BASE_NAME}.usda"
