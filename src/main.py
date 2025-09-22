@@ -23,7 +23,7 @@ STAGE_PATH = OUTPUT_DIR / f"{BASE_NAME}.usda"
 
 OPTIONS = ConversionOptions(
     enable_instancing=True,
-    enable_hash_dedup=True,
+    enable_hash_dedup=False,
     convert_metadata=True,
 )
 

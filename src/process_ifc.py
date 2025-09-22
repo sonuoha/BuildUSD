@@ -19,6 +19,21 @@ try:
 except Exception:
     _HAVE_IFC_UTIL_SHAPE = False
 
+def _localize_mesh(mesh: dict, matrix_inv: np.ndarray) -> dict:
+    """Return a copy of mesh with vertices transformed by matrix_inv (4x4)."""
+    if mesh is None:
+        return None
+    verts = mesh.get("vertices")
+    if verts is None:
+        return mesh
+    verts_np = np.asarray(verts, dtype=float).reshape(-1, 3)
+    ones = np.ones((verts_np.shape[0], 1), dtype=float)
+    homo = np.hstack((verts_np, ones))
+    localized = (homo @ matrix_inv.T)[:, :3]
+    mesh_copy = dict(mesh)
+    mesh_copy["vertices"] = localized
+    return mesh_copy
+
 def _is_identity16(mat16, atol=1e-10):
     try:
         arr = np.array(mat16, dtype=float).reshape(4, 4)
