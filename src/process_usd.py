@@ -522,18 +522,40 @@ def bind_materials_to_prototypes(
 def _author_namespaced_dictionary_attributes(prim: Usd.Prim, namespace: str, entries: Dict[str, Any]) -> None:
     if not entries:
         return
+
+    namespace_payload: Dict[str, Any] = {}
     for raw_name, value in entries.items():
         if value is None:
             continue
         token = _sanitize_identifier(raw_name, fallback="Unnamed")
-        key = f"ifc:{namespace}:{token}"
         if isinstance(value, dict):
             payload = {k: v for k, v in value.items() if v is not None}
             if not payload:
                 continue
         else:
             payload = {"value": value}
-        prim.SetCustomDataByKey(key, payload)
+        namespace_payload[token] = payload
+
+    if not namespace_payload:
+        return
+
+    custom_data = dict(prim.GetCustomData() or {})
+    ifc_block = custom_data.get("ifc")
+    if isinstance(ifc_block, dict):
+        ifc_block = dict(ifc_block)
+    else:
+        ifc_block = {}
+
+    ns_block = ifc_block.get(namespace)
+    if isinstance(ns_block, dict):
+        ns_block = dict(ns_block)
+    else:
+        ns_block = {}
+
+    ns_block.update(namespace_payload)
+    ifc_block[namespace] = ns_block
+    custom_data["ifc"] = ifc_block
+    prim.SetCustomData(custom_data)
 
 
 def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, Any]]) -> None:
@@ -637,6 +659,84 @@ def _length_to_meters(value: float, unit_hint: str) -> float:
     factor = _UNIT_FACTORS.get((unit_hint or "m").lower(), 1.0)
     return float(value) * factor
 
+
+
+def _projected_to_lonlat(
+    easting: float,
+    northing: float,
+    height: float = 0.0,
+    coordinate_system: str = "EPSG:7855",
+    unit_hint: str = "m",
+) -> Optional[Tuple[float, float, Optional[float]]]:
+    """Convert projected east/north (+ optional height) into lon/lat degrees."""
+    if not _HAVE_PYPROJ:
+        print("?? assign_world_geolocation: pyproj unavailable; skipping lon/lat computation")
+        return None
+
+    scale = _UNIT_FACTORS.get((unit_hint or "m").lower(), 1.0)
+    try:
+        e_m = float(easting) * scale
+        n_m = float(northing) * scale
+        h_m = float(height or 0.0) * scale
+    except Exception as exc:
+        print(f"?? assign_world_geolocation: invalid coordinate values: {exc}")
+        return None
+
+    try:
+        src = CRS.from_user_input(coordinate_system)
+        dest = CRS.from_epsg(4326)
+        transformer = Transformer.from_crs(src, dest, always_xy=True)
+    except Exception as exc:
+        print(f"?? assign_world_geolocation: failed to build transformer for '{coordinate_system}': {exc}")
+        return None
+
+    try:
+        lon, lat, alt = transformer.transform(e_m, n_m, h_m, errcheck=False)
+    except Exception:
+        try:
+            lon, lat = transformer.transform(e_m, n_m, errcheck=False)
+            alt = None
+        except Exception as exc:
+            print(f"?? assign_world_geolocation: failed to transform coordinates: {exc}")
+            return None
+
+    return float(lon), float(lat), (float(alt) if alt is not None else None)
+
+
+
+def assign_world_geolocation(
+    stage: Usd.Stage,
+    easting: float,
+    northing: float,
+    height: float = 0.0,
+    coordinate_system: str = "EPSG:7855",
+    unit_hint: str = "m",
+) -> Optional[Tuple[float, float, float]]:
+    """Author lon/lat/height metadata on the World prim given projected coordinates."""
+
+    world_prim = stage.GetPrimAtPath("/World")
+    if not world_prim:
+        raise RuntimeError("/World prim not found on stage")
+
+    converted = _projected_to_lonlat(easting, northing, height, coordinate_system, unit_hint)
+    if converted is None:
+        return None
+
+    lon, lat, alt = converted
+    if alt is None:
+        alt = float(_length_to_meters(height, unit_hint))
+
+    attributes = {
+        "cesium:anchor:longitude": float(lon),
+        "cesium:anchor:latitude": float(lat),
+        "cesium:anchor:height": float(alt),
+    }
+
+    for attr_name, value in attributes.items():
+        attr = world_prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Double)
+        attr.Set(value)
+
+    return float(lon), float(lat), float(alt)
 
 
 def apply_stage_anchor_transform(
