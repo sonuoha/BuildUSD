@@ -386,8 +386,7 @@ def author_prototype_layer(
     used_names: Dict[str, int] = {}
 
     with Usd.EditContext(stage, proto_layer):
-        proto_root_xf = UsdGeom.Xform.Define(stage, proto_root)
-        proto_root_xf.ClearXformOpOrder()
+        UsdGeom.Scope.Define(stage, proto_root)
 
         for key, proto in _iter_prototypes(caches):
             mesh_data = _flatten_mesh_arrays(getattr(proto, "mesh", None))
@@ -455,8 +454,7 @@ def author_material_layer(
     used_names: Dict[str, int] = {}
 
     with Usd.EditContext(stage, material_layer):
-        material_root_xf = UsdGeom.Xform.Define(stage, material_root)
-        material_root_xf.ClearXformOpOrder()
+        UsdGeom.Scope.Define(stage, material_root)
 
         for key, proto_path in proto_paths.items():
             materials = _prototype_materials(caches, key)
@@ -570,7 +568,8 @@ def author_instance_layer(
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
     with Usd.EditContext(stage, inst_layer):
-        UsdGeom.Xform.Define(stage, inst_root)
+        inst_root_xf = UsdGeom.Xform.Define(stage, inst_root)
+        inst_root_xf.ClearXformOpOrder()
 
         for record in caches.instances.values():
             base_name_candidate = _sanitize_identifier(record.name, fallback=f"Ifc_{record.step_id}")
