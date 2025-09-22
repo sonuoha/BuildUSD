@@ -567,6 +567,7 @@ def author_instance_layer(
 
     inst_root = Sdf.Path("/World/Instances")
     used_names: Dict[str, int] = {}
+    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
     with Usd.EditContext(stage, inst_layer):
         UsdGeom.Xform.Define(stage, inst_root)
@@ -575,11 +576,6 @@ def author_instance_layer(
             base_name_candidate = _sanitize_identifier(record.name, fallback=f"Ifc_{record.step_id}")
             inst_name = _unique_name(base_name_candidate, used_names)
             inst_path = inst_root.AppendChild(inst_name)
-
-            proto_path = proto_paths.get(record.prototype)
-            if proto_path is None:
-                print(f"?? Missing prototype for instance {record.step_id}; skipping")
-                continue
 
             xform = UsdGeom.Xform.Define(stage, inst_path)
             xform.ClearXformOpOrder()
@@ -593,6 +589,29 @@ def author_instance_layer(
 
             if options.convert_metadata and record.attributes:
                 _author_instance_attributes(inst_prim, record.attributes)
+
+            if record.mesh:
+                mesh_data = _flatten_mesh_arrays(record.mesh)
+                if not mesh_data:
+                    print(f"?? Missing mesh payload for instance {record.step_id}; skipping")
+                    continue
+                verts, faces = mesh_data
+                write_usd_mesh(
+                    stage,
+                    inst_path,
+                    "Geom",
+                    verts,
+                    faces,
+                    abs_mat=None,
+                    material_ids=list(record.material_ids or []),
+                    stage_meters_per_unit=stage_meters_per_unit,
+                )
+                continue
+
+            proto_path = proto_paths.get(record.prototype)
+            if proto_path is None:
+                print(f"?? Missing prototype for instance {record.step_id}; skipping")
+                continue
 
             ref_path = inst_path.AppendChild("Prototype")
             ref_prim = stage.DefinePrim(ref_path, "Xform")

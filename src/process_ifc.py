@@ -95,13 +95,14 @@ class MapConversionData:
 class InstanceRecord:
     step_id: int
     product_id: Optional[int]
-    prototype: PrototypeKey
+    prototype: Optional[PrototypeKey]
     name: str
     transform: Optional[Tuple[float, ...]]
     material_ids: List[int] = field(default_factory=list)
     materials: List[Any] = field(default_factory=list)
     attributes: Dict[str, Any] = field(default_factory=dict)
     prototype_delta: Optional[Tuple[float, ...]] = None
+    mesh: Optional[Dict[str, Any]] = None
 
 @dataclass
 class PrototypeCaches:
@@ -501,10 +502,6 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             repmaps[rmid] = info
         return info
 
-    use_hash_dedup = options.enable_instancing and options.enable_hash_dedup
-    signature_to_digest: Dict[Tuple[Any, ...], str] = {} if use_hash_dedup else {}
-    type_to_digest: Dict[Tuple[str, str], str] = {} if use_hash_dedup else {}
-
     it = ifcopenshell.geom.iterator(s_local, ifc_file, multiprocessing.cpu_count())
     if not it.initialize():
         raise RuntimeError("iterator init failed")
@@ -555,6 +552,8 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             except Exception:
                 abs_np = np.eye(4, dtype=float)
 
+        instance_mesh: Optional[Dict[str, Any]] = None
+
         if mapped_items:
             for mi in mapped_items:
                 rmid = mi.MappingSource.id()
@@ -583,60 +582,15 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     info.material_ids = list(material_ids)
                 primary_key = PrototypeKey(kind="repmap", identifier=rmid)
             else:
-                mesh = triangulated_to_dict(geom)
-                try:
-                    abs_inv = np.linalg.inv(abs_np)
-                except np.linalg.LinAlgError:
-                    abs_inv = np.eye(4, dtype=float)
-                localized_mesh = _localize_mesh(mesh, abs_inv)
-                signature = compute_mesh_signature(localized_mesh) if use_hash_dedup else None
-                type_key = (type_guid or "", type_name or "") if (type_guid or type_name) else None
-                digest = None
-                if use_hash_dedup:
-                    digest = type_to_digest.get(type_key) if type_key else None
-                    if digest is None and signature is not None:
-                        digest = signature_to_digest.get(signature)
-                    if digest is None:
-                        digest = mesh_hash(localized_mesh, precision=6)
-                        if signature is not None:
-                            signature_to_digest[signature] = digest
-                        if type_key:
-                            type_to_digest[type_key] = digest
-                else:
-                    digest = f"unique_{shape.id}"
+                instance_mesh = triangulated_to_dict(geom)
+                primary_key = None
 
-                bucket = hashes.get(digest)
-                if bucket is None:
-                    bucket = HashProto(
-                        digest=digest,
-                        name=get_type_name(product),
-                        type_name=type_name,
-                        type_guid=type_guid,
-                        mesh=localized_mesh,
-                        materials=list(materials),
-                        material_ids=list(material_ids),
-                        signature=signature,
-                        canonical_frame=tuple(abs_np.reshape(-1).tolist()),
-                        count=1,
-                    )
-                    hashes[digest] = bucket
-                else:
-                    bucket.count += 1
-                    if bucket.mesh is None:
-                        bucket.mesh = localized_mesh
-                    if not bucket.materials and materials:
-                        bucket.materials = list(materials)
-                    if not bucket.material_ids and material_ids:
-                        bucket.material_ids = list(material_ids)
-                    if bucket.canonical_frame is None:
-                        bucket.canonical_frame = tuple(abs_np.reshape(-1).tolist())
-                primary_key = PrototypeKey(kind="hash", identifier=digest)
-
-        if primary_key is None:
+        if primary_key is None and instance_mesh is None:
             continue
 
         step_id = shape.id
-        step_keys[step_id] = primary_key
+        if primary_key is not None:
+            step_keys[step_id] = primary_key
 
         fallback = getattr(product, "GlobalId", None)
         if not fallback:
@@ -651,7 +605,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             product_id = None
 
         proto_delta_tuple: Optional[Tuple[float, ...]] = None
-        if options.enable_instancing and abs_mat is not None and primary_key.kind == "hash":
+        if (
+            options.enable_instancing
+            and abs_mat is not None
+            and primary_key is not None
+            and primary_key.kind == "hash"
+        ):
             bucket = hashes.get(primary_key.identifier)
             if bucket and bucket.canonical_frame is not None:
                 try:
@@ -674,6 +633,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             materials=list(materials),
             attributes=attributes,
             prototype_delta=proto_delta_tuple,
+            mesh=instance_mesh,
         )
 
     map_conversion = extract_map_conversion(ifc_file)
