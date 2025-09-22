@@ -56,6 +56,12 @@ class HashProto:
     canonical_frame: Optional[Tuple[float, ...]] = None
     count: int = 0
 
+@dataclass
+class ConversionOptions:
+    enable_instancing: bool = True
+    enable_hash_dedup: bool = True
+    convert_metadata: bool = True
+
 @dataclass(frozen=True)
 class PrototypeKey:
     kind: Literal["repmap", "hash"]
