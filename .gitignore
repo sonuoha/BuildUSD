@@ -12,9 +12,9 @@ wheels/
 .venv
 
 # Local Development files
-src\dev\*.py
-src\dev\__pycache__\*.pyc
-src\dev\__pycache__\*.pyo
+src/dev/*.py
+src/dev/__pycache__/*.pyc
+src/dev/__pycache__/*.pyo
 
 # Ignore heavy BIM sample files
 /output/*.usd*
@@ -23,3 +23,9 @@ src\dev\__pycache__\*.pyo
 /data/input/*.rvt
 /data/input/*.usda
 /data/input/*.ifc
+
+# Generated USD artifacts
+output/*.usd*
+output/**/*.usd*
+data/output/*.usd*
+data/output/**/*.usd*
