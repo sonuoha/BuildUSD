@@ -823,3 +823,82 @@ def apply_stage_anchor_transform(
     world_xform = UsdGeom.Xform(world_prim)
     world_xform.ClearXformOpOrder()
     world_xform.AddTransformOp().Set(matrix)
+
+
+# 9. ---------------------------- Federated master view ----------------------------
+
+def _sanitize_identifier(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
+    """Local-lightweight sanitizer for prim names (dup of earlier helper)."""
+    import re as _re
+    base = str(raw_name or fallback or "Unnamed")
+    name = _re.sub(r"[^A-Za-z0-9_]", "_", base)
+    name = _re.sub(r"_+", "_", name).strip("_")
+    if not name:
+        name = "Unnamed"
+    if name[0].isdigit():
+        name = "_" + name
+    return name[:63]
+
+
+def update_federated_view(
+    master_stage_path: Path,
+    payload_stage_path: Path,
+    payload_prim_name: Optional[str] = None,
+) -> Sdf.Layer:
+    """Create or update a federated master stage and add an unloaded payload.
+
+    - Creates the master stage if it does not exist, with /World as default prim.
+    - Adds/ensures an Xform at /World/Federated.
+    - Adds a child Xform for the payload (named by `payload_prim_name` or file stem),
+      authors a payload arc to the payload stage's /World, and sets the child inactive
+      on first creation (so it's unloaded by default). Existing prims are left as-is.
+    - Avoids duplicate payload entries.
+    """
+
+    # Open or create master stage
+    master_stage_path = Path(master_stage_path).resolve()
+    if master_stage_path.exists():
+        stage = Usd.Stage.Open(master_stage_path.as_posix())
+    else:
+        stage = Usd.Stage.CreateNew(master_stage_path.as_posix())
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        world = UsdGeom.Xform.Define(stage, "/World")
+        stage.SetDefaultPrim(world.GetPrim())
+
+    # Ensure /World/Federated exists
+    fed_root_path = Sdf.Path("/World/Federated")
+    fed_root = UsdGeom.Xform.Define(stage, fed_root_path)
+    fed_root.ClearXformOpOrder()
+
+    # Choose child prim name
+    child_name = _sanitize_identifier(payload_prim_name or Path(payload_stage_path).stem)
+    child_path = fed_root_path.AppendChild(child_name)
+
+    # Define or get child prim
+    created = False
+    if not stage.GetPrimAtPath(child_path):
+        child_x = UsdGeom.Xform.Define(stage, child_path)
+        child_prim = child_x.GetPrim()
+        created = True
+    else:
+        child_prim = stage.GetPrimAtPath(child_path)
+
+    # Author payload (avoid duplicates)
+    payloads = child_prim.GetPayloads()
+    existing = []
+    try:
+        existing = payloads.GetAddedOrExplicitItems()
+    except Exception:
+        existing = []
+    asset = payload_stage_path.as_posix()
+    target_prim = Sdf.Path("/World")
+    already = any((p.assetPath == asset and p.primPath == target_prim) for p in (existing or []))
+    if not already:
+        payloads.AddPayload(asset, target_prim)
+
+    # Set inactive on first creation so payload is unloaded by default
+    if created:
+        child_prim.SetActive(False)
+
+    stage.GetRootLayer().Save()
+    return stage.GetRootLayer()
