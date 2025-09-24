@@ -27,6 +27,15 @@ OPTIONS = ConversionOptions(
 
 
 def parse_args(argv: list[str] | None = None):
+    """Parse CLI arguments.
+
+    Args:
+        argv: Optional list of command-line tokens (defaults to sys.argv when None).
+
+    Returns:
+        argparse.Namespace with fields: map_coordinate_system, input_path,
+        ifc_names, process_all.
+    """
     parser = argparse.ArgumentParser(description="Convert IFC to USD")
     parser.add_argument(
         "--map-coordinate-system",
@@ -59,6 +68,20 @@ def parse_args(argv: list[str] | None = None):
 
 
 def _collect_ifc_paths(input_path: Path, ifc_names: list[str] | None, process_all: bool=True) -> list[Path]:
+    """Resolve IFC paths from a file or directory based on selection flags.
+
+    - If input_path is a file: return just that file.
+    - If a directory: return selected names (if provided), else all *.ifc.
+
+    Args:
+        input_path: File or directory path.
+        ifc_names: Optional names within the directory to process (suffix .ifc added if missing).
+        process_all: When True and directory provided, processes all *.ifc. The
+            function defaults to processing all ifc files when no names provided.
+
+    Returns:
+        A list of resolved IFC file paths.
+    """
     if input_path.is_file():
         return [input_path]
     if not input_path.exists():
@@ -91,6 +114,24 @@ def _process_single_ifc(
     coordinate_system: str,
     options: ConversionOptions,
 ):
+    """Convert a single IFC file to USD and update the federated stage.
+
+    Steps:
+      1) Open IFC and build prototype/instance caches.
+      2) Create a per-file USD stage and author prototypes, materials, instances.
+      3) Apply stage anchor transform and write WGS84 metadata to /World.
+      4) Save layers and stage; register as a payload under /World/<file_stem>
+         inside the federated "Federated Model.usda".
+
+    Args:
+        ifc_path: Path to the IFC file to convert.
+        output_root: Directory for the resulting USD files.
+        coordinate_system: EPSG or CRS string for geospatial conversion.
+        options: Conversion options controlling instancing, hashing, metadata.
+
+    Returns:
+        A dict summarizing outputs, counts, and WGS84 tuple.
+    """
     import ifcopenshell
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -162,6 +203,15 @@ def _process_single_ifc(
 
 
 def main(argv: list[str] | None = None, map_coordinate_system: str = "EPSG:7855"):
+    """Main entrypoint supporting CLI and programmatic invocation.
+
+    Pass argv to control inputs when calling from VS Code tasks, notebooks, or
+    tests. When invoked as a script (python src/main.py), it reads sys.argv.
+
+    Args:
+        argv: Optional CLI tokens; None to use sys.argv.
+        map_coordinate_system: Default CRS when not specified in argv.
+    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     log = logging.getLogger("ifc_usd")
 
@@ -192,3 +242,18 @@ def main(argv: list[str] | None = None, map_coordinate_system: str = "EPSG:7855"
 
 if __name__ == "__main__":
     main()
+"""IFC→USD conversion entrypoint.
+
+This module provides a CLI and VS Code-friendly main for converting one or
+more IFC files into USD stages. For each IFC:
+  - Builds prototype and instance caches from IFC (process_ifc).
+  - Authors a USD stage with prototypes, materials, and instances (process_usd).
+  - Applies geospatial anchoring and WGS84 metadata.
+  - Updates a federated master stage ("Federated Model.usda") with an unloaded
+    payload per file, placed under /World/<file_stem>.
+
+It supports:
+  - Single-file input or a directory of IFCs.
+  - Selection via --ifc-names or process-all via --all.
+  - Programmatic invocation by passing argv to main()/parse_args().
+"""
