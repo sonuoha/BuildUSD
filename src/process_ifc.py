@@ -48,6 +48,7 @@ def _is_identity16(mat16, atol=1e-10):
 
 @dataclass
 class MeshProto:
+    """Prototype representing a single IFC representation map (type-based mesh)."""
     repmap_id: int
     type_name: Optional[str] = None
     type_class: Optional[str] = None
@@ -60,6 +61,7 @@ class MeshProto:
 
 @dataclass
 class HashProto:
+    """Prototype representing a hashed fallback mesh aggregated from instances."""
     digest: str
     name: Optional[str] = None
     type_name: Optional[str] = None
@@ -73,17 +75,20 @@ class HashProto:
 
 @dataclass
 class ConversionOptions:
+    """Controls conversion behavior: instancing, hash de-dup, and metadata."""
     enable_instancing: bool = True
     enable_hash_dedup: bool = True
     convert_metadata: bool = True
 
 @dataclass(frozen=True)
 class PrototypeKey:
+    """Stable key for prototypes: either by repmap id or fallback hash."""
     kind: Literal["repmap", "hash"]
     identifier: Union[int, str]
 
 @dataclass
 class MapConversionData:
+    """IFC IfcMapConversion parameters used to align stage to map coordinates."""
     eastings: float = 0.0
     northings: float = 0.0
     orthogonal_height: float = 0.0
@@ -93,6 +98,7 @@ class MapConversionData:
 
 @dataclass
 class InstanceRecord:
+    """A single placed IFC product occurrence and its authored payload."""
     step_id: int
     product_id: Optional[int]
     prototype: Optional[PrototypeKey]
@@ -106,6 +112,7 @@ class InstanceRecord:
 
 @dataclass
 class PrototypeCaches:
+    """All prototypes and instances discovered plus optional map conversion."""
     repmaps: Dict[int, MeshProto]
     repmap_counts: Counter
     hashes: Dict[str, HashProto]
@@ -152,6 +159,7 @@ def _select_map_conversion_entity(ifc_file) -> Optional[Any]:
 
 
 def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Extract IfcMapConversion parameters from an IFC file if present."""
     entity = _select_map_conversion_entity(ifc_file)
     if entity is None:
         return None
@@ -293,6 +301,10 @@ def _extract_quantity_value(quantity):
 
 
 def collect_instance_attributes(product) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Collect property sets (psets) and quantities (qtos) for an IFC product.
+
+    Returns a nested dict: {'psets': {Name: {k:v}}, 'qtos': {Name: {k:v}}}.
+    """
     attrs: Dict[str, Dict[str, Dict[str, Any]]] = {'psets': {}, 'qtos': {}}
 
     def merge(container: Dict[str, Dict[str, Any]], name: Optional[str], data: Dict[str, Any]):

@@ -67,6 +67,15 @@ def _unique_name(base: str, used: Dict[str, int]) -> str:
 # 2. ---------------------------- Mesh helpers ----------------------------
 
 def create_usd_stage(usd_path, meters_per_unit=1.0):
+    """Create a new USD stage with Z-up and a /World default prim.
+
+    Args:
+        usd_path: Filesystem path where the stage will be written.
+        meters_per_unit: Stage linear units (USD metadata metersPerUnit).
+
+    Returns:
+        The newly created Usd.Stage instance.
+    """
     stage = Usd.Stage.CreateNew(str(usd_path))
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
     stage.SetMetadata("metersPerUnit", float(meters_per_unit))
@@ -118,6 +127,7 @@ def write_usd_mesh(stage, parent_path, mesh_name, verts, faces, abs_mat=None,
 
 
 def _flatten_mesh_arrays(mesh: Dict[str, Any]) -> Optional[Tuple[List[float], List[int]]]:
+    """Return flattened vertex/face arrays from a mesh dict, or None if missing."""
     if not mesh:
         return None
     verts = mesh.get("vertices")
@@ -374,6 +384,10 @@ def author_prototype_layer(
     base_name: str,
     options: ConversionOptions,
 ) -> Tuple[Sdf.Layer, Dict[PrototypeKey, Sdf.Path]]:
+    """Author a prototype layer and fill /World/__Prototypes with meshes.
+
+    Returns the authored Sdf.Layer and mapping from PrototypeKey to prim path.
+    """
     proto_file = (output_dir / f"{base_name}_prototypes.usda").resolve()
     proto_layer = Sdf.Layer.CreateNew(proto_file.as_posix())
 
@@ -440,6 +454,7 @@ def author_material_layer(
     proto_layer: Sdf.Layer,
     options: ConversionOptions,
 ) -> Tuple[Sdf.Layer, Dict[PrototypeKey, List[Sdf.Path]]]:
+    """Author a material layer and return mapping from prototype key to materials."""
     material_file = (output_dir / f"{base_name}_materials.usda").resolve()
     material_layer = Sdf.Layer.CreateNew(material_file.as_posix())
 
@@ -499,6 +514,7 @@ def bind_materials_to_prototypes(
     proto_paths: Dict[PrototypeKey, Sdf.Path],
     material_paths: Dict[PrototypeKey, List[Sdf.Path]],
 ) -> None:
+    """Bind first available material to each prototype mesh if present."""
     if not material_paths:
         return
 
@@ -593,6 +609,7 @@ def _author_namespaced_dictionary_attributes(prim: Usd.Prim, namespace: str, ent
 
 
 def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, Any]]) -> None:
+    """Author IFC property sets and quantities as BIMData attributes on a prim."""
     if not attributes:
         return
     if not isinstance(attributes, dict):
@@ -746,7 +763,16 @@ def assign_world_geolocation(
     coordinate_system: str = "EPSG:7855",
     unit_hint: str = "m",
 ) -> Optional[Tuple[float, float, float]]:
-    """Author lon/lat/height metadata on the World prim given projected coordinates."""
+    """Author lon/lat/height Double attributes on /World from projected coordinates.
+
+    Additionally, if a prim exists at "/CesiumGeoreference", author the
+    following attributes on that prim:
+      - cesium:georeferenceOrigin:latitude
+      - cesium:georeferenceOrigin:longitude
+      - cesium:georeferenceOrigin:height
+
+    If the prim does not exist, create these attributes on /World instead.
+    """
 
     world_prim = stage.GetPrimAtPath("/World")
     if not world_prim:
@@ -769,6 +795,20 @@ def assign_world_geolocation(
     for attr_name, value in attributes.items():
         attr = world_prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Double)
         attr.Set(value)
+
+    # Update Cesium Georeference prim if present; otherwise write on /World
+    target_prim = stage.GetPrimAtPath("/CesiumGeoreference")
+    if not target_prim or not target_prim.IsValid():
+        target_prim = world_prim
+
+    geo_attrs = {
+        "cesium:georeferenceOrigin:latitude": float(lat),
+        "cesium:georeferenceOrigin:longitude": float(lon),
+        "cesium:georeferenceOrigin:height": float(alt),
+    }
+    for name, val in geo_attrs.items():
+        a = target_prim.CreateAttribute(name, Sdf.ValueTypeNames.Double)
+        a.Set(val)
 
     return float(lon), float(lat), float(alt)
 
