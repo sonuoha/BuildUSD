@@ -1,0 +1,48 @@
+{
+  // VS Code launch configurations for running the IFC→USD pipeline
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Run main.py (directory, all)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/main.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--input", "${workspaceFolder}/data/inputs",
+        "--all"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "Python: Run main.py (single file)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/main.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--input", "${workspaceFolder}/data/inputs/YourFile.ifc"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "Python: Run main.py (directory, selected names)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/src/main.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--input", "${workspaceFolder}/data/inputs",
+        "--ifc-names", "A.ifc", "B.ifc"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  ]
+}
+
