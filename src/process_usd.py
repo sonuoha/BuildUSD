@@ -520,42 +520,76 @@ def bind_materials_to_prototypes(
 
 
 def _author_namespaced_dictionary_attributes(prim: Usd.Prim, namespace: str, entries: Dict[str, Any]) -> None:
+    """Author IFC psets/qtos as USD attributes under a BIMData namespace.
+
+    The attribute naming convention is:
+      BIMData:Psets:<PsetName>:<PropName>
+      BIMData:QTO:<QtoName>:<PropName>
+
+    Names are sanitized to be USD-identifier-safe. Values are typed based on Python types.
+    """
     if not entries:
         return
 
-    namespace_payload: Dict[str, Any] = {}
-    for raw_name, value in entries.items():
-        if value is None:
+    root_ns = "BIMData"
+    ns_map = {"pset": "Psets", "qtos": "QTO", "qto": "QTO"}
+    ns1 = ns_map.get(namespace.lower(), _sanitize_identifier(namespace, fallback="Meta"))
+
+    def _set_attr(full_name: str, value: Any) -> None:
+        # Decide type
+        if isinstance(value, bool):
+            attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.Bool)
+            attr.Set(bool(value))
+            return
+        if isinstance(value, int) and not isinstance(value, bool):
+            attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.Int)
+            attr.Set(int(value))
+            return
+        if isinstance(value, float):
+            attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.Double)
+            attr.Set(float(value))
+            return
+        if isinstance(value, (list, tuple)):
+            seq = list(value)
+            if all(isinstance(v, bool) for v in seq):
+                attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.BoolArray)
+                attr.Set(Vt.BoolArray([bool(v) for v in seq]))
+                return
+            if all(isinstance(v, int) and not isinstance(v, bool) for v in seq):
+                attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.IntArray)
+                attr.Set(Vt.IntArray([int(v) for v in seq]))
+                return
+            if all(isinstance(v, (int, float)) for v in seq):
+                attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.DoubleArray)
+                attr.Set(Vt.DoubleArray([float(v) for v in seq]))
+                return
+            if all(isinstance(v, str) for v in seq):
+                attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.StringArray)
+                attr.Set(Vt.StringArray([str(v) for v in seq]))
+                return
+            # Fallback: serialize to string
+            attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.String)
+            attr.Set(str(value))
+            return
+        # Default to string for other types (tokens/enums can be strings)
+        attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.String)
+        attr.Set(str(value))
+
+    for set_name, payload in entries.items():
+        if payload is None:
             continue
-        token = _sanitize_identifier(raw_name, fallback="Unnamed")
-        if isinstance(value, dict):
-            payload = {k: v for k, v in value.items() if v is not None}
-            if not payload:
-                continue
+        set_token = _sanitize_identifier(set_name, fallback="Unnamed")
+        if isinstance(payload, dict):
+            for prop_name, prop_value in payload.items():
+                if prop_value is None:
+                    continue
+                prop_token = _sanitize_identifier(prop_name, fallback="Value")
+                full_attr = f"{root_ns}:{ns1}:{set_token}:{prop_token}"
+                _set_attr(full_attr, prop_value)
         else:
-            payload = {"value": value}
-        namespace_payload[token] = payload
-
-    if not namespace_payload:
-        return
-
-    custom_data = dict(prim.GetCustomData() or {})
-    ifc_block = custom_data.get("ifc")
-    if isinstance(ifc_block, dict):
-        ifc_block = dict(ifc_block)
-    else:
-        ifc_block = {}
-
-    ns_block = ifc_block.get(namespace)
-    if isinstance(ns_block, dict):
-        ns_block = dict(ns_block)
-    else:
-        ns_block = {}
-
-    ns_block.update(namespace_payload)
-    ifc_block[namespace] = ns_block
-    custom_data["ifc"] = ifc_block
-    prim.SetCustomData(custom_data)
+            # If entries is not a dict-of-dicts, write the single value under the set name
+            full_attr = f"{root_ns}:{ns1}:{set_token}:Value"
+            _set_attr(full_attr, payload)
 
 
 def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, Any]]) -> None:
@@ -844,6 +878,7 @@ def update_federated_view(
     master_stage_path: Path,
     payload_stage_path: Path,
     payload_prim_name: Optional[str] = None,
+    parent_prim_path: str = "/World/Federated",
 ) -> Sdf.Layer:
     """Create or update a federated master stage and add an unloaded payload.
 
@@ -855,6 +890,10 @@ def update_federated_view(
     - Avoids duplicate payload entries.
     """
 
+    # Open payload stage to read its units
+    payload_stage = Usd.Stage.Open(Path(payload_stage_path).resolve().as_posix())
+    payload_mpu = float(payload_stage.GetMetadata("metersPerUnit") or 1.0)
+
     # Open or create master stage
     master_stage_path = Path(master_stage_path).resolve()
     if master_stage_path.exists():
@@ -864,9 +903,25 @@ def update_federated_view(
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
         world = UsdGeom.Xform.Define(stage, "/World")
         stage.SetDefaultPrim(world.GetPrim())
+        # Set federated master to meters; do not scale payloads
+        stage.SetMetadata("metersPerUnit", 1.0)
 
-    # Ensure /World/Federated exists
-    fed_root_path = Sdf.Path("/World/Federated")
+    # Ensure /World exists and is default prim
+    world_prim = stage.GetPrimAtPath("/World")
+    if not world_prim:
+        world_prim = UsdGeom.Xform.Define(stage, "/World").GetPrim()
+    if stage.GetDefaultPrim() != world_prim:
+        stage.SetDefaultPrim(world_prim)
+
+    # Validate master stage metersPerUnit matches payload's
+    master_mpu = float(stage.GetMetadata("metersPerUnit") or 1.0)
+    if abs(master_mpu - payload_mpu) > 1e-9:
+        print(f"!! federated_view: units mismatch (master={master_mpu} m, payload={payload_mpu}); payload will not be auto-scaled: {payload_stage_path}")
+    else:
+        print(f"federated_view: units aligned at {master_mpu} m for {payload_stage_path}")
+
+    # Ensure parent exists (e.g., "/World" or "/World/Federated")
+    fed_root_path = Sdf.Path(parent_prim_path)
     fed_root = UsdGeom.Xform.Define(stage, fed_root_path)
     fed_root.ClearXformOpOrder()
 
@@ -891,7 +946,9 @@ def update_federated_view(
     except Exception:
         existing = []
     asset = payload_stage_path.as_posix()
-    target_prim = Sdf.Path("/World")
+    # Use the payload stage's default prim if available to avoid grafting an extra '/World'
+    default_prim = payload_stage.GetDefaultPrim()
+    target_prim = (default_prim.GetPath() if default_prim else Sdf.Path("/World"))
     already = any((p.assetPath == asset and p.primPath == target_prim) for p in (existing or []))
     if not already:
         payloads.AddPayload(asset, target_prim)

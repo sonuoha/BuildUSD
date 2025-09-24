@@ -26,7 +26,7 @@ OPTIONS = ConversionOptions(
 )
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Convert IFC to USD")
     parser.add_argument(
         "--map-coordinate-system",
@@ -39,7 +39,7 @@ def parse_args():
         "--input",
         dest="input_path",
         type=str,
-        default=str((ROOT / "data" / "inputs").resolve()),
+        default=str((Path(r"C:\Users\sonuoha\_dev\datasets\ifc")).resolve()),
         help="Path to an IFC file or a directory containing IFC files (default: data/inputs)",
     )
     parser.add_argument(
@@ -55,7 +55,7 @@ def parse_args():
         action="store_true",
         help="Process all .ifc files in the input directory",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _collect_ifc_paths(input_path: Path, ifc_names: list[str] | None, process_all: bool=True) -> list[Path]:
@@ -141,8 +141,9 @@ def _process_single_ifc(
     print(f"Instance layer: {inst_layer.identifier}")
 
     # Update federated master stage (do not overwrite; add payload inactive by default)
-    master_stage = output_root / "federated_view.usda"
-    update_federated_view(master_stage, stage_path, base_name)
+    master_stage = output_root / "Federated Model.usda"
+    # Use the file stem as the discipline node directly under /World
+    update_federated_view(master_stage, stage_path, base_name, parent_prim_path="/World")
 
     return {
         "ifc": ifc_path,
@@ -160,11 +161,11 @@ def _process_single_ifc(
     }
 
 
-def main(map_coordinate_system: str = "EPSG:7855"):
+def main(argv: list[str] | None = None, map_coordinate_system: str = "EPSG:7855"):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     log = logging.getLogger("ifc_usd")
 
-    args = parse_args()
+    args = parse_args(argv)
     coordinate_system = args.map_coordinate_system or map_coordinate_system
     input_path = Path(args.input_path).resolve()
     output_dir = (ROOT / "data" / "output").resolve()
