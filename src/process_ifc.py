@@ -1,4 +1,5 @@
 ﻿# 0 . ---------------------------- Imports ----------------------------
+import logging
 from collections import Counter
 import multiprocessing
 import numpy as np
@@ -18,6 +19,8 @@ try:
     _HAVE_IFC_UTIL_SHAPE = True
 except Exception:
     _HAVE_IFC_UTIL_SHAPE = False
+
+log = logging.getLogger(__name__)
 
 def _localize_mesh(mesh: dict, matrix_inv: np.ndarray) -> dict:
     """Return a copy of mesh with vertices transformed by matrix_inv (4x4)."""
@@ -467,6 +470,9 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     safe_set(s_local, "weld-vertices", True)
     safe_set(s_local, "disable-opening-subtractions", True)
     safe_set(s_local, "apply-default-materials", False)
+
+    if options.enable_hash_dedup:
+        log.warning("Hash-based deduplication is experimental and may produce inaccurate results; use with caution.")
 
     repmaps: Dict[int, MeshProto] = {}
     repmap_counts: Counter = Counter()
