@@ -43,6 +43,7 @@ Outputs
   - <name>_prototypes.usda
   - <name>_materials.usda
   - <name>_instances.usda
+    - /World/<file>_Instances preserves the IFC spatial hierarchy (Project/Site/Storey/Class).
 - Federated master stage:
   - Federated Model.usda: contains a /World default prim.
   - Each IFC adds a child prim /World/<name> with an inactive payload to that file’s default prim.

@@ -116,6 +116,7 @@ class InstanceRecord:
     materials: List[Any] = field(default_factory=list)
     attributes: Dict[str, Any] = field(default_factory=dict)
     prototype_delta: Optional[Tuple[float, ...]] = None
+    hierarchy: Tuple[Tuple[str, Optional[int]], ...] = field(default_factory=tuple)
     mesh: Optional[Dict[str, Any]] = None
 
 @dataclass
@@ -191,6 +192,69 @@ def sanitize_name(raw_name: Optional[str], fallback: Optional[str] = None) -> st
     if name[0].isdigit():
         name = "_" + name
     return name[:63]
+
+def _entity_label(entity) -> str:
+    for attr in ("Name", "LongName", "Description"):
+        value = getattr(entity, attr, None)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+    label = entity.is_a() if hasattr(entity, "is_a") else "IfcEntity"
+    try:
+        step_id = entity.id()
+    except Exception:
+        step_id = None
+    if step_id is not None:
+        return f"{label}_{step_id}"
+    return label
+
+
+def _resolve_spatial_parent(element):
+    for rel in (getattr(element, "ContainedInStructure", None) or []):
+        parent = getattr(rel, "RelatingStructure", None)
+        if parent is not None:
+            return parent
+    for rel in (getattr(element, "Decomposes", None) or []):
+        parent = getattr(rel, "RelatingObject", None)
+        if parent is not None:
+            return parent
+    return None
+
+
+def _collect_spatial_hierarchy(product) -> Tuple[Tuple[str, Optional[int]], ...]:
+    if product is None or not hasattr(product, "is_a"):
+        return tuple()
+    parents: List[Any] = []
+    seen: set[int] = set()
+    current = product
+    while True:
+        parent = _resolve_spatial_parent(current)
+        if parent is None:
+            break
+        try:
+            parent_id = parent.id()
+        except Exception:
+            parent_id = None
+        if parent_id is not None:
+            if parent_id in seen:
+                break
+            seen.add(parent_id)
+        if hasattr(parent, "is_a") and (parent.is_a("IfcSpatialStructureElement") or parent.is_a("IfcProject")):
+            parents.append(parent)
+        current = parent
+    hierarchy: List[Tuple[str, Optional[int]]] = []
+    for ancestor in reversed(parents):
+        label = _entity_label(ancestor)
+        try:
+            step_id = ancestor.id()
+        except Exception:
+            step_id = None
+        hierarchy.append((label, step_id))
+    class_label = product.is_a() if hasattr(product, "is_a") else "IfcProduct"
+    hierarchy.append((class_label, None))
+    return tuple(hierarchy)
+
 
 # 2. ---------------------------- IFC Geometry Utilities ----------------------------
 
@@ -484,6 +548,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     hashes: Dict[str, HashProto] = {}
     step_keys: Dict[int, PrototypeKey] = {}
     instances: Dict[int, InstanceRecord] = {}
+    hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]] = {}
 
     repmap_to_type: Dict[int, Tuple[Optional[Any], Optional[int]]] = {}
     for t in ifc_file.by_type("IfcTypeProduct"):
@@ -658,6 +723,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
 
         attributes = collect_instance_attributes(product) if options.convert_metadata else {}
 
+        hierarchy_key = product_id if product_id is not None else id(product)
+        hierarchy_nodes = hierarchy_cache.get(hierarchy_key)
+        if hierarchy_nodes is None:
+            hierarchy_nodes = _collect_spatial_hierarchy(product)
+            hierarchy_cache[hierarchy_key] = hierarchy_nodes
+
         instances[step_id] = InstanceRecord(
             step_id=step_id,
             product_id=product_id,
@@ -668,6 +739,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             materials=list(materials),
             attributes=attributes,
             prototype_delta=proto_delta_tuple,
+            hierarchy=hierarchy_nodes,
             mesh=instance_mesh,
         )
 

@@ -1,5 +1,6 @@
 import re
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -637,18 +638,59 @@ def author_instance_layer(
     if inst_layer.identifier not in root_layer.subLayerPaths:
         root_layer.subLayerPaths.append(inst_layer.identifier)
 
-    inst_root = Sdf.Path("/World/Instances")
-    used_names: Dict[str, int] = {}
+    inst_root_name = _sanitize_identifier(f"{base_name}_Instances", fallback="Instances")
+    inst_root = Sdf.Path(f"/World/{inst_root_name}")
+    name_counters: Dict[Sdf.Path, Dict[str, int]] = defaultdict(dict)
+    hierarchy_nodes_by_step: Dict[int, Sdf.Path] = {}
+    hierarchy_nodes_by_label: Dict[Tuple[Sdf.Path, str], Sdf.Path] = {}
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
+
+    def _unique_child_name(parent_path: Sdf.Path, base: str) -> str:
+        return _unique_name(base, name_counters[parent_path])
+
+    def _ensure_group(parent_path: Sdf.Path, label: str, step_id: Optional[int]) -> Sdf.Path:
+        if step_id is not None and step_id in hierarchy_nodes_by_step:
+            return hierarchy_nodes_by_step[step_id]
+        sanitized = _sanitize_identifier(label, fallback=f"Group_{step_id or 'Node'}")
+        if not sanitized:
+            sanitized = "Group"
+        if step_id is None:
+            existing = hierarchy_nodes_by_label.get((parent_path, sanitized))
+            if existing is not None:
+                return existing
+        token = _unique_child_name(parent_path, sanitized)
+        child_path = parent_path.AppendChild(token)
+        prim = stage.GetPrimAtPath(child_path)
+        if not prim:
+            xf = UsdGeom.Xform.Define(stage, child_path)
+            xf.ClearXformOpOrder()
+            prim = xf.GetPrim()
+            Usd.ModelAPI(prim).SetKind('group')
+            prim.SetCustomDataByKey("ifc:label", label)
+            if step_id is not None:
+                try:
+                    prim.SetCustomDataByKey("ifc:stepId", int(step_id))
+                except Exception:
+                    prim.SetCustomDataByKey("ifc:stepId", step_id)
+        if step_id is not None:
+            hierarchy_nodes_by_step[step_id] = child_path
+        else:
+            hierarchy_nodes_by_label[(parent_path, sanitized)] = child_path
+        return child_path
 
     with Usd.EditContext(stage, inst_layer):
         inst_root_xf = UsdGeom.Xform.Define(stage, inst_root)
         inst_root_xf.ClearXformOpOrder()
+        inst_root_xf.GetPrim().SetCustomDataByKey("ifc:sourceFile", base_name)
 
         for record in caches.instances.values():
+            parent_path = inst_root
+            for label, step_id in record.hierarchy:
+                parent_path = _ensure_group(parent_path, label, step_id)
+
             base_name_candidate = _sanitize_identifier(record.name, fallback=f"Ifc_{record.step_id}")
-            inst_name = _unique_name(base_name_candidate, used_names)
-            inst_path = inst_root.AppendChild(inst_name)
+            inst_name = _unique_child_name(parent_path, base_name_candidate)
+            inst_path = parent_path.AppendChild(inst_name)
 
             xform = UsdGeom.Xform.Define(stage, inst_path)
             xform.ClearXformOpOrder()
