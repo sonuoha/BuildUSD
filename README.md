@@ -73,6 +73,7 @@ Manifest Schema
 Notes
 - JSON manifests work immediately; YAML manifests require installing PyYAML.
 - Sample manifests live at src/config/sample_manifest.yaml and src/config/sample_manifest.json.
+- 2D annotation contexts (e.g. alignment strings in IfcAnnotation) are skipped; the converter logs a warning and continues without them.
 
 
 Troubleshooting
