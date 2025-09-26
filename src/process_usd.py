@@ -1,10 +1,11 @@
-﻿import re
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
+from src.config.manifest import BasePointConfig, GeodeticCoordinate
 from src.process_ifc import PrototypeCaches, PrototypeKey, ConversionOptions
 from src.utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
 
@@ -713,32 +714,31 @@ def _length_to_meters(value: float, unit_hint: str) -> float:
 
 
 def _projected_to_lonlat(
-    easting: float,
-    northing: float,
-    height: float = 0.0,
-    coordinate_system: str = "EPSG:7855",
-    unit_hint: str = "m",
+    base_point: BasePointConfig,
+    projected_crs: str,
+    geodetic_crs: str,
 ) -> Optional[Tuple[float, float, Optional[float]]]:
-    """Convert projected east/north (+ optional height) into lon/lat degrees."""
+    """Convert a base point in a projected CRS to geodetic coordinates."""
     if not _HAVE_PYPROJ:
         print("?? assign_world_geolocation: pyproj unavailable; skipping lon/lat computation")
         return None
 
-    scale = _UNIT_FACTORS.get((unit_hint or "m").lower(), 1.0)
+    unit = (base_point.unit or "m").lower()
+    scale = _UNIT_FACTORS.get(unit, 1.0)
     try:
-        e_m = float(easting) * scale
-        n_m = float(northing) * scale
-        h_m = float(height or 0.0) * scale
+        e_m = float(base_point.easting) * scale
+        n_m = float(base_point.northing) * scale
+        h_m = float(base_point.height or 0.0) * scale
     except Exception as exc:
-        print(f"?? assign_world_geolocation: invalid coordinate values: {exc}")
+        print(f"?? assign_world_geolocation: invalid base point values: {exc}")
         return None
 
     try:
-        src = CRS.from_user_input(coordinate_system)
-        dest = CRS.from_epsg(4326)
+        src = CRS.from_user_input(projected_crs)
+        dest = CRS.from_user_input(geodetic_crs or "EPSG:4326")
         transformer = Transformer.from_crs(src, dest, always_xy=True)
     except Exception as exc:
-        print(f"?? assign_world_geolocation: failed to build transformer for '{coordinate_system}': {exc}")
+        print(f"?? assign_world_geolocation: failed to build transformer for '{projected_crs}' -> '{geodetic_crs}': {exc}")
         return None
 
     try:
@@ -754,80 +754,69 @@ def _projected_to_lonlat(
     return float(lon), float(lat), (float(alt) if alt is not None else None)
 
 
-
 def assign_world_geolocation(
     stage: Usd.Stage,
-    easting: float,
-    northing: float,
-    height: float = 0.0,
-    coordinate_system: str = "EPSG:7855",
-    unit_hint: str = "m",
-) -> Optional[Tuple[float, float, float]]:
-    """Author lon/lat/height Double attributes on /World from projected coordinates.
-
-    Additionally, if a prim exists at "/CesiumGeoreference", author the
-    following attributes on that prim:
-      - cesium:georeferenceOrigin:latitude
-      - cesium:georeferenceOrigin:longitude
-      - cesium:georeferenceOrigin:height
-
-    If the prim does not exist, create these attributes on /World instead.
-    """
+    base_point: BasePointConfig,
+    projected_crs: str,
+    geodetic_crs: str = "EPSG:4326",
+    unit_hint: Optional[str] = None,
+    lonlat_override: Optional[GeodeticCoordinate] = None,
+) -> Optional[Tuple[float, float, Optional[float]]]:
+    """Author geodetic metadata (Cesium) for the stage based on a base point."""
 
     world_prim = stage.GetPrimAtPath("/World")
     if not world_prim:
         raise RuntimeError("/World prim not found on stage")
 
-    converted = _projected_to_lonlat(easting, northing, height, coordinate_system, unit_hint)
-    if converted is None:
-        return None
+    if lonlat_override is not None:
+        lon, lat = float(lonlat_override.longitude), float(lonlat_override.latitude)
+        alt = float(lonlat_override.height) if lonlat_override.height is not None else None
+    else:
+        result = _projected_to_lonlat(base_point, projected_crs, geodetic_crs)
+        if result is None:
+            return None
+        lon, lat, alt = result
 
-    lon, lat, alt = converted
-    if alt is None:
-        alt = float(_length_to_meters(height, unit_hint))
+    unit = unit_hint or base_point.unit or "m"
+    alt_fallback = _length_to_meters(base_point.height or 0.0, unit)
+    alt_value = float(alt) if alt is not None else float(alt_fallback)
 
-    attributes = {
-        "cesium:anchor:longitude": float(lon),
-        "cesium:anchor:latitude": float(lat),
-        "cesium:anchor:height": float(alt),
-    }
-
-    for attr_name, value in attributes.items():
-        attr = world_prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Double)
-        attr.Set(value)
-
-    # Update Cesium Georeference prim if present; otherwise write on /World
-    target_prim = stage.GetPrimAtPath("/CesiumGeoreference")
+    target_prim = stage.GetPrimAtPath("/World/CesiumGeoreferencing")
     if not target_prim or not target_prim.IsValid():
         target_prim = world_prim
 
     geo_attrs = {
         "cesium:georeferenceOrigin:latitude": float(lat),
         "cesium:georeferenceOrigin:longitude": float(lon),
-        "cesium:georeferenceOrigin:height": float(alt),
+        "cesium:georeferenceOrigin:height": alt_value,
     }
     for name, val in geo_attrs.items():
-        a = target_prim.CreateAttribute(name, Sdf.ValueTypeNames.Double)
-        a.Set(val)
+        attr = target_prim.CreateAttribute(name, Sdf.ValueTypeNames.Double)
+        attr.Set(float(val))
 
-    return float(lon), float(lat), float(alt)
+    return float(lon), float(lat), alt_value
 
 
 def apply_stage_anchor_transform(
     stage: Usd.Stage,
     caches: PrototypeCaches,
+    base_point: Optional[BasePointConfig] = None,
+    *,
+    align_axes_to_map: bool = False,
+    enable_geo_anchor: bool = True,
+    projected_crs: Optional[str] = None,
+    lonlat: Optional[GeodeticCoordinate] = None,
     map_easting: Optional[float] = None,
     map_northing: Optional[float] = None,
     map_height: Optional[float] = 0.0,
     unit_hint: str = "m",
-    align_axes_to_map: bool = False,
-    enable_geo_anchor: bool = True,
+    coordinate_system: Optional[str] = None,
     longitude: Optional[float] = None,
     latitude: Optional[float] = None,
     altitude: float = 0.0,
-    coordinate_system: Optional[str] = None,
 ) -> None:
-    """Anchor the /World prim so a supplied geospatial point sits at the origin."""
+    """Anchor the /World prim so the supplied base point sits at the origin."""
+
     if not enable_geo_anchor:
         return
 
@@ -835,43 +824,53 @@ def apply_stage_anchor_transform(
     meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
     meters_to_stage = 1.0 / meters_per_unit if meters_per_unit else 1.0
 
+    unit = unit_hint
     anchor_e = map_easting
     anchor_n = map_northing
     anchor_h = map_height if map_height is not None else 0.0
 
-    if (anchor_e is None or anchor_n is None) and longitude is not None and latitude is not None:
-        if coordinate_system is None:
-            raise ValueError("coordinate_system is required when supplying longitude/latitude")
+    if base_point is not None:
+        unit = base_point.unit or unit_hint
+        anchor_e = base_point.easting
+        anchor_n = base_point.northing
+        anchor_h = base_point.height
+
+    geo_override = lonlat
+    if geo_override is None and longitude is not None and latitude is not None:
+        geo_override = GeodeticCoordinate(longitude=float(longitude), latitude=float(latitude), height=float(altitude))
+
+    crs_for_geo = projected_crs or coordinate_system
+
+    if (anchor_e is None or anchor_n is None) and geo_override is not None:
+        if not crs_for_geo:
+            raise ValueError("projected_crs or coordinate_system is required when supplying longitude/latitude")
         if not _HAVE_PYPROJ:
-            raise RuntimeError("pyproj is required to convert geographic coordinates; install pyproj or provide map_easting/map_northing")
+            raise RuntimeError("pyproj is required to convert geographic coordinates; install pyproj or provide map easting/northing")
+        transformer = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_user_input(crs_for_geo), always_xy=True)
         try:
-            dest = CRS.from_user_input(coordinate_system)
+            result = transformer.transform(
+                float(geo_override.longitude),
+                float(geo_override.latitude),
+                float(geo_override.height or 0.0),
+                errcheck=False,
+            )
         except Exception as exc:
-            raise ValueError(f"Unable to interpret coordinate_system '{coordinate_system}': {exc}") from exc
-        if dest.is_geographic and not dest.is_projected:
-            raise ValueError(f"Coordinate system '{dest.name}' is geographic; provide a projected system for east/north conversion")
-        transformer = Transformer.from_crs(CRS.from_epsg(4326), dest, always_xy=True)
-        try:
-            result = transformer.transform(float(longitude), float(latitude), float(altitude), errcheck=False)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to transform lon/lat using {dest}: {exc}") from exc
-        if isinstance(result, (list, tuple)):
-            if len(result) >= 2:
-                anchor_e = float(result[0])
-                anchor_n = float(result[1])
+            raise RuntimeError(f"Failed to transform lon/lat using {crs_for_geo}: {exc}") from exc
+        if isinstance(result, (list, tuple)) and len(result) >= 2:
+            anchor_e = float(result[0])
+            anchor_n = float(result[1])
             if len(result) >= 3:
                 anchor_h = float(result[2])
-        else:
-            raise RuntimeError("Unexpected transform result when converting geographic coordinates")
-        unit_hint = "m"
+        unit = "m"
 
     if anchor_e is None or anchor_n is None:
         print("?? apply_stage_anchor_transform: missing anchoring coordinates; skipping geo alignment")
         return
 
-    e_m = _length_to_meters(anchor_e, unit_hint)
-    n_m = _length_to_meters(anchor_n, unit_hint)
-    h_m = _length_to_meters(anchor_h or 0.0, unit_hint)
+    use_unit = unit or "m"
+    e_m = _length_to_meters(anchor_e, use_unit)
+    n_m = _length_to_meters(anchor_n, use_unit)
+    h_m = _length_to_meters(anchor_h or 0.0, use_unit)
 
     if map_conv:
         x_local, y_local = map_conv.map_to_local_xy(e_m, n_m)
@@ -999,3 +998,4 @@ def update_federated_view(
 
     stage.GetRootLayer().Save()
     return stage.GetRootLayer()
+
