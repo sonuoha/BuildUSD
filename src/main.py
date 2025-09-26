@@ -1,12 +1,14 @@
 ﻿from pathlib import Path
 import sys
 import argparse
+from dataclasses import replace
 import logging
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.config.manifest import BasePointConfig, ConversionManifest, ResolvedFilePlan
 from src.process_ifc import build_prototypes, ConversionOptions
 from src.process_usd import (
     create_usd_stage,
@@ -25,6 +27,11 @@ OPTIONS = ConversionOptions(
     convert_metadata=True,
 )
 
+
+
+DEFAULT_MASTER_STAGE = "Federated Model.usda"
+DEFAULT_GEODETIC_CRS = "EPSG:4326"
+DEFAULT_BASE_POINT = BasePointConfig(easting=333800.4900, northing=5809101.4680, height=0.0, unit="m")
 
 def parse_args(argv: list[str] | None = None):
     """Parse CLI arguments.
@@ -48,8 +55,16 @@ def parse_args(argv: list[str] | None = None):
         "--input",
         dest="input_path",
         type=str,
-        default=str((Path(r"C:\Users\sonuoha\_dev\datasets\ifc")).resolve()),
+        default=str((Path(r"C:\Users\samue\_dev\datasets\ifc\tvc")).resolve()),
         help="Path to an IFC file or a directory containing IFC files (default: data/inputs)",
+    )
+
+    parser.add_argument(
+        "--manifest",
+        dest="manifest_path",
+        type=str,
+        default=None,
+        help="Path to a manifest (YAML or JSON) describing base points and federated masters",
     )
     parser.add_argument(
         "--ifc-names",
@@ -113,25 +128,13 @@ def _process_single_ifc(
     output_root: Path,
     coordinate_system: str,
     options: ConversionOptions,
+    plan: ResolvedFilePlan | None = None,
+    default_base_point: BasePointConfig = DEFAULT_BASE_POINT,
+    default_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
+    default_master_stage: str = DEFAULT_MASTER_STAGE,
 ):
-    """Convert a single IFC file to USD and update the federated stage.
+    """Convert a single IFC file to USD and update the federated stage."""
 
-    Steps:
-      1) Open IFC and build prototype/instance caches.
-      2) Create a per-file USD stage and author prototypes, materials, instances.
-      3) Apply stage anchor transform and write WGS84 metadata to /World.
-      4) Save layers and stage; register as a payload under /World/<file_stem>
-         inside the federated "Federated Model.usda".
-
-    Args:
-        ifc_path: Path to the IFC file to convert.
-        output_root: Directory for the resulting USD files.
-        coordinate_system: EPSG or CRS string for geospatial conversion.
-        options: Conversion options controlling instancing, hashing, metadata.
-
-    Returns:
-        A dict summarizing outputs, counts, and WGS84 tuple.
-    """
     import ifcopenshell
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -147,29 +150,38 @@ def _process_single_ifc(
 
     stage = create_usd_stage(stage_path)
     proto_layer, proto_paths = author_prototype_layer(stage, caches, output_root, base_name, options)
-    mat_layer, material_paths = author_material_layer(stage, caches, proto_paths, output_root, base_name, proto_layer, options)
+    mat_layer, material_paths = author_material_layer(stage, caches, proto_paths, output_dir=output_root, base_name=base_name, proto_layer=proto_layer, options=options)
     bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
     inst_layer = author_instance_layer(stage, caches, proto_paths, output_root, base_name, options)
+
+    effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
+    if effective_base_point is None:
+        raise ValueError(f"No base point configured for {ifc_path.name}; provide a manifest entry or update defaults")
+
+    projected_crs = plan.projected_crs if plan and plan.projected_crs else coordinate_system
+    if not projected_crs:
+        raise ValueError(f"No projected CRS available for {ifc_path.name}; provide --map-coordinate-system or manifest override")
+    geodetic_crs = plan.geodetic_crs if plan and plan.geodetic_crs else default_geodetic_crs
+    master_stage_name = plan.master_stage_filename if plan else default_master_stage
+    lonlat_override = plan.lonlat if plan else None
 
     apply_stage_anchor_transform(
         stage,
         caches,
-        map_easting=333800.4900,
-        map_northing=5809101.4680,
-        map_height=0.0,
-        unit_hint="m",
+        base_point=effective_base_point,
+        projected_crs=projected_crs,
         align_axes_to_map=True,
+        lonlat=lonlat_override,
     )
 
-    print(f"Assigning world geolocation using {coordinate_system}")
-
-    lon, lat, alt = assign_world_geolocation(
+    print(f"Assigning world geolocation using {projected_crs} -> {geodetic_crs}")
+    geodetic_result = assign_world_geolocation(
         stage,
-        easting=333800.4900,
-        northing=5809101.4680,
-        height=0.0,
-        coordinate_system=coordinate_system,
-        unit_hint="m",
+        base_point=effective_base_point,
+        projected_crs=projected_crs,
+        geodetic_crs=geodetic_crs,
+        unit_hint=effective_base_point.unit,
+        lonlat_override=lonlat_override,
     )
 
     stage.Save()
@@ -181,37 +193,35 @@ def _process_single_ifc(
     print(f"Material layer: {mat_layer.identifier}")
     print(f"Instance layer: {inst_layer.identifier}")
 
-    # Update federated master stage (do not overwrite; add payload inactive by default)
-    master_stage = output_root / "Federated Model.usda"
-    # Use the file stem as the discipline node directly under /World
-    update_federated_view(master_stage, stage_path, base_name, parent_prim_path="/World")
+    master_stage_path = (output_root / master_stage_name).resolve()
+    update_federated_view(master_stage_path, stage_path, base_name, parent_prim_path="/World")
 
     return {
         "ifc": ifc_path,
         "stage": stage_path,
+        "master_stage": master_stage_path,
         "layers": {
             "prototype": proto_layer.identifier,
             "material": mat_layer.identifier,
             "instance": inst_layer.identifier,
         },
-        "wgs84": (lon, lat, alt),
+        "geodetic": {
+            "crs": geodetic_crs,
+            "coordinates": geodetic_result,
+        },
+        "wgs84": geodetic_result,
         "counts": {
             "prototypes": len(caches.repmaps) + len(caches.hashes),
             "instances": len(caches.instances),
         },
+        "plan": plan,
+        "projected_crs": projected_crs,
     }
 
 
-def main(argv: list[str] | None = None, map_coordinate_system: str = "EPSG:7855"):
-    """Main entrypoint supporting CLI and programmatic invocation.
+def main(argv: list[str] | None = None, map_coordinate_system: str = "EPSG:7855") -> None:
+    """Main entrypoint supporting CLI and programmatic invocation."""
 
-    Pass argv to control inputs when calling from VS Code tasks, notebooks, or
-    tests. When invoked as a script (python src/main.py), it reads sys.argv.
-
-    Args:
-        argv: Optional CLI tokens; None to use sys.argv.
-        map_coordinate_system: Default CRS when not specified in argv.
-    """
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     log = logging.getLogger("ifc_usd")
 
@@ -221,6 +231,17 @@ def main(argv: list[str] | None = None, map_coordinate_system: str = "EPSG:7855"
     output_dir = (ROOT / "data" / "output").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    manifest: ConversionManifest | None = None
+    if args.manifest_path:
+        manifest_path = Path(args.manifest_path).resolve()
+        try:
+            manifest = ConversionManifest.from_file(manifest_path)
+            print(f"Loaded manifest from {manifest_path}")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load manifest '{manifest_path}': {exc}") from exc
+
+    run_options = replace(OPTIONS, manifest=manifest)
+
     targets = _collect_ifc_paths(input_path, args.ifc_names, args.process_all)
     if not targets:
         print(f"Nothing to process: no IFC files found in {input_path}")
@@ -228,32 +249,65 @@ def main(argv: list[str] | None = None, map_coordinate_system: str = "EPSG:7855"
 
     results = []
     for ifc_fp in targets:
-        res = _process_single_ifc(ifc_fp, output_dir, coordinate_system, OPTIONS)
-        if res and res.get("wgs84"):
-            lon, lat, alt = res["wgs84"]
-            log.info(f"{ifc_fp.name}: WGS84 lon={lon:.8f}, lat={lat:.8f}, alt={alt:.3f}")
+        plan = None
+        if manifest is not None:
+            try:
+                plan = manifest.resolve_for_path(
+                    ifc_fp,
+                    fallback_master_name=DEFAULT_MASTER_STAGE,
+                    fallback_projected_crs=coordinate_system,
+                    fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
+                    fallback_base_point=DEFAULT_BASE_POINT,
+                )
+            except Exception as exc:
+                log.warning("Manifest resolution failed for %s: %s", ifc_fp.name, exc)
+        res = _process_single_ifc(ifc_fp, output_dir, coordinate_system, run_options, plan=plan)
+        if res:
+            geo = res.get("geodetic") or {}
+            coords = geo.get("coordinates")
+            crs = geo.get("crs", DEFAULT_GEODETIC_CRS)
+            if coords and coords[0] is not None and coords[1] is not None:
+                lon, lat = coords[0], coords[1]
+                alt_val = coords[2] if len(coords) > 2 and coords[2] is not None else 0.0
+                log.info(f"{ifc_fp.name}: {crs} lon={lon:.8f}, lat={lat:.8f}, alt={alt_val:.3f}")
         results.append(res)
 
     print("\nSummary:")
     for r in results:
-        c = r.get("counts", {})
-        print(f"- {r['ifc'].name}: stage={r['stage']}, prototypes={c.get('prototypes', 0)}, instances={c.get('instances', 0)}")
+        if not r:
+            continue
+        counts = r.get("counts", {})
+        master_stage = r.get("master_stage")
+        master_display = master_stage.name if isinstance(master_stage, Path) else (str(master_stage) if master_stage else "n/a")
+        coords = (r.get("geodetic") or {}).get("coordinates")
+        if coords and coords[0] is not None and coords[1] is not None:
+            alt_val = coords[2] if len(coords) > 2 and coords[2] is not None else 0.0
+            coord_info = f", geo=({coords[0]:.5f}, {coords[1]:.5f}, {alt_val:.2f})"
+        else:
+            coord_info = ""
+        print(
+            f"- {r['ifc'].name}: stage={r['stage']}, master={master_display}, "
+            f"prototypes={counts.get('prototypes', 0)}, instances={counts.get('instances', 0)}{coord_info}"
+        )
 
 
 if __name__ == "__main__":
     main()
-"""IFC→USD conversion entrypoint.
+"""IFC?USD conversion entrypoint.
 
 This module provides a CLI and VS Code-friendly main for converting one or
 more IFC files into USD stages. For each IFC:
   - Builds prototype and instance caches from IFC (process_ifc).
   - Authors a USD stage with prototypes, materials, and instances (process_usd).
-  - Applies geospatial anchoring and WGS84 metadata.
-  - Updates a federated master stage ("Federated Model.usda") with an unloaded
-    payload per file, placed under /World/<file_stem>.
+  - Applies geospatial anchoring using manifest/default base points and writes
+    geodetic metadata (WGS84 by default).
+  - Updates the resolved federated master stage with an unloaded payload per file,
+    placed under /World/<file_stem>.
 
 It supports:
   - Single-file input or a directory of IFCs.
   - Selection via --ifc-names or process-all via --all.
   - Programmatic invocation by passing argv to main()/parse_args().
 """
+
+

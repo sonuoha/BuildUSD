@@ -1,4 +1,5 @@
 ﻿# 0 . ---------------------------- Imports ----------------------------
+from __future__ import annotations
 import logging
 from collections import Counter
 import multiprocessing
@@ -8,9 +9,12 @@ from pxr import Gf
 
 import math
 import re
-from typing import Dict, Optional, Union, Literal, List, Tuple, Any
+from typing import Dict, Optional, Union, Literal, List, Tuple, Any, TYPE_CHECKING
 from dataclasses import dataclass, field
 import hashlib
+
+if TYPE_CHECKING:
+    from src.config.manifest import ConversionManifest
 
 
 # ifcopenshell util for robust matrices (mapped/type geometry)
@@ -82,6 +86,7 @@ class ConversionOptions:
     enable_instancing: bool = True
     enable_hash_dedup: bool = True
     convert_metadata: bool = True
+    manifest: Optional['ConversionManifest'] = None
 
 @dataclass(frozen=True)
 class PrototypeKey:

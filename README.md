@@ -23,13 +23,15 @@ Install
 
 Usage (CLI)
 - Single IFC file:
-  - python src/main.py --input C:\path\to\file.ifc
+  - python src/main.py --input C:\\path\\to\\file.ifc
 - Directory, specific names:
-  - python src/main.py --input C:\path\to\dir --ifc-names A.ifc B.ifc
+  - python src/main.py --input C:\\path\\to\\dir --ifc-names A.ifc B.ifc
 - Directory, all files:
-  - python src/main.py --input C:\path\to\dir --all
+  - python src/main.py --input C:\\path\\to\\dir --all
 - Custom CRS (default EPSG:7855):
-  - python src/main.py --input C:\path\to\dir --all --map-coordinate-system EPSG:XXXX
+  - python src/main.py --input C:\\path\\to\\dir --all --map-coordinate-system EPSG:XXXX
+- Manifest-driven base points / federated routing:
+  - python src/main.py --input C:\\path\\to\\dir --all --manifest src/config/sample_manifest.json
 
 Usage (VS Code)
 - Press F5 and pick one of the provided launch configurations in .vscode/launch.json.
@@ -47,7 +49,7 @@ Outputs
 
 Units and Geospatial
 - Per-file stages author metersPerUnit as needed; WGS84 (lon/lat/height) are authored on /World as Double attributes:
-  - cesium:anchor:longitude, cesium:anchor:latitude, cesium:anchor:height
+  - cesium:georeferenceOrigin:longitude, cesium:georeferenceOrigin:latitude, cesium:georeferenceOrigin:height
 - Federated Model.usda is authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
 
 IFC Metadata as USD Attributes
@@ -63,8 +65,23 @@ Federated Stage Behavior
 
 Programmatic Use
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
+Manifest Schema
+- defaults: Global fallback for master name, projected/geodetic CRS, and base point.
+- masters: Named federated stages with optional CRS/base point overrides.
+- files: Match rules (name or glob pattern) that choose a master and override CRS/base point or provide lon/lat.
+
+Notes
+- JSON manifests work immediately; YAML manifests require installing PyYAML.
+- Sample manifests live at src/config/sample_manifest.yaml and src/config/sample_manifest.json.
+
 
 Troubleshooting
 - pxr ImportError with _tf/_usd DLLs on Windows: install latest VC++ redistributable x64.
 - CRS conversions require pyproj; if missing, WGS84 attributes won’t be authored.
+
+
+
+
+
+
 
