@@ -527,7 +527,19 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
 
     it = ifcopenshell.geom.iterator(s_local, ifc_file, multiprocessing.cpu_count())
     if not it.initialize():
-        raise RuntimeError("iterator init failed")
+        geom_log = (ifcopenshell.get_log() or "").strip()
+        if "ContextType 'Annotation' not allowed" in geom_log:
+            log.warning("Skipping 2D annotation context; ifcopenshell geom iterator refused to process it. Details: %s", geom_log)
+        else:
+            log.error("Geometry iterator initialisation failed: %s", geom_log or "<no log output>")
+        return PrototypeCaches(
+            repmaps=repmaps,
+            repmap_counts=repmap_counts,
+            hashes=hashes,
+            step_keys=step_keys,
+            instances=instances,
+            map_conversion=extract_map_conversion(ifc_file),
+        )
 
     while it.next():
         shape = it.get()
