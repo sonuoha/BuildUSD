@@ -18,6 +18,16 @@ _DEFAULT_MASTER_NAME = "Federated Model.usda"
 _DEFAULT_GEODETIC_CRS = "EPSG:4326"
 
 
+_INVALID_FILENAME_CHARS = '<>:"/\\|?*'
+
+
+def _sanitize_filename(value: str) -> str:
+    sanitized = ''.join(ch for ch in value if ch not in _INVALID_FILENAME_CHARS)
+    sanitized = sanitized.rstrip(' .')
+    sanitized = sanitized.strip()
+    return sanitized
+
+
 @dataclass
 class BasePointConfig:
     """Projected base-point expressed as east/north/height in a given unit."""
@@ -94,11 +104,15 @@ class MasterConfig:
     lonlat: Optional[GeodeticCoordinate] = None
 
     def resolved_name(self) -> str:
-        name = self.name.strip() if self.name else ""
+        raw = self.name.strip() if self.name else ""
+        name = _sanitize_filename(raw)
         if not name:
-            name = _DEFAULT_MASTER_NAME
+            name = _sanitize_filename(_DEFAULT_MASTER_NAME)
         if not name.lower().endswith(".usda"):
             name = f"{name}.usda"
+        name = _sanitize_filename(name)
+        if not name:
+            name = _DEFAULT_MASTER_NAME
         return name
 
 
