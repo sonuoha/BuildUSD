@@ -34,10 +34,21 @@ masters:
     projected_crs: "EPSG:7855"
     geodetic_crs: "EPSG:4326"
     base_point:
-      easting: 335700.4900  # IVS PBP Easting
-      northing: 5807351.4680  # IVS PBP Northing
+      easting: 335700.4900  # SGWP Easting
+      northing: 5807351.4680  # SGWP PBP Northing
       height: 0.0
-      unit: m   
+      unit: m
+
+  - id: "PWD"
+    name: SRL-WPD-TVC-UPKW-MOD-XDE-PWD-000000"
+    projected_crs: "EPSG:7855"
+    geodetic_crs: "EPSG:4326"
+    base_point:
+      easting: 335700.4900  # PWD PBP Easting
+      northing: 5807351.4680  # PWD PBP Northing
+      height: 0.0
+      unit: m
+      
 
 files:
   - pattern: "*-BUW-*"

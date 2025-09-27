@@ -1040,6 +1040,100 @@ def author_instance_layer(
     return inst_layer
 
 
+def author_annotation_layer(
+    stage: Usd.Stage,
+    caches: PrototypeCaches,
+    output_dir: Path,
+    base_name: str,
+) -> Optional[Sdf.Layer]:
+    if not getattr(caches, "annotations", None):
+        return None
+
+    ann_file = (output_dir / f"{base_name}_annotations.usda").resolve()
+    ann_layer = Sdf.Layer.CreateNew(ann_file.as_posix())
+    root_layer = stage.GetRootLayer()
+    if ann_layer.identifier not in root_layer.subLayerPaths:
+        root_layer.subLayerPaths.append(ann_layer.identifier)
+
+    name_counters: Dict[Sdf.Path, Dict[str, int]] = defaultdict(dict)
+    hierarchy_nodes: Dict[Tuple[Sdf.Path, str, Optional[int]], Sdf.Path] = {}
+
+    def _unique_child_name(parent_path: Sdf.Path, base: str) -> str:
+        used = name_counters[parent_path]
+        count = used.get(base, 0)
+        used[base] = count + 1
+        return base if count == 0 else f"{base}_{count}"
+
+    def _ensure_group(parent_path: Sdf.Path, label: str, step_id: Optional[int]) -> Sdf.Path:
+        key = (parent_path, label, step_id)
+        cached = hierarchy_nodes.get(key)
+        if cached is not None:
+            return cached
+        token = _unique_child_name(parent_path, _sanitize_identifier(label, fallback=f"Group_{step_id or 'Node'}") or "Group")
+        group_path = parent_path.AppendChild(token)
+        xf = UsdGeom.Xform.Define(stage, group_path)
+        xf.ClearXformOpOrder()
+        prim = xf.GetPrim()
+        Usd.ModelAPI(prim).SetKind('group')
+        prim.SetCustomDataByKey("ifc:label", label)
+        if step_id is not None:
+            try:
+                prim.SetCustomDataByKey("ifc:stepId", int(step_id))
+            except Exception:
+                prim.SetCustomDataByKey("ifc:stepId", step_id)
+        hierarchy_nodes[key] = group_path
+        return group_path
+
+    inst_root_name = _sanitize_identifier(f"{base_name}_Instances", fallback="Instances")
+    inst_root_path = Sdf.Path(f"/World/{inst_root_name}")
+    curves_root_token = _sanitize_identifier("Curves2D", fallback="Curves2D")
+    curves_root_path = inst_root_path.AppendChild(curves_root_token)
+
+    with Usd.EditContext(stage, ann_layer):
+        if not stage.GetPrimAtPath(inst_root_path):
+            inst_root_xf = UsdGeom.Xform.Define(stage, inst_root_path)
+            inst_root_xf.ClearXformOpOrder()
+
+        root_xf = UsdGeom.Xform.Define(stage, curves_root_path)
+        root_xf.ClearXformOpOrder()
+        root_prim = root_xf.GetPrim()
+        Usd.ModelAPI(root_prim).SetKind('group')
+        root_prim.SetCustomDataByKey("ifc:namespace", "2D Curves")
+
+        root_path = curves_root_path
+
+        for curve in caches.annotations.values():
+            parent_path = root_path
+            for label, step_id in curve.hierarchy:
+                parent_path = _ensure_group(parent_path, label, step_id)
+
+            curve_base = _sanitize_identifier(curve.name, fallback=f"Annotation_{curve.step_id}") or "Annotation"
+            curve_token = _unique_child_name(parent_path, curve_base)
+            curve_path = parent_path.AppendChild(curve_token)
+
+            if len(curve.points) < 2:
+                continue
+
+            basis = UsdGeom.BasisCurves.Define(stage, curve_path)
+            basis.CreateTypeAttr(UsdGeom.Tokens.linear)
+            basis.CreateBasisAttr(UsdGeom.Tokens.linear)
+            basis.CreateWrapAttr(UsdGeom.Tokens.open)
+            counts = Vt.IntArray([len(curve.points)])
+            basis.CreateCurveVertexCountsAttr(counts)
+            pt_array = Vt.Vec3fArray(len(curve.points))
+            for idx, (x, y, z) in enumerate(curve.points):
+                pt_array[idx] = (float(x), float(y), float(z))
+            basis.CreatePointsAttr(pt_array)
+            prim = basis.GetPrim()
+            try:
+                prim.SetCustomDataByKey("ifc:annotationStepId", int(curve.step_id))
+            except Exception:
+                prim.SetCustomDataByKey("ifc:annotationStepId", curve.step_id)
+            prim.SetCustomDataByKey("ifc:label", curve.name)
+
+    return ann_layer
+
+
 class GroupingSpecError(ValueError):
     """Raised when a grouping specification cannot be resolved."""
 
