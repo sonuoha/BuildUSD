@@ -385,7 +385,8 @@ def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, fl
     arr = np.asarray(points, dtype=float).reshape(-1, 3)
     ones = np.ones((arr.shape[0], 1), dtype=float)
     homo = np.hstack((arr, ones))
-    transformed = homo @ matrix.T
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
     return [
         (float(x), float(y), float(z))
         for x, y, z in transformed[:, :3]
@@ -393,14 +394,32 @@ def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, fl
 
 
 def _mapping_item_transform(product, mapped_item) -> np.ndarray:
-    """Compute the world transform for an IfcMappedItem belonging to a product."""
-    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
-    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
-    source = getattr(mapped_item, "MappingSource", None)
+    """Compute the row-vector transform for an IfcMappedItem belonging to a product."""
+
     origin_np = np.eye(4, dtype=float)
+    target_np = np.eye(4, dtype=float)
+    source = getattr(mapped_item, "MappingSource", None)
     if source is not None:
         origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None))
-    return placement_np @ target_np @ origin_np
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+
+    return origin_np @ target_np @ placement_np
+
+
+def _context_to_np(ctx) -> np.ndarray:
+    """Compose world transforms defined by an IFC representation context chain."""
+
+    transform = np.eye(4, dtype=float)
+    visited = set()
+    current = ctx
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        wcs = getattr(current, "WorldCoordinateSystem", None)
+        if wcs is not None:
+            transform = transform @ _axis_placement_to_np(wcs)
+        current = getattr(current, "ParentContext", None)
+    return transform
 
 
 def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
@@ -505,7 +524,8 @@ def extract_annotation_curves(
                     continue
 
                 item_annotation = ctx_is_annotation or rep_is_annotation
-                transform = placement_np
+                context_np = _context_to_np(ctx) if ctx is not None else np.eye(4, dtype=float)
+                transform = context_np @ placement_np
                 item_type = str(item.is_a() if hasattr(item, "is_a") else "").lower()
 
                 if item.is_a("IfcMappedItem"):
@@ -514,14 +534,15 @@ def extract_annotation_curves(
                     mapped_type = str(getattr(mapped, "RepresentationType", "") or "").strip().lower() if mapped else ""
                     mapped_ident = str(getattr(mapped, "RepresentationIdentifier", "") or "").strip().lower() if mapped else ""
                     mapped_ctx = getattr(mapped, "ContextOfItems", None) if mapped else None
+                    mapped_context_np = _context_to_np(mapped_ctx) if mapped_ctx is not None else np.eye(4, dtype=float)
                     if mapped_ctx is not None and mapped_ctx.id() in context_ids:
                         item_annotation = True
                     if mapped_type in annotation_rep_types or any(token in mapped_ident for token in annotation_ident_tokens):
                         item_annotation = True
                     try:
-                        transform = _mapping_item_transform(product, item)
+                        transform = context_np @ (mapped_context_np @ _mapping_item_transform(product, item))
                     except Exception:
-                        transform = placement_np
+                        transform = context_np @ (mapped_context_np @ placement_np)
                 else:
                     if item.is_a("IfcGeometricSet") or item.is_a("IfcGeometricCurveSet") or item.is_a("IfcPolyline"):
                         item_annotation = True
