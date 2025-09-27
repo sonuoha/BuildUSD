@@ -19,6 +19,7 @@ from src.process_usd import (
     apply_stage_anchor_transform,
     assign_world_geolocation,
     update_federated_view,
+    persist_instance_cache,
 )
 
 OPTIONS = ConversionOptions(
@@ -153,6 +154,9 @@ def _process_single_ifc(
     mat_layer, material_paths = author_material_layer(stage, caches, proto_paths, output_dir=output_root, base_name=base_name, proto_layer=proto_layer, options=options)
     bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
     inst_layer = author_instance_layer(stage, caches, proto_paths, output_root, base_name, options)
+
+    cache_dir = (output_root / "caches").resolve()
+    persist_instance_cache(cache_dir, base_name, caches, proto_paths)
 
     effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
     if effective_base_point is None:
