@@ -1,13 +1,15 @@
+import json
 import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
 from src.config.manifest import BasePointConfig, GeodeticCoordinate
-from src.process_ifc import PrototypeCaches, PrototypeKey, ConversionOptions
+from src.process_ifc import ConversionOptions, InstanceRecord, PrototypeCaches, PrototypeKey
 from src.utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
 
 try:
@@ -64,6 +66,23 @@ def _unique_name(base: str, used: Dict[str, int]) -> str:
     if count == 0:
         return base
     return f"{base}_{count}"
+
+
+@dataclass
+class PreparedInstance:
+    """Lightweight representation of an IFC instance ready for regrouping."""
+
+    step_id: Any
+    name: str
+    transform: Optional[Tuple[float, ...]]
+    attributes: Dict[str, Any]
+    hierarchy: Tuple[Tuple[str, Optional[int]], ...]
+    prototype_path: Optional[Sdf.Path]
+    prototype_delta: Optional[Tuple[float, ...]]
+    material_ids: List[int]
+    materials: List[Any]
+    mesh: Optional[Dict[str, Any]]
+    source_path: Optional[Sdf.Path] = None
 
 
 # 2. ---------------------------- Mesh helpers ----------------------------
@@ -621,6 +640,276 @@ def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, A
     _author_namespaced_dictionary_attributes(prim, "pset", psets)
     _author_namespaced_dictionary_attributes(prim, "qto", qtos)
 
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        if isinstance(value, dict):
+            return {str(k): _json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_json_safe(v) for v in value]
+        if hasattr(value, "tolist"):
+            return _json_safe(value.tolist())
+        return str(value)
+
+
+def _serialize_instance_record(record: InstanceRecord, proto_paths: Dict[PrototypeKey, Sdf.Path]) -> Dict[str, Any]:
+    proto_path_str = None
+    if record.prototype is not None and proto_paths:
+        proto_path = proto_paths.get(record.prototype)
+        if proto_path is not None:
+            proto_path_str = proto_path.pathString
+    def _as_list(val):
+        return list(val) if val is not None else None
+    mesh_payload = None
+    if record.mesh:
+        flattened = _flatten_mesh_arrays(record.mesh)
+        if flattened:
+            verts_list, faces_list = flattened
+            mesh_payload = {
+                "vertices": verts_list,
+                "faces": faces_list,
+            }
+    return {
+        "step_id": record.step_id,
+        "product_id": record.product_id,
+        "name": record.name,
+        "transform": _as_list(record.transform),
+        "material_ids": list(record.material_ids or []),
+        "materials": _json_safe(record.materials),
+        "attributes": _json_safe(record.attributes),
+        "prototype_delta": _as_list(record.prototype_delta),
+        "hierarchy": [[label, sid] for label, sid in (record.hierarchy or tuple())],
+        "mesh": mesh_payload,
+        "prototype": {
+            "kind": record.prototype.kind,
+            "identifier": record.prototype.identifier,
+        } if record.prototype is not None else None,
+        "prototype_path": proto_path_str,
+    }
+
+
+def persist_instance_cache(cache_dir: Path, base_name: str, caches: PrototypeCaches, proto_paths: Dict[PrototypeKey, Sdf.Path]) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / f"{base_name}.json"
+    payload = {
+        "schema": 1,
+        "base_name": base_name,
+        "instances": [
+            _serialize_instance_record(record, proto_paths) for record in caches.instances.values()
+        ],
+    }
+    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return cache_path
+
+
+def _prepared_instances_from_serialized(data: Dict[str, Any]) -> List[PreparedInstance]:
+    prepared: List[PreparedInstance] = []
+    for entry in data.get("instances", []):
+        proto_path_str = entry.get("prototype_path")
+        proto_path = Sdf.Path(proto_path_str) if proto_path_str else None
+        hierarchy = tuple(
+            (str(label), int(step) if step is not None else None)
+            for label, step in entry.get("hierarchy", [])
+        )
+        transform_list = entry.get("transform")
+        transform = tuple(transform_list) if transform_list else None
+        proto_delta_list = entry.get("prototype_delta")
+        prototype_delta = tuple(proto_delta_list) if proto_delta_list else None
+        mesh_entry = entry.get("mesh")
+        mesh_payload = None
+        if mesh_entry:
+            mesh_payload = {
+                "vertices": mesh_entry.get("vertices"),
+                "faces": mesh_entry.get("faces"),
+            }
+        prepared.append(
+            PreparedInstance(
+                step_id=entry.get("step_id"),
+                name=entry.get("name", ""),
+                transform=transform,
+                attributes=entry.get("attributes") or {},
+                hierarchy=hierarchy,
+                prototype_path=proto_path,
+                prototype_delta=prototype_delta,
+                material_ids=list(entry.get("material_ids") or []),
+                materials=list(entry.get("materials") or []),
+                mesh=mesh_payload,
+                source_path=None,
+            )
+        )
+    return prepared
+
+
+def load_instance_cache(cache_path: Path) -> List[PreparedInstance]:
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+    return _prepared_instances_from_serialized(data)
+
+
+def _prepare_instances_from_cache(caches: PrototypeCaches, proto_paths: Dict[PrototypeKey, Sdf.Path]) -> List[PreparedInstance]:
+    prepared: List[PreparedInstance] = []
+    for record in caches.instances.values():
+        proto_path = None
+        if record.prototype is not None and proto_paths:
+            proto_path = proto_paths.get(record.prototype)
+        prepared.append(
+            PreparedInstance(
+                step_id=record.step_id,
+                name=record.name,
+                transform=tuple(record.transform) if record.transform is not None else None,
+                attributes=record.attributes or {},
+                hierarchy=tuple(record.hierarchy or tuple()),
+                prototype_path=proto_path,
+                prototype_delta=tuple(record.prototype_delta) if record.prototype_delta else None,
+                material_ids=list(record.material_ids or []),
+                materials=list(record.materials or []),
+                mesh=record.mesh,
+                source_path=None,
+            )
+        )
+    return prepared
+
+
+def _collect_bimdata_attributes_from_prim(prim: Usd.Prim) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"psets": {}, "qtos": {}}
+    for attr in prim.GetAttributes():
+        name = attr.GetName()
+        if not name.startswith("BIMData:"):
+            continue
+        tokens = name.split(":")
+        if len(tokens) < 4:
+            continue
+        _, ns, set_name, prop_name, *rest = tokens
+        if rest:
+            prop_name = ":".join([prop_name] + rest)
+        try:
+            value = attr.Get()
+        except Exception:
+            continue
+        if ns.lower().startswith("pset"):
+            bucket = result.setdefault("psets", {})
+        elif ns.lower().startswith("qto"):
+            bucket = result.setdefault("qtos", {})
+        else:
+            bucket = result.setdefault(ns, {})
+        group = bucket.setdefault(set_name, {})
+        group[prop_name] = value
+    if not result.get("psets") and not result.get("qtos"):
+        return {}
+    return result
+
+
+def _collect_hierarchy_for_prim(prim: Usd.Prim, inst_root: Sdf.Path) -> Tuple[Tuple[str, Optional[int]], ...]:
+    nodes: List[Tuple[str, Optional[int]]] = []
+    parent = prim.GetParent()
+    while parent and parent.GetPath().HasPrefix(inst_root) and parent.GetPath() != inst_root:
+        label = parent.GetCustomDataByKey("ifc:label")
+        step_id = parent.GetCustomDataByKey("ifc:stepId")
+        if label:
+            try:
+                step_val = int(step_id) if step_id is not None else None
+            except Exception:
+                step_val = step_id
+            nodes.append((str(label), step_val))
+        parent = parent.GetParent()
+    nodes.reverse()
+    return tuple(nodes)
+
+
+def _extract_mesh_from_prim(prim: Usd.Prim) -> Optional[Dict[str, Any]]:
+    if not prim or not prim.IsValid():
+        return None
+    mesh = UsdGeom.Mesh(prim)
+    if not mesh:
+        return None
+    points = mesh.GetPointsAttr().Get()
+    indices = mesh.GetFaceVertexIndicesAttr().Get()
+    if points is None or indices is None:
+        return None
+    verts: List[float] = []
+    for pt in points:
+        verts.extend([float(pt[0]), float(pt[1]), float(pt[2])])
+    faces = [int(i) for i in indices]
+    if not verts or not faces:
+        return None
+    return {"vertices": verts, "faces": faces}
+
+
+def _prepare_instances_from_stage(stage: Usd.Stage, inst_root: Sdf.Path) -> List[PreparedInstance]:
+    prepared: List[PreparedInstance] = []
+    inst_root_prim = stage.GetPrimAtPath(inst_root)
+    if not inst_root_prim:
+        return prepared
+    grouping_set = inst_root_prim.GetVariantSets().GetVariantSet("Grouping") if inst_root_prim.HasVariantSets() else None
+    previous_selection = None
+    if grouping_set:
+        previous_selection = grouping_set.GetVariantSelection()
+        if "Original" in grouping_set.GetVariantNames():
+            grouping_set.SetVariantSelection("Original")
+    try:
+        for prim in Usd.PrimRange(inst_root_prim):
+            if prim == inst_root_prim:
+                continue
+            if prim.GetTypeName() != "Xform":
+                continue
+            step_id = prim.GetCustomDataByKey("ifc:instanceStepId")
+            if step_id is None:
+                continue
+            try:
+                step_val = int(step_id)
+            except Exception:
+                step_val = step_id
+            xformable = UsdGeom.Xformable(prim)
+            matrix, _ = xformable.GetLocalTransformation()
+            transform = tuple(matrix[i][j] for i in range(4) for j in range(4)) if matrix else None
+            hierarchy = _collect_hierarchy_for_prim(prim, inst_root)
+            attributes = _collect_bimdata_attributes_from_prim(prim)
+            prototype_path = None
+            prototype_delta = None
+            prototype_child = next((child for child in prim.GetChildren() if child.GetName() == "Prototype"), None)
+            if prototype_child:
+                refs = prototype_child.GetReferences()
+                ref_items = refs.GetAddedOrExplicitItems()
+                if ref_items:
+                    prototype_path = ref_items[0].primPath
+                proto_xform = UsdGeom.Xformable(prototype_child)
+                proto_matrix, _ = proto_xform.GetLocalTransformation()
+                if proto_matrix and proto_matrix != Gf.Matrix4d(1):
+                    prototype_delta = tuple(proto_matrix[i][j] for i in range(4) for j in range(4))
+            geom_child = prim.GetChild("Geom")
+            mesh_payload = _extract_mesh_from_prim(geom_child) if geom_child and prototype_path is None else None
+            material_ids_attr = prim.GetAttribute("ifc:materialIds")
+            material_ids = list(material_ids_attr.Get() or []) if material_ids_attr and material_ids_attr.HasAuthoredValueOpinion() else []
+            bound_materials: List[Any] = []
+            target_for_binding = geom_child if geom_child else prim
+            try:
+                binding = UsdShade.MaterialBindingAPI(target_for_binding).ComputeBoundMaterial()[0]
+                if binding:
+                    bound_materials.append(binding.GetPath().pathString)
+            except Exception:
+                pass
+            prepared.append(
+                PreparedInstance(
+                    step_id=step_val,
+                    name=prim.GetName(),
+                    transform=transform,
+                    attributes=attributes,
+                    hierarchy=hierarchy,
+                    prototype_path=prototype_path,
+                    prototype_delta=prototype_delta,
+                    material_ids=material_ids,
+                    materials=bound_materials,
+                    mesh=mesh_payload,
+                    source_path=prim.GetPath(),
+                )
+            )
+    finally:
+        if grouping_set and previous_selection:
+            grouping_set.SetVariantSelection(previous_selection)
+    return prepared
+
 # 7. ---------------------------- Instance authoring ----------------------------
 
 def author_instance_layer(
@@ -695,6 +984,10 @@ def author_instance_layer(
             xform = UsdGeom.Xform.Define(stage, inst_path)
             xform.ClearXformOpOrder()
             inst_prim = xform.GetPrim()
+            try:
+                inst_prim.SetCustomDataByKey("ifc:instanceStepId", int(record.step_id))
+            except Exception:
+                inst_prim.SetCustomDataByKey("ifc:instanceStepId", record.step_id)
             if record.transform:
                 try:
                     xf = np_to_gf_matrix(record.transform)
@@ -745,6 +1038,258 @@ def author_instance_layer(
             ref_prim.SetInstanceable(bool(options.enable_instancing))
 
     return inst_layer
+
+
+class GroupingSpecError(ValueError):
+    """Raised when a grouping specification cannot be resolved."""
+
+
+def _ensure_layer_on_stage(stage: Usd.Stage, layer: Sdf.Layer, *, persist: bool) -> None:
+    """Attach a layer to the stage's session or root stack if not already present."""
+    target = stage.GetRootLayer() if persist else stage.GetSessionLayer()
+    if layer.identifier not in target.subLayerPaths:
+        target.subLayerPaths.append(layer.identifier)
+
+
+def _map_instance_paths(stage: Usd.Stage, inst_root: Sdf.Path) -> Dict[int, Sdf.Path]:
+    """Build a map from IFC instance step id to its authored prim path."""
+    result: Dict[int, Sdf.Path] = {}
+    root_prim = stage.GetPrimAtPath(inst_root)
+    if not root_prim:
+        return result
+    for prim in Usd.PrimRange(root_prim):
+        if prim == root_prim:
+            continue
+        if prim.GetTypeName() != "Xform":
+            continue
+        step_id = prim.GetCustomDataByKey("ifc:instanceStepId")
+        if step_id is None:
+            continue
+        try:
+            key = int(step_id)
+        except Exception:
+            key = step_id
+        result[key] = prim.GetPath()
+    return result
+
+
+def _resolve_group_value(record: InstanceRecord, accessor: Union[str, Callable[[InstanceRecord], Any]]) -> Any:
+    if callable(accessor):
+        return accessor(record)
+    if not accessor:
+        return None
+    current: Any = record.attributes
+    for token in str(accessor).split('.'):
+        if isinstance(current, dict):
+            current = current.get(token)
+        else:
+            return None
+    return current
+
+
+def _format_group_token(value: Any, *, prefix: str) -> str:
+    display = "Unspecified" if value in (None, "", []) else str(value)
+    base = _sanitize_identifier(f"{prefix}_{display}", fallback="Group")
+    return base or "Group"
+
+
+def author_instance_grouping_variant(
+    stage: Usd.Stage,
+    caches: Optional[PrototypeCaches],
+    proto_paths: Optional[Dict[PrototypeKey, Sdf.Path]],
+    base_name: str,
+    options: ConversionOptions,
+    grouping_accessor: Union[str, Callable[[Any], Any]],
+    variant_name: str,
+    *,
+    cache_path: Optional[Path] = None,
+    drop_leading_levels: int = 0,
+    keep_class_anchor: bool = True,
+    persist_path: Optional[Path] = None,
+    grouping_label_prefix: Optional[str] = None,
+) -> Sdf.Layer:
+    """Author a dynamic grouping variant under the instance root.
+
+    The variant is created beneath /World/<base>_Instances with variant set "Grouping".
+    Existing spatial hierarchy prims remain in the default "Original" variant. The
+    new variant deactivates the original instance prims and instantiates clones under
+    new grouping nodes derived from `grouping_accessor`.
+    """
+    inst_root_name = _sanitize_identifier(f"{base_name}_Instances", fallback="Instances")
+    inst_root = Sdf.Path(f"/World/{inst_root_name}")
+    inst_root_prim = stage.GetPrimAtPath(inst_root)
+    if not inst_root_prim:
+        raise GroupingSpecError(f"Instance root prim not found at {inst_root}")
+
+    instances_data: List[PreparedInstance] = []
+    if caches is not None:
+        if proto_paths is None:
+            raise GroupingSpecError("proto_paths is required when caches are provided")
+        instances_data = _prepare_instances_from_cache(caches, proto_paths)
+    elif cache_path is not None:
+        if not cache_path.exists():
+            raise GroupingSpecError(f"Cache file not found: {cache_path}")
+        instances_data = load_instance_cache(cache_path)
+    else:
+        instances_data = _prepare_instances_from_stage(stage, inst_root)
+
+    if not instances_data:
+        raise GroupingSpecError("No instances available to author grouping variant")
+
+    if persist_path is not None:
+        persist = True
+        variant_layer = Sdf.Layer.CreateNew(Path(persist_path).as_posix())
+    else:
+        persist = False
+        variant_layer = Sdf.Layer.CreateAnonymous(f"group_{variant_name}")
+
+    _ensure_layer_on_stage(stage, variant_layer, persist=persist)
+
+    grouping_label_prefix = grouping_label_prefix or _sanitize_identifier(variant_name, fallback="Group") or "Group"
+
+    with Usd.EditContext(stage, variant_layer):
+        variant_sets = inst_root_prim.GetVariantSets()
+        grouping_set = variant_sets.AddVariantSet("Grouping")
+        variant_names = set(grouping_set.GetVariantNames())
+        if "Original" not in variant_names:
+            grouping_set.AddVariant("Original")
+        if variant_name in variant_names:
+            grouping_set.RemoveVariant(variant_name)
+        grouping_set.AddVariant(variant_name)
+        grouping_set.SetVariantSelection(variant_name)
+
+        with grouping_set.GetVariantEditContext(variant_name):
+            instance_path_map = _map_instance_paths(stage, inst_root)
+            for path in instance_path_map.values():
+                stage.OverridePrim(path).SetActive(False)
+
+            name_counters: Dict[Sdf.Path, Dict[str, int]] = defaultdict(dict)
+            group_cache: Dict[Tuple[Sdf.Path, str, Optional[int]], Sdf.Path] = {}
+
+            def _unique_child_name(parent: Sdf.Path, base: str) -> str:
+                used = name_counters[parent]
+                count = used.get(base, 0)
+                used[base] = count + 1
+                return base if count == 0 else f"{base}_{count}"
+
+            def _ensure_group(parent_path: Sdf.Path, label: str, step_id: Optional[int]) -> Sdf.Path:
+                key = (parent_path, label, step_id)
+                cached = group_cache.get(key)
+                if cached is not None:
+                    return cached
+                base_token = _sanitize_identifier(label, fallback=f"Group_{step_id or 'Node'}") or "Group"
+                token = _unique_child_name(parent_path, base_token)
+                group_path = parent_path.AppendChild(token)
+                group_cache[key] = group_path
+                xf = UsdGeom.Xform.Define(stage, group_path)
+                xf.ClearXformOpOrder()
+                prim = xf.GetPrim()
+                Usd.ModelAPI(prim).SetKind('group')
+                prim.SetCustomDataByKey("ifc:label", label)
+                if step_id is not None:
+                    try:
+                        prim.SetCustomDataByKey("ifc:stepId", int(step_id))
+                    except Exception:
+                        prim.SetCustomDataByKey("ifc:stepId", step_id)
+                return group_path
+
+            stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
+            drop_count = max(0, int(drop_leading_levels))
+
+            for instance in instances_data:
+                group_value = _resolve_group_value(instance, grouping_accessor)
+                parent_path = inst_root
+                hierarchy = list(instance.hierarchy or ())
+                trimmed = hierarchy[drop_count:] if drop_count else hierarchy
+                if keep_class_anchor and not trimmed and hierarchy:
+                    trimmed = [hierarchy[-1]]
+                for label, step_id in trimmed:
+                    parent_path = _ensure_group(parent_path, label, step_id)
+
+                group_label = str(group_value if group_value not in (None, "", []) else "Unspecified")
+                group_token = _format_group_token(group_value, prefix=grouping_label_prefix)
+                group_path = _ensure_group(parent_path, group_token, None)
+                group_prim = stage.GetPrimAtPath(group_path)
+                group_prim.SetCustomDataByKey("ifc:groupingKey", str(grouping_accessor))
+                group_prim.SetCustomDataByKey("ifc:groupingValue", group_label)
+
+                inst_base = _sanitize_identifier(instance.name, fallback=f"Ifc_{instance.step_id}") or "Instance"
+                inst_token = _unique_child_name(group_path, inst_base)
+                inst_path = group_path.AppendChild(inst_token)
+
+                xform = UsdGeom.Xform.Define(stage, inst_path)
+                xform.ClearXformOpOrder()
+                inst_prim = xform.GetPrim()
+                try:
+                    inst_prim.SetCustomDataByKey("ifc:instanceStepId", int(instance.step_id))
+                except Exception:
+                    inst_prim.SetCustomDataByKey("ifc:instanceStepId", instance.step_id)
+
+                if instance.transform:
+                    try:
+                        xform.AddTransformOp().Set(np_to_gf_matrix(instance.transform))
+                    except Exception as exc:
+                        print(f"?? Failed to author transform for grouping variant instance {instance.step_id}: {exc}")
+
+                if options.convert_metadata and instance.attributes:
+                    _author_instance_attributes(inst_prim, instance.attributes)
+
+                if instance.mesh:
+                    mesh_payload = _flatten_mesh_arrays(instance.mesh)
+                    if mesh_payload:
+                        verts, faces = mesh_payload
+                        write_usd_mesh(
+                            stage,
+                            inst_path,
+                            "Geom",
+                            verts,
+                            faces,
+                            abs_mat=None,
+                            material_ids=list(instance.material_ids or []),
+                            stage_meters_per_unit=stage_meters_per_unit,
+                        )
+                        continue
+
+                proto_path = instance.prototype_path
+                if proto_path is None and instance.source_path is not None:
+                    ref_prim = stage.DefinePrim(inst_path.AppendChild("Source"), "Xform")
+                    refs = ref_prim.GetReferences()
+                    refs.ClearReferences()
+                    refs.AddReference("", instance.source_path)
+                    continue
+
+                if proto_path is None:
+                    print(f"?? Missing prototype for grouping variant instance {instance.step_id}; skipping")
+                    continue
+
+                ref_path = inst_path.AppendChild("Prototype")
+                ref_prim = stage.DefinePrim(ref_path, "Xform")
+                refs = ref_prim.GetReferences()
+                refs.ClearReferences()
+                refs.AddReference("", proto_path)
+
+                ref_xform = UsdGeom.Xform(ref_prim)
+                ref_xform.ClearXformOpOrder()
+                if instance.prototype_delta:
+                    try:
+                        ref_xform.AddTransformOp().Set(np_to_gf_matrix(instance.prototype_delta))
+                    except Exception as exc:
+                        print(f"?? Failed to apply prototype delta for grouping variant instance {instance.step_id}: {exc}")
+
+                ref_prim.SetInstanceable(bool(options.enable_instancing))
+
+    return variant_layer
+
+def reset_instance_grouping(stage: Usd.Stage, base_name: str, variant_set: str = "Grouping") -> None:
+    """Reset the grouping variant selection back to the canonical hierarchy."""
+    inst_root_name = _sanitize_identifier(f"{base_name}_Instances", fallback="Instances")
+    inst_root = Sdf.Path(f"/World/{inst_root_name}")
+    prim = stage.GetPrimAtPath(inst_root)
+    if not prim:
+        return
+    vs = prim.GetVariantSets().GetVariantSet(variant_set)
+    if vs:
+        vs.SetVariantSelection("Original")
 
 
 # 8. ---------------------------- Stage alignment ----------------------------
