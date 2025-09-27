@@ -120,6 +120,16 @@ class InstanceRecord:
     mesh: Optional[Dict[str, Any]] = None
 
 @dataclass
+class AnnotationCurve:
+    """Polyline-style annotation extracted from an IFC annotation context."""
+
+    step_id: int
+    name: str
+    points: List[Tuple[float, float, float]]
+    hierarchy: Tuple[Tuple[str, Optional[int]], ...] = field(default_factory=tuple)
+
+
+@dataclass
 class PrototypeCaches:
     """All prototypes and instances discovered plus optional map conversion."""
     repmaps: Dict[int, MeshProto]
@@ -127,6 +137,7 @@ class PrototypeCaches:
     hashes: Dict[str, HashProto]
     step_keys: Dict[int, PrototypeKey]
     instances: Dict[int, "InstanceRecord"]
+    annotations: Dict[int, AnnotationCurve] = field(default_factory=dict)
     map_conversion: Optional[MapConversionData] = None
 
 
@@ -254,6 +265,294 @@ def _collect_spatial_hierarchy(product) -> Tuple[Tuple[str, Optional[int]], ...]
     class_label = product.is_a() if hasattr(product, "is_a") else "IfcProduct"
     hierarchy.append((class_label, None))
     return tuple(hierarchy)
+
+
+def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
+    coords = list(getattr(point, "Coordinates", []) or [])
+    x = _as_float(coords[0] if len(coords) > 0 else 0.0)
+    y = _as_float(coords[1] if len(coords) > 1 else 0.0)
+    z = _as_float(coords[2] if len(coords) > 2 else 0.0)
+    return (x, y, z)
+
+
+
+
+
+
+
+def _as_float(v, default=0.0):
+    """Safely coerce IFC numeric wrappers or Python scalars to float."""
+    try:
+        if hasattr(v, "wrappedValue"):
+            return float(v.wrappedValue)
+        return float(v)
+    except Exception:
+        try:
+            return float(default)
+        except Exception:
+            return 0.0
+
+def _gf_matrix_to_np(matrix) -> np.ndarray:
+    """Convert a pxr.Gf matrix or sequence into a 4x4 numpy array."""
+    if matrix is None:
+        return np.eye(4, dtype=float)
+    if isinstance(matrix, np.ndarray):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    if isinstance(matrix, (list, tuple)):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    try:
+        return np.array([[float(matrix[i][j]) for j in range(4)] for i in range(4)], dtype=float)
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _object_placement_to_np(obj_placement) -> np.ndarray:
+    """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
+    try:
+        gf_matrix = compose_object_placement(obj_placement, length_to_m=1.0)
+    except Exception:
+        return np.eye(4, dtype=float)
+    return _gf_matrix_to_np(gf_matrix)
+
+
+def _axis_placement_to_np(axis_placement) -> np.ndarray:
+    """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
+    if axis_placement is None:
+        return np.eye(4, dtype=float)
+    try:
+        return _gf_matrix_to_np(axis2placement_to_matrix(axis_placement, length_to_m=1.0))
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
+    if op is None:
+        return np.eye(4, dtype=float)
+
+    try:
+        origin_src = getattr(getattr(op, "LocalOrigin", None), "Coordinates", None) or (0.0, 0.0, 0.0)
+        origin_tuple = tuple(origin_src) + (0.0, 0.0, 0.0)
+        origin = np.array([_as_float(c) for c in origin_tuple[:3]], dtype=float)
+    except Exception:
+        origin = np.zeros(3, dtype=float)
+
+    def _vec(data, fallback):
+        if not data:
+            return np.array(fallback, dtype=float)
+        return np.array([_as_float(c) for c in data], dtype=float)
+
+    x_axis = _vec(getattr(getattr(op, "Axis1", None), "DirectionRatios", None), (1.0, 0.0, 0.0))
+    y_axis = _vec(getattr(getattr(op, "Axis2", None), "DirectionRatios", None), (0.0, 1.0, 0.0))
+    z_data = getattr(getattr(op, "Axis3", None), "DirectionRatios", None)
+    z_axis = _vec(z_data, (0.0, 0.0, 1.0)) if z_data else np.cross(x_axis, y_axis)
+
+    def _norm(vec: np.ndarray) -> np.ndarray:
+        length = np.linalg.norm(vec)
+        return vec if length <= 1e-12 else vec / length
+
+    x_axis = _norm(x_axis)
+    y_axis = _norm(y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    z_axis = _norm(z_axis)
+
+    if abs(float(np.dot(x_axis, y_axis))) > 0.9999:
+        y_axis = _norm(np.cross(z_axis, x_axis))
+    x_axis = _norm(np.cross(y_axis, z_axis))
+
+    scale = _as_float(getattr(op, "Scale", 1.0) or 1.0, 1.0)
+    sx = scale
+    sy = _as_float(getattr(op, "Scale2", scale) or scale, scale)
+    sz = _as_float(getattr(op, "Scale3", scale) or scale, scale)
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 0] = x_axis * sx
+    transform[:3, 1] = y_axis * sy
+    transform[:3, 2] = z_axis * sz
+    transform[:3, 3] = origin
+    return transform
+
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    transformed = homo @ matrix.T
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
+
+
+def _mapping_item_transform(product, mapped_item) -> np.ndarray:
+    """Compute the world transform for an IfcMappedItem belonging to a product."""
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = np.eye(4, dtype=float)
+    if source is not None:
+        origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None))
+    return placement_np @ target_np @ origin_np
+
+
+def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    if item is None:
+        return []
+    if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
+        pts: List[Tuple[float, float, float]] = []
+        for p in getattr(item, "Points", []) or []:
+            try:
+                pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
+            pts.extend(_extract_curve_points(parent))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        return _extract_curve_points(getattr(item, "BasisCurve", None))
+    if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
+    return []
+
+
+
+
+def extract_annotation_curves(
+    ifc_file,
+    hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]],
+) -> Dict[int, AnnotationCurve]:
+    annotations: Dict[int, AnnotationCurve] = {}
+    try:
+        contexts = [
+            ctx
+            for ctx in (ifc_file.by_type("IfcGeometricRepresentationContext") or [])
+            if str(getattr(ctx, "ContextType", "") or "").strip().lower() == "annotation"
+            or str(getattr(ctx, "ContextIdentifier", "") or "").strip().lower() == "annotation"
+        ]
+    except Exception:
+        contexts = []
+    context_ids = {ctx.id() for ctx in contexts}
+
+    annotation_rep_types = {
+        "annotation",
+        "annotation2d",
+        "curve",
+        "curve2d",
+        "curve3d",
+        "geometriccurveset",
+        "geometricset",
+    }
+    annotation_ident_tokens = {"annotation", "alignment"}
+
+    def _hierarchy_for(entity) -> Tuple[Tuple[str, Optional[int]], ...]:
+        try:
+            key = entity.id()
+        except Exception:
+            key = id(entity)
+        cached = hierarchy_cache.get(key)
+        if cached is None:
+            cached = _collect_spatial_hierarchy(entity)
+            hierarchy_cache[key] = cached
+        return cached
+
+    for product in ifc_file.by_type("IfcProduct") or []:
+        rep = getattr(product, "Representation", None)
+        if not rep:
+            continue
+        hierarchy = _hierarchy_for(product)
+        name = _entity_label(product)
+        try:
+            placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+        except Exception:
+            placement_np = np.eye(4, dtype=float)
+
+        for rep_ctx in getattr(rep, "Representations", []) or []:
+            ctx = getattr(rep_ctx, "ContextOfItems", None)
+            rep_type = str(getattr(rep_ctx, "RepresentationType", "") or "").strip().lower()
+            rep_ident = str(getattr(rep_ctx, "RepresentationIdentifier", "") or "").strip().lower()
+            ctx_is_annotation = ctx is not None and ctx.id() in context_ids
+            rep_is_annotation = (
+                rep_type in annotation_rep_types
+                or any(token in rep_ident for token in annotation_ident_tokens)
+            )
+
+            for item in getattr(rep_ctx, "Items", []) or []:
+                if not hasattr(item, "is_a"):
+                    continue
+
+                item_annotation = ctx_is_annotation or rep_is_annotation
+                transform = placement_np
+                item_type = str(item.is_a() if hasattr(item, "is_a") else "").lower()
+
+                if item.is_a("IfcMappedItem"):
+                    mapped_source = getattr(item, "MappingSource", None)
+                    mapped = getattr(mapped_source, "MappedRepresentation", None) if mapped_source else None
+                    mapped_type = str(getattr(mapped, "RepresentationType", "") or "").strip().lower() if mapped else ""
+                    mapped_ident = str(getattr(mapped, "RepresentationIdentifier", "") or "").strip().lower() if mapped else ""
+                    mapped_ctx = getattr(mapped, "ContextOfItems", None) if mapped else None
+                    if mapped_ctx is not None and mapped_ctx.id() in context_ids:
+                        item_annotation = True
+                    if mapped_type in annotation_rep_types or any(token in mapped_ident for token in annotation_ident_tokens):
+                        item_annotation = True
+                    try:
+                        transform = _mapping_item_transform(product, item)
+                    except Exception:
+                        transform = placement_np
+                else:
+                    if item.is_a("IfcGeometricSet") or item.is_a("IfcGeometricCurveSet") or item.is_a("IfcPolyline"):
+                        item_annotation = True
+                    elif "curve" in item_type and "surface" not in item_type:
+                        item_annotation = True
+
+                if not item_annotation:
+                    continue
+
+                pts = _extract_curve_points(item)
+                if len(pts) < 2:
+                    continue
+                try:
+                    pts_world = _transform_points(pts, transform)
+                except Exception:
+                    pts_world = pts
+                if len(pts_world) < 2:
+                    continue
+
+                try:
+                    step_id = item.id()
+                except Exception:
+                    step_id = id(item)
+                annotations[step_id] = AnnotationCurve(
+                    step_id=step_id,
+                    name=name,
+                    points=pts_world,
+                    hierarchy=hierarchy,
+                )
+    return annotations
+
 
 
 # 2. ---------------------------- IFC Geometry Utilities ----------------------------
@@ -597,12 +896,14 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             log.warning("Skipping 2D annotation context; ifcopenshell geom iterator refused to process it. Details: %s", geom_log)
         else:
             log.error("Geometry iterator initialisation failed: %s", geom_log or "<no log output>")
+        annotations = extract_annotation_curves(ifc_file, hierarchy_cache)
         return PrototypeCaches(
             repmaps=repmaps,
             repmap_counts=repmap_counts,
             hashes=hashes,
             step_keys=step_keys,
             instances=instances,
+            annotations=annotations,
             map_conversion=extract_map_conversion(ifc_file),
         )
 
@@ -743,6 +1044,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             mesh=instance_mesh,
         )
 
+    annotations = extract_annotation_curves(ifc_file, hierarchy_cache)
     map_conversion = extract_map_conversion(ifc_file)
 
     return PrototypeCaches(
@@ -751,30 +1053,14 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         hashes=hashes,
         step_keys=step_keys,
         instances=instances,
+        annotations=annotations,
         map_conversion=map_conversion,
     )
 
-def _as_float(v, default=0.0):
-    """
-    Attempt to convert the input value into a float. If the value has a "wrappedValue" attribute, use that instead.
-    Function converts placement coordinates and direction ratios before building USD Gf.Vec3d vectors; this lets the code accept plain floats, 
-     IFC measure wrappers, or even strings without crashing.
-    If the conversion fails, return the default value.
-    :param v: The value to convert into a float.
-    :param default: The default value to return if the conversion fails.
-    :return: The converted float value, or the default value if the conversion fails.
-    """
-    try:
-        if hasattr(v, "wrappedValue"):
-            return float(v.wrappedValue)
-        return float(v)
-    except Exception:
-        return float(default)
-     
 def axis2placement_to_matrix(place, length_to_m=1.0):
-    """Convert an IfcAxis2Placement2D/3D into a USD 4×4 transform.
+    """Convert an IfcAxis2Placement2D/3D into a USD 4x4 transform.
 
-    Normalises the placement’s axes, reconstructs an orthonormal frame even when
+    Normalises the placement's axes, reconstructs an orthonormal frame even when
     IFC data is missing or degenerate, and scales coordinates by `length_to_m`.
     Returns an identity matrix if `place` is None.
     Args:
