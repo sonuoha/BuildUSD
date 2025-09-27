@@ -439,8 +439,11 @@ def author_prototype_layer(
 
             xform = UsdGeom.Xform.Define(stage, proto_path)
             xform.ClearXformOpOrder()
+            proto_prim = xform.GetPrim()
+            Usd.ModelAPI(proto_prim).SetKind('component')
+            UsdGeom.Imageable(proto_prim).SetPurpose(UsdGeom.Tokens.guide)
 
-            write_usd_mesh(
+            mesh = write_usd_mesh(
                 stage,
                 proto_path,
                 "Geom",
@@ -450,6 +453,8 @@ def author_prototype_layer(
                 material_ids=list(getattr(proto, "material_ids", []) or []),
                 stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
             )
+            if mesh is not None:
+                UsdGeom.Imageable(mesh.GetPrim()).SetPurpose(UsdGeom.Tokens.guide)
 
     return proto_layer, proto_paths
 
@@ -984,6 +989,7 @@ def author_instance_layer(
             xform = UsdGeom.Xform.Define(stage, inst_path)
             xform.ClearXformOpOrder()
             inst_prim = xform.GetPrim()
+            Usd.ModelAPI(inst_prim).SetKind('component')
             try:
                 inst_prim.SetCustomDataByKey("ifc:instanceStepId", int(record.step_id))
             except Exception:
@@ -1023,6 +1029,7 @@ def author_instance_layer(
 
             ref_path = inst_path.AppendChild("Prototype")
             ref_prim = stage.DefinePrim(ref_path, "Xform")
+            UsdGeom.Imageable(ref_prim).SetPurpose(UsdGeom.Tokens.default_)
             refs = ref_prim.GetReferences()
             refs.ClearReferences()
             refs.AddReference("", proto_path)
@@ -1086,30 +1093,39 @@ def author_annotation_layer(
 
     inst_root_name = _sanitize_identifier(f"{base_name}_Instances", fallback="Instances")
     inst_root_path = Sdf.Path(f"/World/{inst_root_name}")
-    curves_root_token = _sanitize_identifier("Curves2D", fallback="Curves2D")
-    curves_root_path = inst_root_path.AppendChild(curves_root_token)
+
+    curves_containers: Dict[Sdf.Path, Sdf.Path] = {}
+
+    def _ensure_curves_container(parent_path: Sdf.Path) -> Sdf.Path:
+        existing = curves_containers.get(parent_path)
+        if existing is not None:
+            return existing
+        token = _sanitize_identifier("Curves2D", fallback="Curves2D") or "Curves2D"
+        container_path = parent_path.AppendChild(token)
+        if not stage.GetPrimAtPath(container_path):
+            curves_xf = UsdGeom.Xform.Define(stage, container_path)
+            curves_xf.ClearXformOpOrder()
+            container_prim = curves_xf.GetPrim()
+            Usd.ModelAPI(container_prim).SetKind('group')
+            container_prim.SetCustomDataByKey("ifc:namespace", "2D Curves")
+        curves_containers[parent_path] = container_path
+        return container_path
 
     with Usd.EditContext(stage, ann_layer):
         if not stage.GetPrimAtPath(inst_root_path):
             inst_root_xf = UsdGeom.Xform.Define(stage, inst_root_path)
             inst_root_xf.ClearXformOpOrder()
 
-        root_xf = UsdGeom.Xform.Define(stage, curves_root_path)
-        root_xf.ClearXformOpOrder()
-        root_prim = root_xf.GetPrim()
-        Usd.ModelAPI(root_prim).SetKind('group')
-        root_prim.SetCustomDataByKey("ifc:namespace", "2D Curves")
-
-        root_path = curves_root_path
-
         for curve in caches.annotations.values():
-            parent_path = root_path
+            parent_path = inst_root_path
             for label, step_id in curve.hierarchy:
                 parent_path = _ensure_group(parent_path, label, step_id)
 
+            curves_parent = _ensure_curves_container(parent_path)
+
             curve_base = _sanitize_identifier(curve.name, fallback=f"Annotation_{curve.step_id}") or "Annotation"
-            curve_token = _unique_child_name(parent_path, curve_base)
-            curve_path = parent_path.AppendChild(curve_token)
+            curve_token = _unique_child_name(curves_parent, curve_base)
+            curve_path = curves_parent.AppendChild(curve_token)
 
             if len(curve.points) < 2:
                 continue
