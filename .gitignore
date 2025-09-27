@@ -29,3 +29,7 @@ output/*.usd*
 output/**/*.usd*
 data/output/*.usd*
 data/output/**/*.usd*
+
+*.sh
+*.bat
+*.ps1

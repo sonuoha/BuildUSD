@@ -44,6 +44,8 @@ Outputs
   - <name>_materials.usda
   - <name>_instances.usda
     - /World/<file>_Instances preserves the IFC spatial hierarchy (Project/Site/Storey/Class).
+    - Optional grouping variants (see src/process_usd.py:author_instance_grouping_variant) can reorganize instances on demand without losing the canonical hierarchy.
+  - caches/<name>.json stores serialized instance metadata for later regrouping sessions.
 - Federated master stage:
   - Federated Model.usda: contains a /World default prim.
   - Each IFC adds a child prim /World/<name> with an inactive payload to that file’s default prim.
