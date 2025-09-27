@@ -16,6 +16,7 @@ from src.process_usd import (
     author_material_layer,
     bind_materials_to_prototypes,
     author_instance_layer,
+    author_annotation_layer,
     apply_stage_anchor_transform,
     assign_world_geolocation,
     update_federated_view,
@@ -155,6 +156,8 @@ def _process_single_ifc(
     bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
     inst_layer = author_instance_layer(stage, caches, proto_paths, output_root, base_name, options)
 
+    ann_layer = author_annotation_layer(stage, caches, output_root, base_name)
+
     cache_dir = (output_root / "caches").resolve()
     persist_instance_cache(cache_dir, base_name, caches, proto_paths)
 
@@ -192,10 +195,14 @@ def _process_single_ifc(
     proto_layer.Save()
     mat_layer.Save()
     inst_layer.Save()
+    if ann_layer:
+        ann_layer.Save()
     print(f"Stage written: {stage_path}")
     print(f"Prototype layer: {proto_layer.identifier}")
     print(f"Material layer: {mat_layer.identifier}")
     print(f"Instance layer: {inst_layer.identifier}")
+    if ann_layer:
+        print(f"Annotation layer: {ann_layer.identifier}")
 
     master_stage_path = (output_root / master_stage_name).resolve()
     update_federated_view(master_stage_path, stage_path, base_name, parent_prim_path="/World")
@@ -208,6 +215,7 @@ def _process_single_ifc(
             "prototype": proto_layer.identifier,
             "material": mat_layer.identifier,
             "instance": inst_layer.identifier,
+            "annotation": ann_layer.identifier if ann_layer else None,
         },
         "geodetic": {
             "crs": geodetic_crs,
@@ -215,8 +223,10 @@ def _process_single_ifc(
         },
         "wgs84": geodetic_result,
         "counts": {
-            "prototypes": len(caches.repmaps) + len(caches.hashes),
-            "instances": len(caches.instances),
+            "prototypes_3d": len(caches.repmaps) + len(caches.hashes),
+            "instances_3d": len(caches.instances),
+            "curves_2d": len(getattr(caches, "annotations", {}) or {}),
+            "total_elements": len(caches.instances) + len(getattr(caches, "annotations", {}) or {}),
         },
         "plan": plan,
         "projected_crs": projected_crs,
@@ -289,9 +299,17 @@ def main(argv: list[str] | None = None, map_coordinate_system: str = "EPSG:7855"
             coord_info = f", geo=({coords[0]:.5f}, {coords[1]:.5f}, {alt_val:.2f})"
         else:
             coord_info = ""
+
+        proto_3d = counts.get('prototypes_3d', counts.get('prototypes', 0))
+        inst_3d = counts.get('instances_3d', counts.get('instances', 0))
+        curves_2d = counts.get('curves_2d', counts.get('annotations', 0))
+        total_elements = counts.get('total_elements')
+        if total_elements is None:
+            total_elements = inst_3d + curves_2d
+
         print(
             f"- {r['ifc'].name}: stage={r['stage']}, master={master_display}, "
-            f"prototypes={counts.get('prototypes', 0)}, instances={counts.get('instances', 0)}{coord_info}"
+            f"prototypes3D={proto_3d}, instances3D={inst_3d}, curves2D={curves_2d}, totalElements={total_elements}{coord_info}"
         )
 
 
