@@ -83,9 +83,12 @@ Troubleshooting
 - pxr ImportError with _tf/_usd DLLs on Windows: install latest VC++ redistributable x64.
 - CRS conversions require pyproj; if missing, WGS84 attributes won’t be authored.
 
+Examples
+- NVIDIA CAD Converter export of the same tunnel segment shows gaps and lost detail when tessellating the IFC input.
 
+![NVIDIA CAD converter output showing geometry loss](data/input/img/CAD_converter.png)
 
+- Our IFC pipeline preserves full segment detail and materials while authoring clean instance hierarchies.
 
-
-
+![Pipeline output preserving object integrity](data/input/img/Pipeline.png)
 
