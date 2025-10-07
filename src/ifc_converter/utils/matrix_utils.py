@@ -2,11 +2,14 @@
 #Import standard libraries
 import logging
 import numpy as np
-from pxr import Gf
+
+from ..pxr_utils import require_pxr_module
 
 
 # Set up logging
 log = logging.getLogger(__name__)
+
+Gf = require_pxr_module("Gf")
 
 # Optional: EPSG transforms (WGS84 <-> GDA2020 / MGA Zone 55 : EPSG:7855)
 try:

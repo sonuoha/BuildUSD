@@ -21,6 +21,7 @@ from .io_utils import (
     path_suffix,
     read_bytes,
     read_text,
+    shutdown_kit_if_running,
     stat_entry,
 )
 from .process_ifc import ConversionOptions, build_prototypes
@@ -235,11 +236,14 @@ def convert(
         log=log,
     )
     if not targets:
-        log.info("No IFC files found to convert in %s", input_path)
+        log.info("Connected to %s but found no IFC files to convert.", input_path)
         return []
+
+    log.info("Discovered %d IFC file(s) under %s", len(targets), input_path)
 
     results: list[ConversionResult] = []
     for target in targets:
+        log.info("Starting conversion for %s", target.source)
         plan = None
         if manifest_obj is not None:
             try:
@@ -270,16 +274,19 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv)
-    results = convert(
-        args.input_path,
-        output_dir=args.output_dir,
-        map_coordinate_system=args.map_coordinate_system,
-        manifest_path=args.manifest_path,
-        ifc_names=args.ifc_names,
-        process_all=args.process_all,
-        exclude_names=args.exclude,
-        checkpoint=args.checkpoint,
-    )
+    try:
+        results = convert(
+            args.input_path,
+            output_dir=args.output_dir,
+            map_coordinate_system=args.map_coordinate_system,
+            manifest_path=args.manifest_path,
+            ifc_names=args.ifc_names,
+            process_all=args.process_all,
+            exclude_names=args.exclude,
+            checkpoint=args.checkpoint,
+        )
+    finally:
+        shutdown_kit_if_running()
     _print_summary(results)
     return results
 
@@ -303,6 +310,7 @@ def _collect_ifc_paths(
         )
 
     path_obj = Path(input_path).resolve()
+    log.info("Scanning local directory %s", path_obj)
     return _collect_ifc_paths_local(
         path_obj,
         ifc_names=ifc_names,
@@ -392,6 +400,7 @@ def _collect_ifc_paths_nucleus(
 
     entries = None
     try:
+        log.info("Connecting to Nucleus directory %s", uri)
         entries = list_directory(uri)
     except (RuntimeError, FileNotFoundError):
         if _is_ifc_candidate(path_name(uri)):
