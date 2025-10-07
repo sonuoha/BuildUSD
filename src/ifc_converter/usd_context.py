@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import importlib
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Sequence, Union
+
+from .io_utils import is_omniverse_path
+from .kit_runtime import ensure_kit, shutdown_kit
+
+PathLike = Union[str, Path]
+
+_MODE: Optional[str] = None  # "kit" or "offline"
+_PREFERRED_MODE: Optional[str] = None
+_PXR_CACHE: Dict[str, object] = {}
+
+
+def set_preferred_mode(mode: Optional[str]) -> None:
+    """Force the USD backend mode ('kit' or 'offline')."""
+    global _PREFERRED_MODE
+    if mode not in (None, "kit", "offline"):
+        raise ValueError(f"Unsupported USD mode '{mode}'")
+    _PREFERRED_MODE = mode
+
+
+def _normalize_paths(paths: Iterable[PathLike]) -> Sequence[str]:
+    normalized: list[str] = []
+    for p in paths:
+        if p is None:
+            continue
+        if isinstance(p, Path):
+            normalized.append(p.as_posix())
+        else:
+            normalized.append(str(p))
+    return normalized
+
+
+def _determine_mode(required_paths: Iterable[PathLike]) -> str:
+    if _PREFERRED_MODE:
+        return _PREFERRED_MODE
+    normalized = _normalize_paths(required_paths)
+    if any(is_omniverse_path(p) for p in normalized):
+        return "kit"
+    return "offline"
+
+
+def initialize_usd(required_paths: Iterable[PathLike] = (), preferred_mode: Optional[str] = None) -> str:
+    """Initialize pxr bindings using Kit or standalone USD based on the requested mode."""
+    global _MODE, _PXR_CACHE
+
+    if preferred_mode is not None:
+        set_preferred_mode(preferred_mode)
+
+    mode = _determine_mode(required_paths)
+    if _MODE == mode and _PXR_CACHE:
+        return _MODE
+
+    _teardown_current_mode()
+
+    if mode == "kit":
+        ensure_kit(("omni.client", "omni.usd"))
+
+    _PXR_CACHE = {}
+    _MODE = mode
+    return _MODE
+
+
+def _teardown_current_mode() -> None:
+    global _MODE, _PXR_CACHE
+    if _MODE == "kit":
+        shutdown_kit()
+    _PXR_CACHE = {}
+    _MODE = None
+
+
+def get_pxr_module(name: str):
+    """Return the pxr.<name> module using the currently active mode."""
+    if name not in _PXR_CACHE:
+        initialize_usd()
+        _PXR_CACHE[name] = importlib.import_module(f"pxr.{name}")
+    return _PXR_CACHE[name]
+
+
+def get_pxr_package():
+    """Return the pxr package root for the active mode."""
+    if "__pxr__" not in _PXR_CACHE:
+        initialize_usd()
+        _PXR_CACHE["__pxr__"] = importlib.import_module("pxr")
+    return _PXR_CACHE["__pxr__"]
+
+
+def shutdown_usd_context() -> None:
+    """Shut down the active USD backend (and Kit, if running)."""
+    _teardown_current_mode()
