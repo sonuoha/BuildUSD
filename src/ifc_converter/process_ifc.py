@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 import hashlib
 
 if TYPE_CHECKING:
-    from src.config.manifest import ConversionManifest
+    from .config.manifest import ConversionManifest
 
 
 # ifcopenshell util for robust matrices (mapped/type geometry)

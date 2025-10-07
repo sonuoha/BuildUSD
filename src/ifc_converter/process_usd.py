@@ -8,9 +8,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
-from src.config.manifest import BasePointConfig, GeodeticCoordinate
-from src.process_ifc import ConversionOptions, InstanceRecord, PrototypeCaches, PrototypeKey
-from src.utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
+from .config.manifest import BasePointConfig, GeodeticCoordinate
+from .io_utils import join_path, path_stem, write_text
+from .process_ifc import ConversionOptions, InstanceRecord, PrototypeCaches, PrototypeKey
+from .utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
 
 try:
     from pyproj import CRS, Transformer
@@ -97,7 +98,11 @@ def create_usd_stage(usd_path, meters_per_unit=1.0):
     Returns:
         The newly created Usd.Stage instance.
     """
-    stage = Usd.Stage.CreateNew(str(usd_path))
+    if isinstance(usd_path, Path):
+        identifier = usd_path.resolve().as_posix()
+    else:
+        identifier = str(usd_path)
+    stage = Usd.Stage.CreateNew(identifier)
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
     stage.SetMetadata("metersPerUnit", float(meters_per_unit))
     world = UsdGeom.Xform.Define(stage, "/World")
@@ -398,10 +403,19 @@ def _name_for_hash(proto: Any) -> str:
     return _sanitize_identifier(f"{base}_Fallback_{str(digest)[:12]}")
 
 
+PathLike = Union[str, Path]
+
+
+def _layer_identifier(path: PathLike) -> str:
+    if isinstance(path, Path):
+        return path.resolve().as_posix()
+    return str(path)
+
+
 def author_prototype_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
-    output_dir: Path,
+    layer_path: PathLike,
     base_name: str,
     options: ConversionOptions,
 ) -> Tuple[Sdf.Layer, Dict[PrototypeKey, Sdf.Path]]:
@@ -409,8 +423,7 @@ def author_prototype_layer(
 
     Returns the authored Sdf.Layer and mapping from PrototypeKey to prim path.
     """
-    proto_file = (output_dir / f"{base_name}_prototypes.usda").resolve()
-    proto_layer = Sdf.Layer.CreateNew(proto_file.as_posix())
+    proto_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
 
     root_layer = stage.GetRootLayer()
     if proto_layer.identifier not in root_layer.subLayerPaths:
@@ -475,14 +488,13 @@ def author_material_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
     proto_paths: Dict[PrototypeKey, Sdf.Path],
-    output_dir: Path,
+    layer_path: PathLike,
     base_name: str,
     proto_layer: Sdf.Layer,
     options: ConversionOptions,
 ) -> Tuple[Sdf.Layer, Dict[PrototypeKey, List[Sdf.Path]]]:
     """Author a material layer and return mapping from prototype key to materials."""
-    material_file = (output_dir / f"{base_name}_materials.usda").resolve()
-    material_layer = Sdf.Layer.CreateNew(material_file.as_posix())
+    material_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
 
     root_layer = stage.GetRootLayer()
     if material_layer.identifier not in root_layer.subLayerPaths:
@@ -696,9 +708,13 @@ def _serialize_instance_record(record: InstanceRecord, proto_paths: Dict[Prototy
     }
 
 
-def persist_instance_cache(cache_dir: Path, base_name: str, caches: PrototypeCaches, proto_paths: Dict[PrototypeKey, Sdf.Path]) -> Path:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{base_name}.json"
+def persist_instance_cache(
+    cache_dir: PathLike,
+    base_name: str,
+    caches: PrototypeCaches,
+    proto_paths: Dict[PrototypeKey, Sdf.Path],
+) -> PathLike:
+    cache_path = join_path(cache_dir, f"{base_name}.json")
     payload = {
         "schema": 1,
         "base_name": base_name,
@@ -706,7 +722,7 @@ def persist_instance_cache(cache_dir: Path, base_name: str, caches: PrototypeCac
             _serialize_instance_record(record, proto_paths) for record in caches.instances.values()
         ],
     }
-    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_text(cache_path, json.dumps(payload, indent=2))
     return cache_path
 
 
@@ -921,12 +937,11 @@ def author_instance_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
     proto_paths: Dict[PrototypeKey, Sdf.Path],
-    output_dir: Path,
+    layer_path: PathLike,
     base_name: str,
     options: ConversionOptions,
 ) -> Sdf.Layer:
-    inst_file = (output_dir / f"{base_name}_instances.usda").resolve()
-    inst_layer = Sdf.Layer.CreateNew(inst_file.as_posix())
+    inst_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
 
     root_layer = stage.GetRootLayer()
     if inst_layer.identifier not in root_layer.subLayerPaths:
@@ -1050,14 +1065,13 @@ def author_instance_layer(
 def author_annotation_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
-    output_dir: Path,
+    layer_path: PathLike,
     base_name: str,
 ) -> Optional[Sdf.Layer]:
     if not getattr(caches, "annotations", None):
         return None
 
-    ann_file = (output_dir / f"{base_name}_annotations.usda").resolve()
-    ann_layer = Sdf.Layer.CreateNew(ann_file.as_posix())
+    ann_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
     root_layer = stage.GetRootLayer()
     if ann_layer.identifier not in root_layer.subLayerPaths:
         root_layer.subLayerPaths.append(ann_layer.identifier)
@@ -1611,8 +1625,8 @@ def _sanitize_identifier(raw_name: Optional[str], fallback: Optional[str] = None
 
 
 def update_federated_view(
-    master_stage_path: Path,
-    payload_stage_path: Path,
+    master_stage_path: PathLike,
+    payload_stage_path: PathLike,
     payload_prim_name: Optional[str] = None,
     parent_prim_path: str = "/World/Federated",
 ) -> Sdf.Layer:
@@ -1626,16 +1640,17 @@ def update_federated_view(
     - Avoids duplicate payload entries.
     """
 
-    # Open payload stage to read its units
-    payload_stage = Usd.Stage.Open(Path(payload_stage_path).resolve().as_posix())
+    payload_identifier = _layer_identifier(payload_stage_path)
+    master_identifier = _layer_identifier(master_stage_path)
+
+    payload_stage = Usd.Stage.Open(payload_identifier)
+    if payload_stage is None:
+        raise RuntimeError(f"Failed to open payload stage '{payload_stage_path}'")
     payload_mpu = float(payload_stage.GetMetadata("metersPerUnit") or 1.0)
 
-    # Open or create master stage
-    master_stage_path = Path(master_stage_path).resolve()
-    if master_stage_path.exists():
-        stage = Usd.Stage.Open(master_stage_path.as_posix())
-    else:
-        stage = Usd.Stage.CreateNew(master_stage_path.as_posix())
+    stage = Usd.Stage.Open(master_identifier)
+    if stage is None:
+        stage = Usd.Stage.CreateNew(master_identifier)
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
         world = UsdGeom.Xform.Define(stage, "/World")
         stage.SetDefaultPrim(world.GetPrim())
@@ -1662,7 +1677,7 @@ def update_federated_view(
     fed_root.ClearXformOpOrder()
 
     # Choose child prim name
-    child_name = _sanitize_identifier(payload_prim_name or Path(payload_stage_path).stem)
+    child_name = _sanitize_identifier(payload_prim_name or path_stem(payload_stage_path))
     child_path = fed_root_path.AppendChild(child_name)
 
     # Define or get child prim
@@ -1681,7 +1696,7 @@ def update_federated_view(
         existing = payloads.GetAddedOrExplicitItems()
     except Exception:
         existing = []
-    asset = payload_stage_path.as_posix()
+    asset = payload_identifier
     # Use the payload stage's default prim if available to avoid grafting an extra '/World'
     default_prim = payload_stage.GetDefaultPrim()
     target_prim = (default_prim.GetPath() if default_prim else Sdf.Path("/World"))
