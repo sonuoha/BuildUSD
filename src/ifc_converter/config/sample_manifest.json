@@ -3,6 +3,7 @@
     "master_name": "Federated Model",
     "projected_crs": "EPSG:7855",
     "geodetic_crs": "EPSG:4326",
+    "file_revision": "REV-DEFAULT",
     "base_point": {
       "easting": 333800.49,
       "northing": 5809101.468,
@@ -16,6 +17,7 @@
       "name": "Civil_Master",
       "projected_crs": "EPSG:7856",
       "geodetic_crs": "EPSG:4326",
+      "file_revision": "REV-CIVIL",
       "base_point": {
         "easting": 333750.0,
         "northing": 5809150.0,
@@ -27,12 +29,14 @@
   "files": [
     {
       "pattern": "BUW_*",
-      "master": "CIVIL"
+      "master": "CIVIL",
+      "file_revision": "REV-BUW"
     },
     {
       "name": "pass_1.ifc",
       "projected_crs": "EPSG:7855",
       "geodetic_crs": "EPSG:4979",
+      "file_revision": "REV-PASS-1",
       "base_point": {
         "easting": 333905.123,
         "northing": 5809205.456,

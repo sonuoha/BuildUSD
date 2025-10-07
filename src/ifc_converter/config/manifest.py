@@ -28,6 +28,18 @@ def _sanitize_filename(value: str) -> str:
     return sanitized
 
 
+def _extract_revision(entry: Dict[str, Any] | None) -> Optional[str]:
+    if not entry:
+        return None
+    value = entry.get("file_revision")
+    if value is None:
+        value = entry.get("revision")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 @dataclass
 class BasePointConfig:
     """Projected base-point expressed as east/north/height in a given unit."""
@@ -92,6 +104,7 @@ class ManifestDefaults:
     projected_crs: Optional[str] = None
     geodetic_crs: Optional[str] = None
     base_point: Optional[BasePointConfig] = None
+    revision: Optional[str] = None
 
 
 @dataclass
@@ -102,6 +115,7 @@ class MasterConfig:
     geodetic_crs: Optional[str] = None
     base_point: Optional[BasePointConfig] = None
     lonlat: Optional[GeodeticCoordinate] = None
+    revision: Optional[str] = None
 
     def resolved_name(self) -> str:
         raw = self.name.strip() if self.name else ""
@@ -125,6 +139,7 @@ class FileRule:
     geodetic_crs: Optional[str] = None
     base_point: Optional[BasePointConfig] = None
     lonlat: Optional[GeodeticCoordinate] = None
+    revision: Optional[str] = None
 
     def matches(self, path: Path) -> bool:
         target_name = path.name.lower()
@@ -149,6 +164,7 @@ class ResolvedFilePlan:
     base_point: BasePointConfig
     lonlat: Optional[GeodeticCoordinate] = None
     applied_rules: List[FileRule] = field(default_factory=list)
+    revision: Optional[str] = None
 
     @property
     def master_stage_filename(self) -> str:
@@ -178,6 +194,7 @@ class ConversionManifest:
             projected_crs=defaults_data.get("projected_crs"),
             geodetic_crs=defaults_data.get("geodetic_crs"),
             base_point=BasePointConfig.from_mapping(defaults_data.get("base_point")),
+            revision=_extract_revision(defaults_data),
         )
 
         masters: Dict[str, MasterConfig] = {}
@@ -198,6 +215,7 @@ class ConversionManifest:
                 geodetic_crs=geodetic,
                 base_point=base_point,
                 lonlat=lonlat,
+                revision=_extract_revision(entry),
             )
 
         file_rules: List[FileRule] = []
@@ -213,8 +231,9 @@ class ConversionManifest:
                     geodetic_crs=entry.get("geodetic_crs"),
                     base_point=base_point,
                     lonlat=lonlat,
+                    revision=_extract_revision(entry),
                 )
-        )
+            )
 
         return cls(defaults=defaults, masters=masters, file_rules=file_rules)
 
@@ -244,6 +263,7 @@ class ConversionManifest:
         geodetic_crs = self.defaults.geodetic_crs or fallback_geodetic_crs
         base_point = self.defaults.base_point or fallback_base_point
         lonlat: Optional[GeodeticCoordinate] = None
+        revision = self.defaults.revision
 
         master_id = self.defaults.master_id
         master_name = self.defaults.master_name
@@ -262,8 +282,15 @@ class ConversionManifest:
                 master_name = None
             if rule.lonlat:
                 lonlat = rule.lonlat
+            if rule.revision:
+                revision = rule.revision
 
-        master = self._resolve_master(master_id=master_id, master_name=master_name, fallback_name=fallback_master_name)
+        master = self._resolve_master(
+            master_id=master_id,
+            master_name=master_name,
+            fallback_name=fallback_master_name,
+            fallback_revision=self.defaults.revision,
+        )
 
         if projected_crs is None:
             projected_crs = master.projected_crs or fallback_projected_crs
@@ -282,6 +309,8 @@ class ConversionManifest:
 
         if lonlat is None:
             lonlat = master.lonlat
+        if revision is None:
+            revision = master.revision or self.defaults.revision
 
         return ResolvedFilePlan(
             ifc_path=ifc_path,
@@ -291,6 +320,7 @@ class ConversionManifest:
             base_point=base_point,
             lonlat=lonlat,
             applied_rules=applied,
+            revision=revision,
         )
 
     def _iter_matching_rules(self, ifc_path: Path) -> Iterable[FileRule]:
@@ -307,16 +337,17 @@ class ConversionManifest:
         master_id: Optional[str],
         master_name: Optional[str],
         fallback_name: str,
+        fallback_revision: Optional[str],
     ) -> MasterConfig:
         master: Optional[MasterConfig] = None
         if master_id:
             master = self.masters.get(master_id)
             if master is None:
                 log.warning("Manifest references undefined master '%s'; treating as ad-hoc file name", master_id)
-                master = MasterConfig(id=master_id, name=master_id)
+                master = MasterConfig(id=master_id, name=master_id, revision=fallback_revision)
         if master is None:
             name = master_name or fallback_name
-            master = MasterConfig(id="__default__", name=name)
+            master = MasterConfig(id="__default__", name=name, revision=fallback_revision)
         resolved_name = master.resolved_name()
         if master.name != resolved_name:
             master = replace(master, name=resolved_name)

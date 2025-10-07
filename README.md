@@ -31,6 +31,8 @@ Usage (CLI)
   - python -m ifc_converter --input C:\\path\\to\\dir --all
 - Directory, all files excluding drafts:
   - python -m ifc_converter --input C:\\path\\to\\dir --all --exclude DraftModel TempIFC
+- Checkpoint authored layers on Nucleus:
+  - python -m ifc_converter --input omniverse://server/Projects/IFC --all --checkpoint
 - Custom CRS (default EPSG:7855):
   - python -m ifc_converter --input C:\\path\\to\\dir --all --map-coordinate-system EPSG:XXXX
 - Manifest-driven base points / federated routing:
@@ -46,6 +48,7 @@ Usage (Python)
 - from ifc_converter import convert
 - results = convert("path/to/file.ifc", output_dir="data/output")  # returns List[ConversionResult]
 - convert("omniverse://server/Projects/file.ifc", output_dir="omniverse://server/USD/output")
+- convert("path/to/file.ifc", output_dir="data/output", checkpoint=True)  # omniverse:// required for checkpoints
 
 Outputs
 - Per-IFC stages and layers are written to data/output:
@@ -80,9 +83,9 @@ Federated Stage Behavior
 Programmatic Use
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
 Manifest Schema
-- defaults: Global fallback for master name, projected/geodetic CRS, and base point.
-- masters: Named federated stages with optional CRS/base point overrides.
-- files: Match rules (name or glob pattern) that choose a master and override CRS/base point or provide lon/lat.
+- defaults: Global fallback for master name, projected/geodetic CRS, base point, and optional `file_revision` used for checkpoint notes/tags.
+- masters: Named federated stages with optional CRS/base point overrides and `file_revision`.
+- files: Match rules (name or glob pattern) that choose a master, override CRS/base point/lonlat, and provide a per-file `file_revision`.
 
 Notes
 - JSON manifests work immediately; YAML manifests require installing PyYAML.
