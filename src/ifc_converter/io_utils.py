@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Sequence, Union
+from typing import Iterable, List, Optional, Sequence, Union
 
 try:
     import omni.client as _omni_client
@@ -142,6 +142,28 @@ def write_bytes(path: PathLike, data: bytes) -> None:
         Path(path).write_bytes(data)
 
 
+def create_checkpoint(path: PathLike, *, note: Optional[str] = None, tags: Optional[Sequence[str]] = None) -> bool:
+    """Create a Nucleus checkpoint for the given path when possible.
+
+    Returns:
+        True when a checkpoint was created, False when the path is not an omniverse URI.
+    """
+    if not is_omniverse_path(path):
+        return False
+    client = _require_omni_client()
+    tag_list: List[str] = []
+    if tags:
+        tag_list = [str(tag).strip() for tag in tags if str(tag).strip()]
+    result = client.create_checkpoint(
+        _normalize_nucleus_path(_as_string(path)),
+        note or "",
+        tag_list,
+    )
+    if result != client.Result.OK:
+        raise RuntimeError(f"Failed to checkpoint {path}: {result}")
+    return True
+
+
 def list_directory(path: PathLike):
     if is_omniverse_path(path):
         client = _require_omni_client()
@@ -207,4 +229,3 @@ def _ensure_nucleus_directory(client, uri: str) -> None:
     create_result = client.create_folder(uri.rstrip("/"))
     if create_result not in (client.Result.OK, getattr(client.Result, "ALREADY_EXISTS", client.Result.OK)):
         raise RuntimeError(f"Failed to create omniverse directory {uri}: {create_result}")
-

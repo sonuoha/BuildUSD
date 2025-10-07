@@ -5,7 +5,7 @@ import logging
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 from .config.manifest import BasePointConfig, ConversionManifest, ResolvedFilePlan
 from .io_utils import (
@@ -13,6 +13,7 @@ from .io_utils import (
     ensure_parent_directory,
     is_omniverse_path,
     join_path,
+    create_checkpoint,
     list_directory,
     normalize_exclusions,
     path_name,
@@ -82,6 +83,7 @@ class ConversionResult:
     geodetic_coordinates: tuple[float, ...] | None
     counts: dict[str, int]
     plan: ResolvedFilePlan | None
+    revision: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         """Legacy dict-compatible view of the conversion result."""
@@ -98,6 +100,7 @@ class ConversionResult:
             "counts": self.counts,
             "plan": self.plan,
             "projected_crs": self.projected_crs,
+            "revision": self.revision,
         }
 
 
@@ -169,6 +172,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Process all .ifc files in the input directory",
     )
+    parser.add_argument(
+        "--checkpoint",
+        dest="checkpoint",
+        action="store_true",
+        help="Create Nucleus checkpoints for each authored layer and stage (omniverse:// only)",
+    )
     return parser.parse_args(argv)
 
 
@@ -184,6 +193,7 @@ def convert(
     exclude_names: Sequence[str] | None = None,
     options: ConversionOptions | None = None,
     logger: logging.Logger | None = None,
+    checkpoint: bool = False,
 ) -> list[ConversionResult]:
     """Programmatic API for running the converter inside another application."""
 
@@ -249,6 +259,7 @@ def convert(
             options=run_options,
             plan=plan,
             logger=log,
+            checkpoint=checkpoint,
         )
         results.append(result)
     return results
@@ -267,6 +278,7 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         ifc_names=args.ifc_names,
         process_all=args.process_all,
         exclude_names=args.exclude,
+        checkpoint=args.checkpoint,
     )
     _print_summary(results)
     return results
@@ -280,6 +292,7 @@ def _collect_ifc_paths(
     exclude: set[str],
     log: logging.Logger,
 ) -> list[_IfcTarget]:
+    """Resolve the set of IFC targets from a local or Nucleus path."""
     if is_omniverse_path(input_path):
         return _collect_ifc_paths_nucleus(
             str(input_path),
@@ -307,6 +320,7 @@ def _collect_ifc_paths_local(
     exclude: set[str],
     log: logging.Logger,
 ) -> list[_IfcTarget]:
+    """Collect IFC files from the local filesystem."""
     if root.is_file():
         if root.suffix.lower() != ".ifc":
             raise ValueError(f"Input file is not an IFC: {root}")
@@ -361,6 +375,7 @@ def _collect_ifc_paths_nucleus(
     exclude: set[str],
     log: logging.Logger,
 ) -> list[_IfcTarget]:
+    """Collect IFC files from a Nucleus directory or file URI."""
     # Try treating input as a single file if it looks like one
     def _single_file_target(file_uri: str) -> list[_IfcTarget]:
         if not _is_ifc_candidate(path_name(file_uri)):
@@ -424,6 +439,7 @@ def _collect_ifc_paths_nucleus(
 
 
 def _ensure_ifc_name(name: str) -> str:
+    """Normalize a user-specified IFC filename, appending .ifc when missing."""
     trimmed = (name or "").strip()
     if not trimmed:
         return trimmed
@@ -433,10 +449,12 @@ def _ensure_ifc_name(name: str) -> str:
 
 
 def _is_ifc_candidate(name: str) -> bool:
+    """Return True when `name` looks like an IFC file."""
     return (name or "").lower().endswith(".ifc")
 
 
 def _manifest_key_for_path(path: PathLike) -> Path:
+    """Provide a stable manifest lookup key for either local or omniverse paths."""
     if isinstance(path, Path):
         return path.resolve()
     if is_omniverse_path(path):
@@ -447,6 +465,7 @@ def _manifest_key_for_path(path: PathLike) -> Path:
 
 
 def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout:
+    """Return the canonical file layout for USD artifacts derived from an IFC."""
     ensure_directory(output_root)
 
     prototypes_dir = join_path(output_root, "prototypes")
@@ -471,6 +490,31 @@ def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout
     )
 
 
+def _make_checkpoint_metadata(revision: Optional[str], base_name: str) -> tuple[str, list[str]]:
+    """Create checkpoint note/tags using manifest revision when provided."""
+    if revision:
+        note = revision
+        tag_candidates = revision.replace(",", " ").split()
+        tags = [fragment.strip() for fragment in tag_candidates if fragment.strip()]
+        if not tags:
+            tags = [base_name]
+    else:
+        note = f"{base_name} update"
+        tags = [base_name]
+    return note, tags
+
+
+def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: logging.Logger, label: str) -> None:
+    """Create a checkpoint for `path` when it resides on Nucleus."""
+    try:
+        did_checkpoint = create_checkpoint(path, note=note, tags=tags)
+    except Exception as exc:
+        logger.warning("Failed to checkpoint %s (%s): %s", label, path, exc)
+        return
+    if did_checkpoint:
+        logger.info("Checkpoint saved for %s (%s)", label, note)
+
+
 def _process_single_ifc(
     ifc_path: PathLike,
     *,
@@ -479,14 +523,21 @@ def _process_single_ifc(
     options: ConversionOptions,
     plan: ResolvedFilePlan | None,
     logger: logging.Logger,
+    checkpoint: bool,
     default_base_point: BasePointConfig = DEFAULT_BASE_POINT,
     default_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
     default_master_stage: str = DEFAULT_MASTER_STAGE,
 ) -> ConversionResult:
+    """Convert a single IFC file into USD layers and optional checkpoints."""
     import ifcopenshell  # Local import to avoid heavy dependency at module load
 
     base_name = path_stem(ifc_path)
     layout = _build_output_layout(output_root, base_name)
+    revision_note = plan.revision if plan and plan.revision else None
+    checkpoint_note: Optional[str] = None
+    checkpoint_tags: list[str] = []
+    if checkpoint:
+        checkpoint_note, checkpoint_tags = _make_checkpoint_metadata(revision_note, base_name)
 
     def _execute(local_ifc: Path) -> ConversionResult:
         ifc = ifcopenshell.open(local_ifc.as_posix())
@@ -565,12 +616,21 @@ def _process_single_ifc(
         inst_layer.Save()
         if ann_layer:
             ann_layer.Save()
+        if checkpoint and checkpoint_note is not None:
+            _checkpoint_path(layout.stage, checkpoint_note, checkpoint_tags, logger, f"{base_name} stage")
+            _checkpoint_path(layout.prototypes, checkpoint_note, checkpoint_tags, logger, f"{base_name} prototypes layer")
+            _checkpoint_path(layout.materials, checkpoint_note, checkpoint_tags, logger, f"{base_name} materials layer")
+            _checkpoint_path(layout.instances, checkpoint_note, checkpoint_tags, logger, f"{base_name} instances layer")
+            if ann_layer:
+                _checkpoint_path(layout.annotations, checkpoint_note, checkpoint_tags, logger, f"{base_name} annotations layer")
 
         logger.info("Wrote stage %s", layout.stage)
 
         master_stage_path = join_path(output_root, master_stage_name)
         ensure_parent_directory(master_stage_path)
         update_federated_view(master_stage_path, layout.stage, base_name, parent_prim_path="/World")
+        if checkpoint and checkpoint_note is not None:
+            _checkpoint_path(master_stage_path, checkpoint_note, checkpoint_tags, logger, f"{base_name} master stage")
 
         counts = {
             "prototypes_3d": len(caches.repmaps) + len(caches.hashes),
@@ -598,6 +658,7 @@ def _process_single_ifc(
             geodetic_coordinates=coordinates,
             counts=counts,
             plan=plan,
+            revision=revision_note,
         )
 
     logger.info("Opening IFC %s", ifc_path)
@@ -621,6 +682,7 @@ def _print_summary(results: Sequence[ConversionResult]) -> None:
         counts = result.counts
         master_stage = path_name(result.master_stage_path) if result.master_stage_path else "n/a"
         coords = result.geodetic_coordinates
+        revision = result.revision or "n/a"
         if coords and len(coords) >= 2 and coords[0] is not None and coords[1] is not None:
             alt_val = coords[2] if len(coords) > 2 and coords[2] is not None else 0.0
             coord_info = f", geo=({coords[0]:.5f}, {coords[1]:.5f}, {alt_val:.2f})"
@@ -637,7 +699,7 @@ def _print_summary(results: Sequence[ConversionResult]) -> None:
         print(
             f"- {path_name(result.ifc_path)}: stage={result.stage_path}, master={master_stage}, "
             f"prototypes3D={proto_3d}, instances3D={inst_3d}, curves2D={curves_2d}, "
-            f"totalElements={total_elements}{coord_info}"
+            f"totalElements={total_elements}, revision={revision}{coord_info}"
         )
 
 
