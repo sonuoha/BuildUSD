@@ -1,7 +1,6 @@
 # Python-generated files
 __pycache__/
-src/utils/__pycache__
-src/__pycache
+**/__pycache__/
 *.py[oc]
 build/
 dist/
@@ -15,6 +14,7 @@ wheels/
 src/dev/*.py
 src/dev/__pycache__/*.pyc
 src/dev/__pycache__/*.pyo
+src/ifc_converter/config/manifest.yaml
 
 # Ignore heavy BIM sample files
 /output/*.usd*

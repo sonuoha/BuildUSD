@@ -5,8 +5,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pathlib import Path
-from src.utils.ifc import debug_dump_contexts
+from ifc_converter.utils.ifc import debug_dump_contexts
 
 data_path = Path(r"\Users\samue\_dev\usd_root\usdex\data\SRL-WPD-TVC-UTU8-MOD-CTU-BUW-000001.ifc").resolve()
 
