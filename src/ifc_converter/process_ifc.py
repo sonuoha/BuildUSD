@@ -5,13 +5,14 @@ from collections import Counter
 import multiprocessing
 import numpy as np
 import ifcopenshell
-from pxr import Gf
 
 import math
 import re
 from typing import Dict, Optional, Union, Literal, List, Tuple, Any, TYPE_CHECKING
 from dataclasses import dataclass, field
 import hashlib
+
+from .pxr_utils import require_pxr_module
 
 if TYPE_CHECKING:
     from .config.manifest import ConversionManifest
@@ -25,6 +26,8 @@ except Exception:
     _HAVE_IFC_UTIL_SHAPE = False
 
 log = logging.getLogger(__name__)
+
+Gf = require_pxr_module("Gf")
 
 def _localize_mesh(mesh: dict, matrix_inv: np.ndarray) -> dict:
     """Return a copy of mesh with vertices transformed by matrix_inv (4x4)."""

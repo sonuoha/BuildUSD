@@ -3,23 +3,43 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 from typing import Iterable, List, Optional, Sequence, Union
 
-try:
-    import omni.client as _omni_client
-except Exception:  # pragma: no cover - optional dependency
-    _omni_client = None
+from .kit_runtime import ensure_kit, shutdown_kit
 
 PathLike = Union[str, Path]
 
 _OMNI_PREFIXES = ("omniverse://",)
+_OMNI_CLIENT = None
 
 
 def _require_omni_client():
-    if _omni_client is None:
+    """Ensure omni.client is ready, starting Kit in headless mode if needed."""
+    client = _ensure_omni_client()
+    if client is None:
         raise RuntimeError(
-            "omni.client is required for omniverse:// paths. Install omniverse-kit and ensure it is available."
+            "omni.client is required for omniverse:// paths. Install omniverse-kit inside your environment."
         )
-    return _omni_client
+    return client
 
+
+def _ensure_omni_client():
+    """Return omni.client, bootstrapping the Kit runtime using the official pattern."""
+    global _OMNI_CLIENT
+    if _OMNI_CLIENT is not None:
+        return _OMNI_CLIENT
+    try:
+        import omni.client as omni_client  # type: ignore
+    except ModuleNotFoundError:
+        ensure_kit(("omni.client", "omni.usd"))
+        import omni.client as omni_client  # type: ignore
+    _OMNI_CLIENT = omni_client
+    return _OMNI_CLIENT
+
+
+def shutdown_kit_if_running():
+    """Shutdown the Kit application created for omni.client, if any."""
+    global _OMNI_CLIENT
+    _OMNI_CLIENT = None
+    shutdown_kit()
 
 def is_omniverse_path(value: PathLike) -> bool:
     s = _as_string(value).lower()
@@ -95,20 +115,20 @@ def path_name(path: PathLike) -> str:
 def read_text(path: PathLike, encoding: str = "utf-8") -> str:
     if is_omniverse_path(path):
         client = _require_omni_client()
-        result, content = client.read_file(_normalize_nucleus_path(_as_string(path)))
+        result, resolved, payload = client.read_file(_normalize_nucleus_path(_as_string(path)))
         if result != client.Result.OK:
-            raise RuntimeError(f"Failed to read {path}: {result}")
-        return bytes(content).decode(encoding)
+            raise RuntimeError(f"Failed to read {path} (resolved: {resolved}): {result}")
+        data = _payload_bytes(payload)
+        return data.decode(encoding)
     return Path(path).read_text(encoding=encoding)
-
 
 def read_bytes(path: PathLike) -> bytes:
     if is_omniverse_path(path):
         client = _require_omni_client()
-        result, content = client.read_file(_normalize_nucleus_path(_as_string(path)))
+        result, resolved, payload = client.read_file(_normalize_nucleus_path(_as_string(path)))
         if result != client.Result.OK:
-            raise RuntimeError(f"Failed to read {path}: {result}")
-        return bytes(content)
+            raise RuntimeError(f"Failed to read {path} (resolved: {resolved}): {result}")
+        return _payload_bytes(payload)
     return Path(path).read_bytes()
 
 
@@ -142,36 +162,49 @@ def write_bytes(path: PathLike, data: bytes) -> None:
         Path(path).write_bytes(data)
 
 
-def create_checkpoint(path: PathLike, *, note: Optional[str] = None, tags: Optional[Sequence[str]] = None) -> bool:
-    """Create a Nucleus checkpoint for the given path when possible.
+def _payload_bytes(payload: Any) -> bytes:
+    """Normalize omni.client payload return types to raw bytes."""
+    data = payload
+    if isinstance(payload, tuple):
+        data = payload[0]
+    if isinstance(data, (bytes, bytearray)):
+        return bytes(data)
+    if hasattr(data, "buffer"):
+        return bytes(data.buffer)
+    # handle omni.client.Buffer or memoryview
+    try:
+        return bytes(data)
+    except TypeError:
+        raise RuntimeError("Unsupported omni.client payload type for binary data") from None
 
-    Returns:
-        True when a checkpoint was created, False when the path is not an omniverse URI.
-    """
+
+def create_checkpoint(path: PathLike, *, note: Optional[str] = None, tags: Optional[Sequence[str]] = None) -> bool:
     if not is_omniverse_path(path):
         return False
     client = _require_omni_client()
-    tag_list: List[str] = []
+    # Combine tags into comment if desired; otherwise ignore
+    full_note = note or ""
     if tags:
-        tag_list = [str(tag).strip() for tag in tags if str(tag).strip()]
-    result = client.create_checkpoint(
+        full_note += f" tags:{','.join(str(t).strip() for t in tags if str(t).strip())}"
+    result, checkpoint_id = client.create_checkpoint(
         _normalize_nucleus_path(_as_string(path)),
-        note or "",
-        tag_list,
+        full_note,
+        # force=False  # Add if you want to expose/force
     )
     if result != client.Result.OK:
-        raise RuntimeError(f"Failed to checkpoint {path}: {result}")
+        raise RuntimeError(f"Failed to checkpoint {path}: {result} (ID: {checkpoint_id})")
     return True
 
 
-def list_directory(path: PathLike):
+def list_directory(path: PathLike, include_deleted: bool = False) -> List[ListEntry]:
     if is_omniverse_path(path):
         client = _require_omni_client()
         uri = _normalize_nucleus_dir(_as_string(path))
-        result, entries = client.list(uri)
+        opt = client.ListIncludeOption.ALL if include_deleted else client.ListIncludeOption.NO_DELETED_FILES
+        result, entries_tuple = client.list(uri, opt)
         if result != client.Result.OK:
             raise RuntimeError(f"Failed to list {path}: {result}")
-        return entries
+        return list(entries_tuple)  # Convert to mutable list
     p = Path(path)
     if not p.exists() or not p.is_dir():
         raise FileNotFoundError(f"Directory does not exist: {path}")
@@ -181,10 +214,11 @@ def list_directory(path: PathLike):
 def stat_entry(path: PathLike):
     if is_omniverse_path(path):
         client = _require_omni_client()
-        result, entry = client.stat(_normalize_nucleus_path(_as_string(path)))
+        # In stat_entry, if is_omniverse_path:
+        result, resolved, entry = client.stat(_normalize_nucleus_path(_as_string(path)))  # If stat also resolves—confirm via test
         if result != client.Result.OK:
             return None
-        return entry
+        return entry  # Or wrap in a dict with 'resolved': resolved
     p = Path(path)
     if not p.exists():
         return None
