@@ -21,6 +21,12 @@ Environment
 
 Install
 - Create/activate venv and install dependencies per your workflow (e.g., pip install -e . or use uv per uv.lock).
+- (Omniverse) Accept the Kit EULA once before installing: PowerShell `set OMNI_KIT_ACCEPT_EULA=yes`, bash `export OMNI_KIT_ACCEPT_EULA=yes`.
+- Install the Omniverse client wheel into the same environment: `pip install --extra-index-url https://pypi.nvidia.com omniverse-kit`.
+- Verify Kit bootstrap works: `python -c "from omni.kit.app import KitApp; KitApp().shutdown(); print('Omniverse ready')"` (requires omniverse-kit >= 108).
+- The converter auto-starts a headless Kit session on first `omniverse://` use, enabling `omni.client` for Nucleus I/O.
+- To run without installing the package, execute `python -m ifc_converter ...` from the repository root; the shim package under `ifc_converter/` preloads `src/` onto `PYTHONPATH`. For global use, run `pip install -e .`.
+- INFO-level logs report the Nucleus/local directory being scanned, the number of IFCs discovered, and each file as it begins processing. Set `PYTHONUNBUFFERED=1` if you need unbuffered logging in CI.
 
 Usage (CLI)
 - Single IFC file:

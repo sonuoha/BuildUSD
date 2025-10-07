@@ -1193,6 +1193,24 @@ wheels = [
 ]
 
 [[package]]
+name = "omniverse-kit"
+version = "107.3.1.206797"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.12'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/79/e8/5479f65f3384df19bb5c977385bb012c783e36bef6e741257c25c53b8e9e/omniverse_kit-107.3.1.206797.tar.gz", hash = "sha256:57aece816cb2bde043b9937dbd5c2c151833a4a311b1ffe9d423c35294e5c403", size = 1988 }
+
+[[package]]
+name = "omniverse-kit"
+version = "108.1.0.234166"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.12'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5e/d3/1ff836300b7a7dae9ff425aaa60dece40c7cf25102acbdb843be92e5191e/omniverse_kit-108.1.0.234166.tar.gz", hash = "sha256:91136549fd198cb0f016833b17e3a2766225958573f577152e45106d4fbab7f0", size = 1989 }
+
+[[package]]
 name = "openpyxl"
 version = "3.1.5"
 source = { registry = "https://pypi.org/simple" }
@@ -2104,9 +2122,11 @@ wheels = [
 [[package]]
 name = "usdx"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "ifcopenshell" },
+    { name = "omniverse-kit", version = "107.3.1.206797", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "omniverse-kit", version = "108.1.0.234166", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "polars", extra = ["all"] },
     { name = "pyproj" },
     { name = "pytest" },
@@ -2117,6 +2137,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "ifcopenshell", specifier = "==0.8.3.post2" },
+    { name = "omniverse-kit" },
     { name = "polars", extras = ["all"] },
     { name = "pyproj", specifier = "==3.7.2" },
     { name = "pytest", specifier = "==8.4.2" },
