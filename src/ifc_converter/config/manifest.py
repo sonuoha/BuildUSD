@@ -214,27 +214,19 @@ class ConversionManifest:
                     base_point=base_point,
                     lonlat=lonlat,
                 )
-            )
+        )
 
         return cls(defaults=defaults, masters=masters, file_rules=file_rules)
 
     @classmethod
     def from_file(cls, path: Path) -> "ConversionManifest":
         text = path.read_text(encoding="utf-8")
-        data: Dict[str, Any]
-        if path.suffix.lower() in {".yaml", ".yml"}:
-            if yaml is None:
-                raise RuntimeError("PyYAML is required to load YAML manifests")
-            loaded = yaml.safe_load(text)
-            if not isinstance(loaded, dict):
-                raise ValueError("YAML manifest must define a mapping at the top level")
-            data = loaded
-        elif path.suffix.lower() == ".json":
-            data = json.loads(text)
-            if not isinstance(data, dict):
-                raise ValueError("JSON manifest must define a mapping at the top level")
-        else:
-            raise ValueError(f"Unsupported manifest type: {path.suffix}")
+        data = cls._load_data_from_text(text, suffix=path.suffix)
+        return cls.from_mapping(data)
+
+    @classmethod
+    def from_text(cls, text: str, *, suffix: str) -> "ConversionManifest":
+        data = cls._load_data_from_text(text, suffix=suffix)
         return cls.from_mapping(data)
 
     def resolve_for_path(
@@ -329,6 +321,23 @@ class ConversionManifest:
         if master.name != resolved_name:
             master = replace(master, name=resolved_name)
         return master
+
+    @staticmethod
+    def _load_data_from_text(text: str, *, suffix: str) -> Dict[str, Any]:
+        ext = (suffix or "").lower()
+        if ext in {".yaml", ".yml"}:
+            if yaml is None:
+                raise RuntimeError("PyYAML is required to load YAML manifests")
+            loaded = yaml.safe_load(text)
+            if not isinstance(loaded, dict):
+                raise ValueError("YAML manifest must define a mapping at the top level")
+            return loaded
+        if ext == ".json":
+            loaded = json.loads(text)
+            if not isinstance(loaded, dict):
+                raise ValueError("JSON manifest must define a mapping at the top level")
+            return loaded
+        raise ValueError(f"Unsupported manifest type: {suffix}")
 
 
 __all__ = [

@@ -9,5 +9,19 @@ dependencies = ["usd-core==25.8",
                 "polars[all]",
                 "pyproj==3.7.2",
                 "pytest==8.4.2",
-                "pyyaml==6.0.3"
+                "pyyaml==6.0.3",
+                "omniverse-kit"
                 ]
+
+[project.scripts]
+ifc-convert = "ifc_converter.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
