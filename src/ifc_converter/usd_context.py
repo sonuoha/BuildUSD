@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Union
+import sys
 
 from .io_utils import is_omniverse_path
 from .kit_runtime import ensure_kit, shutdown_kit
@@ -57,6 +58,7 @@ def initialize_usd(required_paths: Iterable[PathLike] = (), preferred_mode: Opti
     _teardown_current_mode()
 
     if mode == "kit":
+        _unload_pxr_modules()
         ensure_kit(("omni.client", "omni.usd"))
 
     _PXR_CACHE = {}
@@ -68,6 +70,7 @@ def _teardown_current_mode() -> None:
     global _MODE, _PXR_CACHE
     if _MODE == "kit":
         shutdown_kit()
+    _unload_pxr_modules()
     _PXR_CACHE = {}
     _MODE = None
 
@@ -91,3 +94,8 @@ def get_pxr_package():
 def shutdown_usd_context() -> None:
     """Shut down the active USD backend (and Kit, if running)."""
     _teardown_current_mode()
+def _unload_pxr_modules() -> None:
+    """Remove pxr-related modules from sys.modules to avoid ABI clashes when switching backends."""
+    for name in list(sys.modules):
+        if name == "pxr" or name.startswith("pxr.") or name in {"Usd", "UsdGeom", "UsdShade", "UsdUtils", "Sdf", "Gf", "Vt"}:
+            sys.modules.pop(name, None)
