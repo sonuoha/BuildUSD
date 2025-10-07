@@ -4,29 +4,32 @@ Overview
 - Converts IFC files to USD with prototypes, materials, and instances.
 - Adds WGS84 geolocation attributes to /World.
 - Builds a federated master stage (Federated Model.usda) that payloads each per-file stage under /World/<discipline>.
-- Authors IFC properties/quantities as USD attributes under BIMData namespace.
+- Authors IFC properties/quantities as USD attributes under a BIMData namespace.
 
 Requirements
-- Python >= 3.11
-- Packages (see pyproject.toml):
-  - openusd core wheel (pxr) via usd-core
-  - ifcopenshell==0.8.3.post2
-  - pyproj==3.7.2 (for CRS transforms)
-  - omniverse-kit (for omni.client omniverse:// support)
-  - numpy, etc.
+- Python ≥ 3.11
+- Shared dependencies (see `pyproject.toml`):
+  - `ifcopenshell==0.8.3.post2`
+  - `pyproj==3.7.2` (for CRS transforms)
+  - `numpy`, `click`, `rich`, etc.
+- **Omniverse mode (default)** – no standalone `usd-core` wheel required. Install Omniverse Kit (``pip install --extra-index-url https://pypi.nvidia.com omniverse-kit``) so `omni.client` and Kit's pxr are available.
+- **Offline mode (`--offline`)** – install a standalone USD build (e.g. ``pip install usd-core``). All paths must be local; `omniverse://` URIs are rejected and checkpointing is skipped.
 
 Environment
 - Windows requires the Microsoft Visual C++ 2015–2022 Redistributable x64.
 - Ensure your virtual environment is active before running.
 
 Install
-- Create/activate venv and install dependencies per your workflow (e.g., pip install -e . or use uv per uv.lock).
-- (Omniverse) Accept the Kit EULA once before installing: PowerShell `set OMNI_KIT_ACCEPT_EULA=yes`, bash `export OMNI_KIT_ACCEPT_EULA=yes`.
-- Install the Omniverse client wheel into the same environment: `pip install --extra-index-url https://pypi.nvidia.com omniverse-kit`.
-- Verify Kit bootstrap works: `python -c "from omni.kit.app import KitApp; KitApp().shutdown(); print('Omniverse ready')"` (requires omniverse-kit >= 108).
-- The converter auto-starts a headless Kit session on first `omniverse://` use, enabling `omni.client` for Nucleus I/O.
-- To run without installing the package, execute `python -m ifc_converter ...` from the repository root; the shim package under `ifc_converter/` preloads `src/` onto `PYTHONPATH`. For global use, run `pip install -e .`.
-- INFO-level logs report the Nucleus/local directory being scanned, the number of IFCs discovered, and each file as it begins processing. Set `PYTHONUNBUFFERED=1` if you need unbuffered logging in CI.
+- Create/activate venv and install dependencies per your workflow (e.g., ``pip install -e .`` or ``uv sync``).
+- **Omniverse mode**
+  - Accept the Kit EULA once (PowerShell ``set OMNI_KIT_ACCEPT_EULA=yes``, bash ``export OMNI_KIT_ACCEPT_EULA=yes``).
+  - Install Kit: ``pip install --extra-index-url https://pypi.nvidia.com omniverse-kit``.
+  - Optional: ``python -c "from omni.kit_app import KitApp; KitApp().shutdown(); print('Omniverse ready')"`` to verify the runtime.
+  - The converter auto-starts a headless Kit session whenever an `omniverse://` path is encountered.
+- **Offline mode**
+  - Install ``usd-core`` (or another pxr build) alongside ifcopenshell.
+- Run ``python -m ifc_converter ...`` from the repo root, or ``pip install -e .`` for a global CLI.
+- INFO logs show which directory or Nucleus path is scanned and each IFC file as it starts processing (`PYTHONUNBUFFERED=1` for unbuffered output).
 
 Usage (CLI)
 - Single IFC file:
@@ -35,6 +38,8 @@ Usage (CLI)
   - python -m ifc_converter --input C:\\path\\to\\dir --ifc-names A.ifc B.ifc
 - Directory, all files:
   - python -m ifc_converter --input C:\\path\\to\\dir --all
+- Offline conversion (local-only, no Kit):
+  - python -m ifc_converter --offline --input C:\\path\\to\\dir --all
 - Directory, all files excluding drafts:
   - python -m ifc_converter --input C:\\path\\to\\dir --all --exclude DraftModel TempIFC
 - Checkpoint authored layers on Nucleus:
