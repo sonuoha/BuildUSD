@@ -21,7 +21,6 @@ from .io_utils import (
     path_suffix,
     read_bytes,
     read_text,
-    shutdown_kit_if_running,
     stat_entry,
 )
 from .process_ifc import ConversionOptions, build_prototypes
@@ -37,6 +36,7 @@ from .process_usd import (
     persist_instance_cache,
     update_federated_view,
 )
+from .usd_context import initialize_usd, set_preferred_mode, shutdown_usd_context
 
 __all__ = [
     "ConversionResult",
@@ -179,6 +179,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Create Nucleus checkpoints for each authored layer and stage (omniverse:// only)",
     )
+    parser.add_argument(
+        "--offline",
+        dest="offline",
+        action="store_true",
+        help="Force standalone USD (no Kit). All input/output paths must be local.",
+    )
     return parser.parse_args(argv)
 
 
@@ -195,6 +201,7 @@ def convert(
     options: ConversionOptions | None = None,
     logger: logging.Logger | None = None,
     checkpoint: bool = False,
+    offline: bool = False,
 ) -> list[ConversionResult]:
     """Programmatic API for running the converter inside another application."""
 
@@ -212,6 +219,19 @@ def convert(
     if not is_omniverse_path(output_root):
         output_root = Path(output_root).resolve()
     ensure_directory(output_root)
+
+    check_paths: list[PathLike] = [input_path, output_root]
+    if manifest_path:
+        check_paths.append(manifest_path)
+    if offline:
+        if any(is_omniverse_path(p) for p in check_paths):
+            raise ValueError("--offline mode requires local input/output/manifest paths")
+        set_preferred_mode("offline")
+        if checkpoint:
+            log.warning("--checkpoint is ignored in offline mode (Nucleus only).")
+            checkpoint = False
+    else:
+        set_preferred_mode(None)
 
     manifest_obj = manifest
     if manifest_path:
@@ -240,6 +260,12 @@ def convert(
         return []
 
     log.info("Discovered %d IFC file(s) under %s", len(targets), input_path)
+
+    context_paths: list[PathLike] = [output_root]
+    context_paths.extend(target.source for target in targets)
+    if manifest_path:
+        context_paths.append(manifest_path)
+    initialize_usd(context_paths, preferred_mode="offline" if offline else None)
 
     results: list[ConversionResult] = []
     for target in targets:
@@ -284,9 +310,10 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             process_all=args.process_all,
             exclude_names=args.exclude,
             checkpoint=args.checkpoint,
+            offline=args.offline,
         )
     finally:
-        shutdown_kit_if_running()
+        shutdown_usd_context()
     _print_summary(results)
     return results
 

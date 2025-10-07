@@ -6,19 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
-from .pxr_utils import require_pxr_module
+from .pxr_utils import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
 from .config.manifest import BasePointConfig, GeodeticCoordinate
 from .io_utils import join_path, path_stem, write_text
 from .process_ifc import ConversionOptions, InstanceRecord, PrototypeCaches, PrototypeKey
 from .utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
-
-Gf = require_pxr_module("Gf")
-Sdf = require_pxr_module("Sdf")
-Usd = require_pxr_module("Usd")
-UsdGeom = require_pxr_module("UsdGeom")
-UsdShade = require_pxr_module("UsdShade")
-Vt = require_pxr_module("Vt")
 
 try:
     from pyproj import CRS, Transformer
