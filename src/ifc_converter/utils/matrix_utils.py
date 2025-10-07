@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 #Import standard libraries
 import logging
@@ -97,3 +98,4 @@ def _is_identity16(mat16, atol=1e-10):
         return np.allclose(arr, np.eye(4), atol=atol)
     except Exception:
         return False
+
