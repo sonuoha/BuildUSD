@@ -5,11 +5,18 @@ from typing import Iterable, List, Optional, Sequence, Union
 
 from .kit_runtime import ensure_kit, shutdown_kit
 
+from .usd_context import get_mode
+
+import logging
+
+
 PathLike = Union[str, Path]
 
 _OMNI_PREFIXES = ("omniverse://",)
 _OMNI_CLIENT = None
 
+
+log = logging.getLogger(__name__)
 
 def _require_omni_client():
     """Ensure omni.client is ready, starting Kit in headless mode if needed."""
@@ -124,13 +131,14 @@ def read_text(path: PathLike, encoding: str = "utf-8") -> str:
 
 def read_bytes(path: PathLike) -> bytes:
     if is_omniverse_path(path):
+        if get_mode() == "offline":
+            raise RuntimeError(f"Offline mode rejects omniverse:// paths: {path}. Use local files or remove --offline.")
         client = _require_omni_client()
         result, resolved, payload = client.read_file(_normalize_nucleus_path(_as_string(path)))
         if result != client.Result.OK:
             raise RuntimeError(f"Failed to read {path} (resolved: {resolved}): {result}")
         return _payload_bytes(payload)
     return Path(path).read_bytes()
-
 
 def write_text(path: PathLike, data: str, encoding: str = "utf-8") -> None:
     if is_omniverse_path(path):
@@ -181,16 +189,14 @@ def _payload_bytes(payload: Any) -> bytes:
 def create_checkpoint(path: PathLike, *, note: Optional[str] = None, tags: Optional[Sequence[str]] = None) -> bool:
     if not is_omniverse_path(path):
         return False
+    if get_mode() == "offline":
+        log.warning(f"Checkpoint skipped in offline mode: {path}")
+        return False
     client = _require_omni_client()
-    # Combine tags into comment if desired; otherwise ignore
     full_note = note or ""
     if tags:
         full_note += f" tags:{','.join(str(t).strip() for t in tags if str(t).strip())}"
-    result, checkpoint_id = client.create_checkpoint(
-        _normalize_nucleus_path(_as_string(path)),
-        full_note,
-        # force=False  # Add if you want to expose/force
-    )
+    result, checkpoint_id = client.create_checkpoint(_normalize_nucleus_path(_as_string(path)), full_note)
     if result != client.Result.OK:
         raise RuntimeError(f"Failed to checkpoint {path}: {result} (ID: {checkpoint_id})")
     return True
