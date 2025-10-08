@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any
 
@@ -6,7 +6,6 @@ from .usd_context import (
     get_pxr_module,
     get_pxr_package,
     initialize_usd,
-    set_preferred_mode,
     shutdown_usd_context,
 )
 
@@ -52,7 +51,6 @@ __all__ = [
     "Vt",
     "require_pxr_module",
     "require_pxr_attribute",
-    "set_preferred_mode",
     "shutdown_usd_context",
     "initialize_usd",
 ]

@@ -1,12 +1,10 @@
-from __future__ import annotations
-
+﻿from __future__ import annotations
 import argparse
 import logging
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Sequence, Union
-
 from .config.manifest import BasePointConfig, ConversionManifest, ResolvedFilePlan
 from .io_utils import (
     ensure_directory,
@@ -36,8 +34,7 @@ from .process_usd import (
     persist_instance_cache,
     update_federated_view,
 )
-from .usd_context import initialize_usd, set_preferred_mode, shutdown_usd_context
-
+from .usd_context import initialize_usd, shutdown_usd_context
 __all__ = [
     "ConversionResult",
     "convert",
@@ -45,20 +42,15 @@ __all__ = [
     "ConversionOptions",
     "ConversionManifest",
 ]
-
-
 LOG = logging.getLogger(__name__)
-
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT_ROOT = Path(r"C:\Users\samue\_dev\datasets\ifc\tvc").resolve()
 DEFAULT_OUTPUT_ROOT = ROOT / "data" / "output"
-
 OPTIONS = ConversionOptions(
     enable_instancing=True,
     enable_hash_dedup=False,
     convert_metadata=True,
 )
-
 DEFAULT_MASTER_STAGE = "Federated Model.usda"
 DEFAULT_GEODETIC_CRS = "EPSG:4326"
 DEFAULT_BASE_POINT = BasePointConfig(
@@ -67,14 +59,10 @@ DEFAULT_BASE_POINT = BasePointConfig(
     height=0.0,
     unit="m",
 )
-
 PathLike = Union[str, Path]
-
-
 @dataclass(slots=True)
 class ConversionResult:
     """Artifacts produced for a single converted IFC file."""
-
     ifc_path: PathLike
     stage_path: PathLike
     master_stage_path: PathLike
@@ -85,7 +73,6 @@ class ConversionResult:
     counts: dict[str, int]
     plan: ResolvedFilePlan | None
     revision: Optional[str] = None
-
     def as_dict(self) -> dict[str, Any]:
         """Legacy dict-compatible view of the conversion result."""
         return {
@@ -103,14 +90,10 @@ class ConversionResult:
             "projected_crs": self.projected_crs,
             "revision": self.revision,
         }
-
-
 @dataclass(slots=True)
 class _IfcTarget:
     source: PathLike
     manifest_key: Path
-
-
 @dataclass(slots=True)
 class _OutputLayout:
     stage: PathLike
@@ -119,11 +102,8 @@ class _OutputLayout:
     instances: PathLike
     annotations: PathLike
     cache_dir: PathLike
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the standalone converter."""
-
     parser = argparse.ArgumentParser(description="Convert IFC to USD")
     parser.add_argument(
         "--map-coordinate-system",
@@ -186,8 +166,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Force standalone USD (no Kit). All input/output paths must be local.",
     )
     return parser.parse_args(argv)
-
-
 def convert(
     input_path: PathLike,
     *,
@@ -204,34 +182,34 @@ def convert(
     offline: bool = False,
 ) -> list[ConversionResult]:
     """Programmatic API for running the converter inside another application."""
-
     log = logger or LOG
     if manifest_path and manifest is not None:
         raise ValueError("Provide either manifest or manifest_path, not both.")
 
     exclude = normalize_exclusions(exclude_names)
 
-    output_root: PathLike
     if output_dir is None:
-        output_root = DEFAULT_OUTPUT_ROOT
+        output_root: PathLike = DEFAULT_OUTPUT_ROOT
     else:
         output_root = output_dir
     if not is_omniverse_path(output_root):
         output_root = Path(output_root).resolve()
-    ensure_directory(output_root)
 
     check_paths: list[PathLike] = [input_path, output_root]
     if manifest_path:
         check_paths.append(manifest_path)
+
     if offline:
         if any(is_omniverse_path(p) for p in check_paths):
             raise ValueError("--offline mode requires local input/output/manifest paths")
-        set_preferred_mode("offline")
+        initialize_usd(offline=True)
         if checkpoint:
             log.warning("--checkpoint is ignored in offline mode (Nucleus only).")
             checkpoint = False
     else:
-        set_preferred_mode(None)
+        initialize_usd(offline=False)
+
+    ensure_directory(output_root)
 
     manifest_obj = manifest
     if manifest_path:
@@ -261,12 +239,6 @@ def convert(
 
     log.info("Discovered %d IFC file(s) under %s", len(targets), input_path)
 
-    context_paths: list[PathLike] = [output_root]
-    context_paths.extend(target.source for target in targets)
-    if manifest_path:
-        context_paths.append(manifest_path)
-    initialize_usd(context_paths, preferred_mode="offline" if offline else None)
-
     results: list[ConversionResult] = []
     for target in targets:
         log.info("Starting conversion for %s", target.source)
@@ -293,11 +265,8 @@ def convert(
         )
         results.append(result)
     return results
-
-
 def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     """CLI entrypoint with logging and a conversion summary."""
-
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv)
     try:
@@ -316,8 +285,6 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         shutdown_usd_context()
     _print_summary(results)
     return results
-
-
 def _collect_ifc_paths(
     input_path: PathLike,
     *,
@@ -335,7 +302,6 @@ def _collect_ifc_paths(
             exclude=exclude,
             log=log,
         )
-
     path_obj = Path(input_path).resolve()
     log.info("Scanning local directory %s", path_obj)
     return _collect_ifc_paths_local(
@@ -345,8 +311,6 @@ def _collect_ifc_paths(
         exclude=exclude,
         log=log,
     )
-
-
 def _collect_ifc_paths_local(
     root: Path,
     *,
@@ -365,12 +329,10 @@ def _collect_ifc_paths_local(
             return []
         resolved = root.resolve()
         return [_IfcTarget(source=resolved, manifest_key=resolved)]
-
     if not root.exists():
         raise FileNotFoundError(f"Input path does not exist: {root}")
     if not root.is_dir():
         raise ValueError(f"Input path is not a file or directory: {root}")
-
     targets: list[_IfcTarget] = []
     if ifc_names and not process_all:
         for name in ifc_names:
@@ -388,7 +350,6 @@ def _collect_ifc_paths_local(
             resolved = candidate.resolve()
             targets.append(_IfcTarget(source=resolved, manifest_key=resolved))
         return sorted(targets, key=lambda t: str(t.source).lower())
-
     candidates = []
     for child in root.iterdir():
         if child.is_file() and child.suffix.lower() == ".ifc":
@@ -400,8 +361,6 @@ def _collect_ifc_paths_local(
             continue
         targets.append(_IfcTarget(source=candidate, manifest_key=candidate))
     return targets
-
-
 def _collect_ifc_paths_nucleus(
     uri: str,
     *,
@@ -421,10 +380,8 @@ def _collect_ifc_paths_nucleus(
             return []
         manifest_key = _manifest_key_for_path(file_uri)
         return [_IfcTarget(source=file_uri, manifest_key=manifest_key)]
-
     if _is_ifc_candidate(path_name(uri)) and not (ifc_names and process_all):
         return _single_file_target(uri)
-
     entries = None
     try:
         log.info("Connecting to Nucleus directory %s", uri)
@@ -433,7 +390,6 @@ def _collect_ifc_paths_nucleus(
         if _is_ifc_candidate(path_name(uri)):
             return _single_file_target(uri)
         raise
-
     targets: list[_IfcTarget] = []
     if ifc_names and not process_all:
         for name in ifc_names:
@@ -451,7 +407,6 @@ def _collect_ifc_paths_nucleus(
                 continue
             targets.append(_IfcTarget(source=candidate, manifest_key=_manifest_key_for_path(candidate)))
         return sorted(targets, key=lambda t: path_name(t.source).lower())
-
     for entry in entries:
         rel = getattr(entry, "relative_path", None)
         if rel:
@@ -469,11 +424,8 @@ def _collect_ifc_paths_nucleus(
             log.info("Skipping excluded IFC %s", candidate)
             continue
         targets.append(_IfcTarget(source=candidate, manifest_key=_manifest_key_for_path(candidate)))
-
     targets.sort(key=lambda t: path_name(t.source).lower())
     return targets
-
-
 def _ensure_ifc_name(name: str) -> str:
     """Normalize a user-specified IFC filename, appending .ifc when missing."""
     trimmed = (name or "").strip()
@@ -482,13 +434,9 @@ def _ensure_ifc_name(name: str) -> str:
     if not trimmed.lower().endswith(".ifc"):
         trimmed = f"{trimmed}.ifc"
     return trimmed
-
-
 def _is_ifc_candidate(name: str) -> bool:
     """Return True when `name` looks like an IFC file."""
     return (name or "").lower().endswith(".ifc")
-
-
 def _manifest_key_for_path(path: PathLike) -> Path:
     """Provide a stable manifest lookup key for either local or omniverse paths."""
     if isinstance(path, Path):
@@ -498,24 +446,18 @@ def _manifest_key_for_path(path: PathLike) -> Path:
         stripped = uri.split("://", 1)[-1]
         return PurePosixPath(stripped)
     return Path(str(path)).resolve()
-
-
 def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout:
     """Return the canonical file layout for USD artifacts derived from an IFC."""
     ensure_directory(output_root)
-
     prototypes_dir = join_path(output_root, "prototypes")
     materials_dir = join_path(output_root, "materials")
     instances_dir = join_path(output_root, "instances")
     annotations_dir = join_path(output_root, "annotations")
     caches_dir = join_path(output_root, "caches")
-
     for directory in (prototypes_dir, materials_dir, instances_dir, annotations_dir, caches_dir):
         ensure_directory(directory)
-
     stage_path = join_path(output_root, f"{base_name}.usda")
     ensure_parent_directory(stage_path)
-
     return _OutputLayout(
         stage=stage_path,
         prototypes=join_path(prototypes_dir, f"{base_name}_prototypes.usda"),
@@ -525,20 +467,12 @@ def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout
         cache_dir=caches_dir,
     )
 
-
 def _make_checkpoint_metadata(revision: Optional[str], base_name: str) -> tuple[str, list[str]]:
-    """Create checkpoint note/tags using manifest revision when provided."""
-    if revision:
-        note = revision
-        tag_candidates = revision.replace(",", " ").split()
-        tags = [fragment.strip() for fragment in tag_candidates if fragment.strip()]
-        if not tags:
-            tags = [base_name]
-    else:
-        note = f"{base_name} update"
-        tags = [base_name]
+    note = revision or f"{base_name}"
+    tag_src = revision or base_name
+    tag_candidates = tag_src.replace(",", " ").split()
+    tags = [t.strip() for t in tag_candidates if t.strip()] or [base_name]
     return note, tags
-
 
 def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: logging.Logger, label: str) -> None:
     """Create a checkpoint for `path` when it resides on Nucleus."""
@@ -549,8 +483,6 @@ def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: log
         return
     if did_checkpoint:
         logger.info("Checkpoint saved for %s (%s)", label, note)
-
-
 def _process_single_ifc(
     ifc_path: PathLike,
     *,
@@ -566,7 +498,6 @@ def _process_single_ifc(
 ) -> ConversionResult:
     """Convert a single IFC file into USD layers and optional checkpoints."""
     import ifcopenshell  # Local import to avoid heavy dependency at module load
-
     base_name = path_stem(ifc_path)
     layout = _build_output_layout(output_root, base_name)
     revision_note = plan.revision if plan and plan.revision else None
@@ -574,19 +505,16 @@ def _process_single_ifc(
     checkpoint_tags: list[str] = []
     if checkpoint:
         checkpoint_note, checkpoint_tags = _make_checkpoint_metadata(revision_note, base_name)
-
     def _execute(local_ifc: Path) -> ConversionResult:
         ifc = ifcopenshell.open(local_ifc.as_posix())
-
         caches = build_prototypes(ifc, options)
         logger.info(
-            "IFC %s → %d repmap prototypes, %d hashed prototypes, %d instances",
+            "IFC %s â†’ %d repmap prototypes, %d hashed prototypes, %d instances",
             path_name(ifc_path),
             len(caches.repmaps),
             len(caches.hashes),
             len(caches.instances),
         )
-
         stage = create_usd_stage(layout.stage)
         proto_layer, proto_paths = author_prototype_layer(stage, caches, layout.prototypes, base_name, options)
         mat_layer, material_paths = author_material_layer(
@@ -608,25 +536,20 @@ def _process_single_ifc(
             options=options,
         )
         ann_layer = author_annotation_layer(stage, caches, layout.annotations, base_name)
-
         persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths)
-
         effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
         if effective_base_point is None:
             raise ValueError(
                 f"No base point configured for {path_name(ifc_path)}; provide a manifest entry or update defaults."
             )
-
         projected_crs = plan.projected_crs if plan and plan.projected_crs else coordinate_system
         if not projected_crs:
             raise ValueError(
                 f"No projected CRS available for {path_name(ifc_path)}; supply --map-coordinate-system or manifest override."
             )
-
         geodetic_crs = plan.geodetic_crs if plan and plan.geodetic_crs else default_geodetic_crs
         master_stage_name = plan.master_stage_filename if plan else default_master_stage
         lonlat_override = plan.lonlat if plan else None
-
         apply_stage_anchor_transform(
             stage,
             caches,
@@ -635,8 +558,7 @@ def _process_single_ifc(
             align_axes_to_map=True,
             lonlat=lonlat_override,
         )
-
-        logger.info("Assigning world geolocation using %s → %s", projected_crs, geodetic_crs)
+        logger.info("Assigning world geolocation using %s â†’ %s", projected_crs, geodetic_crs)
         geodetic_result = assign_world_geolocation(
             stage,
             base_point=effective_base_point,
@@ -645,7 +567,6 @@ def _process_single_ifc(
             unit_hint=effective_base_point.unit,
             lonlat_override=lonlat_override,
         )
-
         stage.Save()
         proto_layer.Save()
         mat_layer.Save()
@@ -659,31 +580,25 @@ def _process_single_ifc(
             _checkpoint_path(layout.instances, checkpoint_note, checkpoint_tags, logger, f"{base_name} instances layer")
             if ann_layer:
                 _checkpoint_path(layout.annotations, checkpoint_note, checkpoint_tags, logger, f"{base_name} annotations layer")
-
         logger.info("Wrote stage %s", layout.stage)
-
         master_stage_path = join_path(output_root, master_stage_name)
         ensure_parent_directory(master_stage_path)
         update_federated_view(master_stage_path, layout.stage, base_name, parent_prim_path="/World")
         if checkpoint and checkpoint_note is not None:
             _checkpoint_path(master_stage_path, checkpoint_note, checkpoint_tags, logger, f"{base_name} master stage")
-
         counts = {
             "prototypes_3d": len(caches.repmaps) + len(caches.hashes),
             "instances_3d": len(caches.instances),
             "curves_2d": len(getattr(caches, "annotations", {}) or {}),
             "total_elements": len(caches.instances) + len(getattr(caches, "annotations", {}) or {}),
         }
-
         layers = {
             "prototype": proto_layer.identifier,
             "material": mat_layer.identifier,
             "instance": inst_layer.identifier,
             "annotation": ann_layer.identifier if ann_layer else None,
         }
-
         coordinates = tuple(geodetic_result) if geodetic_result else None
-
         return ConversionResult(
             ifc_path=ifc_path,
             stage_path=layout.stage,
@@ -696,23 +611,16 @@ def _process_single_ifc(
             plan=plan,
             revision=revision_note,
         )
-
     logger.info("Opening IFC %s", ifc_path)
     if is_omniverse_path(ifc_path):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir) / path_name(ifc_path)
             tmp_path.write_bytes(read_bytes(ifc_path))
             return _execute(tmp_path)
-    else:
-        local_path = Path(ifc_path).resolve()
-        return _execute(local_path)
-
-
 def _print_summary(results: Sequence[ConversionResult]) -> None:
     if not results:
         print("No IFC files were converted.")
         return
-
     print("\nSummary:")
     for result in results:
         counts = result.counts
@@ -724,20 +632,16 @@ def _print_summary(results: Sequence[ConversionResult]) -> None:
             coord_info = f", geo=({coords[0]:.5f}, {coords[1]:.5f}, {alt_val:.2f})"
         else:
             coord_info = ""
-
         proto_3d = counts.get("prototypes_3d", counts.get("prototypes", 0))
         inst_3d = counts.get("instances_3d", counts.get("instances", 0))
         curves_2d = counts.get("curves_2d", counts.get("annotations", 0))
         total_elements = counts.get("total_elements")
         if total_elements is None:
             total_elements = inst_3d + curves_2d
-
         print(
             f"- {path_name(result.ifc_path)}: stage={result.stage_path}, master={master_stage}, "
             f"prototypes3D={proto_3d}, instances3D={inst_3d}, curves2D={curves_2d}, "
             f"totalElements={total_elements}, revision={revision}{coord_info}"
         )
-
-
 if __name__ == "__main__":
     main()
