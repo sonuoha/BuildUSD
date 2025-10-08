@@ -1,0 +1,33 @@
+DEBUG: Using proactor: IocpProactor
+INFO: Loaded manifest from omniverse://nucleus.tanech.com.au:443/Projects/Global Datasets/tvc/misc/manifest.yaml
+INFO: Connecting to Nucleus directory omniverse://nucleus.tanech.com.au:443/Projects/Global Datasets/tvc/ifc
+INFO: Discovered 15 IFC file(s) under omniverse://nucleus.tanech.com.au:443/Projects/Global Datasets/tvc/ifc
+INFO: Starting conversion for omniverse://nucleus.tanech.com.au:443/Projects/Global Datasets/tvc/ifc/SRL-WPD-TVC-UPKW-MOD-CTU-PWD-001001.ifc
+INFO: Opening IFC omniverse://nucleus.tanech.com.au:443/Projects/Global Datasets/tvc/ifc/SRL-WPD-TVC-UPKW-MOD-CTU-PWD-001001.ifc
+WARNING: Skipping 2D annotation context; ifcopenshell geom iterator refused to process it. Details: [Warning] [2025-10-08 09:05:38] ContextType 'Annotation' not allowed:
+#14=IfcGeometricRepresentationContext($,'Annotation',3,1.E-07,#11,$)
+[Notice] [2025-10-08 09:05:38] Created 6 tasks for 6 products
+[Info] [carb] Logging to file: C:/Users/samue/.nvidia-omniverse/logs/Kit/kit/108.1/kit_20251008_090535.log
+2025-10-07T22:05:35Z [0ms] [Warning] [omni.kit.app.plugin] No crash reporter present, dumps uploading isn't available.
+[0.108s] [ext: omni.usd.config-1.0.6] startup
+2025-10-07T22:05:35Z [205ms] [Warning] [omni.usd_config.extension] Enable omni.materialx.libs extension to use MaterialX
+[0.301s] [ext: omni.usd.libs-1.0.1] startup
+[0.395s] [ext: omni.usd.schema.audio-0.0.0] startup
+[0.490s] [ext: omni.kit.async_engine-0.0.3] startup
+[0.494s] [ext: omni.kit.actions.core-1.0.0] startup
+[0.501s] [ext: omni.client.lib-1.1.0] startup
+[0.520s] [ext: omni.timeline-1.1.0] startup
+[0.524s] [ext: omni.kit.usd_undo-0.1.8] startup
+[0.526s] [ext: omni.kit.commands-1.4.10] startup
+[0.534s] [ext: omni.client-1.3.0] startup
+[0.607s] [ext: omni.assets.plugins-0.0.0] startup
+[0.611s] [ext: omni.usd_resolver-1.0.0] startup
+[0.620s] [ext: omni.graph.exec-0.9.6] startup
+[0.622s] [ext: carb.audio-0.1.0] startup
+[0.624s] [ext: omni.usd.core-1.6.0] startup
+[0.626s] [ext: omni.kit.exec.core-0.13.4] startup
+[0.630s] [ext: omni.kit.audiodeviceenum-1.0.2] startup
+[0.634s] [ext: omni.usd-1.13.17] startup
+2025-10-07T22:05:38Z [3,226ms] [Warning] [src.ifc_converter.process_ifc] Skipping 2D annotation context; ifcopenshell geom iterator refused to process it. Details: [Warning] [2025-10-08 09:05:38] ContextType 'Annotation' not allowed:
+#14=IfcGeometricRepresentationContext($,'Annotation',3,1.E-07,#11,$)
+[Notice] [2025-10-08 09:05:38] Created 6 tasks for 6 products

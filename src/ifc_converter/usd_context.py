@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import os
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Union
-import sys
 
 from .io_utils import is_omniverse_path
 from .kit_runtime import ensure_kit, shutdown_kit
@@ -11,14 +12,19 @@ from .kit_runtime import ensure_kit, shutdown_kit
 PathLike = Union[str, Path]
 
 _MODE: Optional[str] = None  # "kit" or "offline"
-_PREFERRED_MODE: Optional[str] = None
+_DEFAULT_MODE_ENV = os.environ.get("IFC_CONVERTER_DEFAULT_USD_MODE", "kit").strip().lower()
+_DEFAULT_MODE = _DEFAULT_MODE_ENV if _DEFAULT_MODE_ENV in {"kit", "offline"} else "kit"
+_PREFERRED_MODE: Optional[str] = _DEFAULT_MODE
 _PXR_CACHE: Dict[str, object] = {}
 
 
 def set_preferred_mode(mode: Optional[str]) -> None:
     """Force the USD backend mode ('kit' or 'offline')."""
     global _PREFERRED_MODE
-    if mode not in (None, "kit", "offline"):
+    if mode is None:
+        _PREFERRED_MODE = _DEFAULT_MODE
+        return
+    if mode not in {"kit", "offline"}:
         raise ValueError(f"Unsupported USD mode '{mode}'")
     _PREFERRED_MODE = mode
 
