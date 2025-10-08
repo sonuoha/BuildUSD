@@ -263,6 +263,9 @@ def convert(
             logger=log,
             checkpoint=checkpoint,
         )
+        if result is None:
+            log.warning("Conversion for %s produced no result; skipping.", target.source)
+            continue
         results.append(result)
     return results
 def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
@@ -617,6 +620,9 @@ def _process_single_ifc(
             tmp_path = Path(tmpdir) / path_name(ifc_path)
             tmp_path.write_bytes(read_bytes(ifc_path))
             return _execute(tmp_path)
+    # Local filesystem path: use as-is (converting to Path for str inputs).
+    local_ifc = ifc_path if isinstance(ifc_path, Path) else Path(ifc_path)
+    return _execute(local_ifc)
 def _print_summary(results: Sequence[ConversionResult]) -> None:
     if not results:
         print("No IFC files were converted.")

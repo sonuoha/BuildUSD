@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 from .pxr_utils import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
 from .config.manifest import BasePointConfig, GeodeticCoordinate
-from .io_utils import join_path, path_stem, write_text
+from .io_utils import join_path, path_stem, write_text, is_omniverse_path, stat_entry
 from .process_ifc import ConversionOptions, InstanceRecord, PrototypeCaches, PrototypeKey
 from .utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
 
@@ -412,6 +412,19 @@ def _layer_identifier(path: PathLike) -> str:
     if isinstance(path, Path):
         return path.resolve().as_posix()
     return str(path)
+
+
+def _layer_exists(path: PathLike) -> bool:
+    if is_omniverse_path(path):
+        try:
+            return stat_entry(path) is not None
+        except Exception:
+            return False
+    path_obj = path if isinstance(path, Path) else Path(path)
+    try:
+        return path_obj.exists()
+    except OSError:
+        return False
 
 
 def author_prototype_layer(
@@ -1650,7 +1663,12 @@ def update_federated_view(
         raise RuntimeError(f"Failed to open payload stage '{payload_stage_path}'")
     payload_mpu = float(payload_stage.GetMetadata("metersPerUnit") or 1.0)
 
-    stage = Usd.Stage.Open(master_identifier)
+    stage = None
+    if _layer_exists(master_stage_path):
+        try:
+            stage = Usd.Stage.Open(master_identifier)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to open master stage '{master_stage_path}': {exc}") from exc
     if stage is None:
         stage = Usd.Stage.CreateNew(master_identifier)
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
@@ -1712,4 +1730,5 @@ def update_federated_view(
 
     stage.GetRootLayer().Save()
     return stage.GetRootLayer()
+
 
