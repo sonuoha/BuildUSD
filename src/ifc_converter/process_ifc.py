@@ -938,7 +938,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     if not it.initialize():
         geom_log = (ifcopenshell.get_log() or "").strip()
         if "ContextType 'Annotation' not allowed" in geom_log:
-            log.warning("Skipping 2D annotation context; ifcopenshell geom iterator refused to process it. Details: %s", geom_log)
+            log.warning("ifcopenshell geom iterator refused annotation context; switching to manual 2D curve extraction. Details: %s", geom_log)
         else:
             log.error("Geometry iterator initialisation failed: %s", geom_log or "<no log output>")
         annotations = extract_annotation_curves(ifc_file, hierarchy_cache)
