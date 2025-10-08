@@ -18,33 +18,37 @@ def get_mode() -> Optional[str]:
     global _MODE
     return _MODE
 
+# ifc_converter/usd_context.py  (replace initialize_usd with this)
 def initialize_usd(*, offline: Optional[bool] = None) -> str:
-    """Prepare USD bindings. Default = Kit; use offline=True to stay with standalone pxr."""
+    """Prepare USD bindings.
+
+    - If `offline` is None, keep whatever mode we're already in (or default to _DEFAULT_MODE on first call).
+    - If mode is unchanged, do nothing (idempotent).
+    """
     global _MODE, _PXR_CACHE
 
-    # If caller didn't specify, respect CURRENT mode (or env default), don't flip.
-    desired = (
-        "offline" if offline is True
-        else "kit" if offline is False
-        else (_MODE or _DEFAULT_MODE)   # <— important: no implicit switch
-    )
+    # Decide desired mode: preserve current unless explicitly overridden.
+    if offline is None:
+        desired = _MODE or _DEFAULT_MODE
+    else:
+        desired = "offline" if offline else "kit"
 
-    # Idempotent: if already in desired mode, do nothing.
+    # If already in the desired mode, do nothing (idempotent).
     if _MODE == desired:
         return _MODE
 
-    # Only tear down when actually switching modes.
+    # Switching modes: teardown previous and (re)initialize as needed
     _teardown()
 
+    _clear_pxr_modules()
     if desired == "kit":
-        _clear_pxr_modules()
+        # Start Kit with the extensions we rely on for Nucleus/Usd
         ensure_kit(("omni.client", "omni.usd"))
-    else:
-        _clear_pxr_modules()
 
     _MODE = desired
     _PXR_CACHE = {}
     return _MODE
+
 
 def _teardown() -> None:
     global _MODE, _PXR_CACHE
