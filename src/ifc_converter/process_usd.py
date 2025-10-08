@@ -1077,7 +1077,7 @@ def author_instance_layer(
     return inst_layer
 
 
-def author_annotation_layer(
+def author_geometry2d_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
     layer_path: PathLike,
@@ -1086,10 +1086,10 @@ def author_annotation_layer(
     if not getattr(caches, "annotations", None):
         return None
 
-    ann_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
+    geom_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
     root_layer = stage.GetRootLayer()
-    if ann_layer.identifier not in root_layer.subLayerPaths:
-        root_layer.subLayerPaths.append(ann_layer.identifier)
+    if geom_layer.identifier not in root_layer.subLayerPaths:
+        root_layer.subLayerPaths.append(geom_layer.identifier)
 
     name_counters: Dict[Sdf.Path, Dict[str, int]] = defaultdict(dict)
     hierarchy_nodes: Dict[Tuple[Sdf.Path, str, Optional[int]], Sdf.Path] = {}
@@ -1140,7 +1140,7 @@ def author_annotation_layer(
         curves_containers[parent_path] = container_path
         return container_path
 
-    with Usd.EditContext(stage, ann_layer):
+    with Usd.EditContext(stage, geom_layer):
         if not stage.GetPrimAtPath(inst_root_path):
             inst_root_xf = UsdGeom.Xform.Define(stage, inst_root_path)
             inst_root_xf.ClearXformOpOrder()
@@ -1152,7 +1152,7 @@ def author_annotation_layer(
 
             curves_parent = _ensure_curves_container(parent_path)
 
-            curve_base = _sanitize_identifier(curve.name, fallback=f"Annotation_{curve.step_id}") or "Annotation"
+            curve_base = _sanitize_identifier(curve.name, fallback=f"Geometry2D_{curve.step_id}") or "Geometry2D"
             curve_token = _unique_child_name(curves_parent, curve_base)
             curve_path = curves_parent.AppendChild(curve_token)
 
@@ -1176,7 +1176,7 @@ def author_annotation_layer(
                 prim.SetCustomDataByKey("ifc:annotationStepId", curve.step_id)
             prim.SetCustomDataByKey("ifc:label", curve.name)
 
-    return ann_layer
+    return geom_layer
 
 
 class GroupingSpecError(ValueError):

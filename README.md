@@ -12,7 +12,7 @@ Requirements
   - `ifcopenshell==0.8.3.post2`
   - `pyproj==3.7.2` (for CRS transforms)
   - `numpy`, `click`, `rich`, etc.
-- **Omniverse mode (default)** – no standalone `usd-core` wheel required. Install Omniverse Kit (``pip install --extra-index-url https://pypi.nvidia.com omniverse-kit``) so `omni.client` and Kit's pxr are available.
+- **Kit mode (default)** – no standalone `usd-core` wheel required. Install Omniverse Kit (``pip install --extra-index-url https://pypi.nvidia.com omniverse-kit``) so `omni.client` and Kit's pxr are available.
 - **Offline mode (`--offline`)** – install a standalone USD build (e.g. ``pip install usd-core``). All paths must be local; `omniverse://` URIs are rejected and checkpointing is skipped.
 
 Environment
@@ -21,7 +21,7 @@ Environment
 
 Install
 - Create/activate venv and install dependencies per your workflow (e.g., ``pip install -e .`` or ``uv sync``).
-- **Omniverse mode**
+- **Kit mode**
   - Accept the Kit EULA once (PowerShell ``set OMNI_KIT_ACCEPT_EULA=yes``, bash ``export OMNI_KIT_ACCEPT_EULA=yes``).
   - Install Kit: ``pip install --extra-index-url https://pypi.nvidia.com omniverse-kit``.
   - Optional: ``python -c "from omni.kit_app import KitApp; KitApp().shutdown(); print('Omniverse ready')"`` to verify the runtime.
@@ -30,6 +30,21 @@ Install
   - Install ``usd-core`` (or another pxr build) alongside ifcopenshell.
 - Run ``python -m ifc_converter ...`` from the repo root, or ``pip install -e .`` for a global CLI.
 - INFO logs show which directory or Nucleus path is scanned and each IFC file as it starts processing (`PYTHONUNBUFFERED=1` for unbuffered output).
+
+Mode selection & environment variables
+- The converter can author USD via two bindings:
+  - **Kit mode** (default). Used whenever any supplied path is `omniverse://` _or_ when `IFC_CONVERTER_DEFAULT_USD_MODE` resolves to `kit`. Requires Omniverse Kit (`omni.client`), automatically boots Kit in headless mode, and enables Nucleus features such as checkpoints.
+  - **Offline mode**. Activated by providing `--offline` on the CLI, `offline=True` in the Python API, or setting `IFC_CONVERTER_DEFAULT_USD_MODE=offline`. All paths must be local filesystem locations. Nucleus checkpoint requests are ignored and `omniverse://` inputs raise a `ValueError`.
+- Mode-precedence rules:
+  1. Explicit CLI/programmatic `offline=True` wins.
+  2. Otherwise, if any input/output/manifest path starts with `omniverse://`, Kit mode is chosen.
+  3. Otherwise, the environment variable `IFC_CONVERTER_DEFAULT_USD_MODE` (`kit` by default) decides the binding.
+- Exclusion handling honours the mode: `--exclude` takes bare stems or names with `.ifc` and skips them case-insensitively during directory scans (local paths or Nucleus directories).
+- Relevant environment variables:
+  - `IFC_CONVERTER_DEFAULT_USD_MODE` – `kit` (default) or `offline`; establishes the initial USD binding when the process starts.
+  - `OMNI_KIT_ACCEPT_EULA` – set to `yes` to suppress Kit's interactive EULA prompt during headless launches.
+  - `PYTHONUNBUFFERED` – optional; keep at `1` to stream logs without buffering during long conversions.
+  - `USD_FORCE_MODULE_NAME` – honoured by pxr when present; useful if your USD distribution installs under a different module alias.
 
 Usage (CLI)
 - Single IFC file:
@@ -67,7 +82,7 @@ Outputs
   - prototypes/<name>_prototypes.usda
   - materials/<name>_materials.usda
   - instances/<name>_instances.usda
-  - annotations/<name>_annotations.usda (when present)
+  - geometry2d/<name>_geometry2d.usda (when present; captured 2D alignment/annotation curves)
     - /World/<file>_Instances preserves the IFC spatial hierarchy (Project/Site/Storey/Class).
     - Optional grouping variants (see src/ifc_converter/process_usd.py:author_instance_grouping_variant) can reorganize instances on demand without losing the canonical hierarchy.
   - caches/<name>.json stores serialized instance metadata for later regrouping sessions.
@@ -101,7 +116,7 @@ Manifest Schema
 Notes
 - JSON manifests work immediately; YAML manifests require installing PyYAML.
 - A sample manifest template lives at src/ifc_converter/config/sample_manifest.json; copy or rename it locally (e.g. to src/ifc_converter/config/manifest.yaml) when preparing project-specific settings. The real manifest remains untracked by design and can be loaded from local paths or omniverse:// URIs.
-- 2D annotation contexts (e.g. alignment strings in IfcAnnotation) are skipped; the converter logs a warning and continues without them.
+- 2D annotation contexts (e.g. alignment strings in IfcAnnotation) are preserved. If the ifcopenshell geometry iterator rejects an annotation context, the pipeline emits a warning and falls back to manual curve extraction so the data still lands in the 2D geometry layer.
 
 
 Troubleshooting

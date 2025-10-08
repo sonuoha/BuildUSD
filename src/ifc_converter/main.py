@@ -25,10 +25,10 @@ from .process_ifc import ConversionOptions, build_prototypes
 from .process_usd import (
     apply_stage_anchor_transform,
     assign_world_geolocation,
-    author_annotation_layer,
     author_instance_layer,
     author_material_layer,
     author_prototype_layer,
+    author_geometry2d_layer,
     bind_materials_to_prototypes,
     create_usd_stage,
     persist_instance_cache,
@@ -100,7 +100,7 @@ class _OutputLayout:
     prototypes: PathLike
     materials: PathLike
     instances: PathLike
-    annotations: PathLike
+    geometry2d: PathLike
     cache_dir: PathLike
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the standalone converter."""
@@ -464,9 +464,9 @@ def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout
     prototypes_dir = join_path(output_root, "prototypes")
     materials_dir = join_path(output_root, "materials")
     instances_dir = join_path(output_root, "instances")
-    annotations_dir = join_path(output_root, "annotations")
+    geometry2d_dir = join_path(output_root, "geometry2d")
     caches_dir = join_path(output_root, "caches")
-    for directory in (prototypes_dir, materials_dir, instances_dir, annotations_dir, caches_dir):
+    for directory in (prototypes_dir, materials_dir, instances_dir, geometry2d_dir, caches_dir):
         ensure_directory(directory)
     stage_path = join_path(output_root, f"{base_name}.usda")
     ensure_parent_directory(stage_path)
@@ -475,7 +475,7 @@ def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout
         prototypes=join_path(prototypes_dir, f"{base_name}_prototypes.usda"),
         materials=join_path(materials_dir, f"{base_name}_materials.usda"),
         instances=join_path(instances_dir, f"{base_name}_instances.usda"),
-        annotations=join_path(annotations_dir, f"{base_name}_annotations.usda"),
+        geometry2d=join_path(geometry2d_dir, f"{base_name}_geometry2d.usda"),
         cache_dir=caches_dir,
     )
 
@@ -548,7 +548,7 @@ def _process_single_ifc(
             base_name=base_name,
             options=options,
         )
-        ann_layer = author_annotation_layer(stage, caches, layout.annotations, base_name)
+        geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name)
         persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths)
         effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
         if effective_base_point is None:
@@ -584,15 +584,15 @@ def _process_single_ifc(
         proto_layer.Save()
         mat_layer.Save()
         inst_layer.Save()
-        if ann_layer:
-            ann_layer.Save()
+        if geometry2d_layer:
+            geometry2d_layer.Save()
         if checkpoint and checkpoint_note is not None:
             _checkpoint_path(layout.stage, checkpoint_note, checkpoint_tags, logger, f"{base_name} stage")
             _checkpoint_path(layout.prototypes, checkpoint_note, checkpoint_tags, logger, f"{base_name} prototypes layer")
             _checkpoint_path(layout.materials, checkpoint_note, checkpoint_tags, logger, f"{base_name} materials layer")
             _checkpoint_path(layout.instances, checkpoint_note, checkpoint_tags, logger, f"{base_name} instances layer")
-            if ann_layer:
-                _checkpoint_path(layout.annotations, checkpoint_note, checkpoint_tags, logger, f"{base_name} annotations layer")
+            if geometry2d_layer:
+                _checkpoint_path(layout.geometry2d, checkpoint_note, checkpoint_tags, logger, f"{base_name} 2D geometry layer")
         logger.info("Wrote stage %s", layout.stage)
         master_stage_path = join_path(output_root, master_stage_name)
         ensure_parent_directory(master_stage_path)
@@ -609,8 +609,10 @@ def _process_single_ifc(
             "prototype": proto_layer.identifier,
             "material": mat_layer.identifier,
             "instance": inst_layer.identifier,
-            "annotation": ann_layer.identifier if ann_layer else None,
+            "geometry2d": geometry2d_layer.identifier if geometry2d_layer else None,
         }
+        if geometry2d_layer:
+            layers["annotation"] = geometry2d_layer.identifier
         coordinates = tuple(geodetic_result) if geodetic_result else None
         return ConversionResult(
             ifc_path=ifc_path,
