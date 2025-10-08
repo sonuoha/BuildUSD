@@ -5,6 +5,7 @@ from collections import Counter
 import multiprocessing
 import numpy as np
 import ifcopenshell
+import os
 
 import math
 import re
@@ -26,6 +27,28 @@ except Exception:
     _HAVE_IFC_UTIL_SHAPE = False
 
 log = logging.getLogger(__name__)
+
+
+def resolve_threads(env_var="IFC_GEOM_THREADS", minimum=1):
+    val = os.getenv(env_var)
+    if val is not None and val.strip() != "":
+        try:
+            n = int(val)
+        except ValueError:
+            log.warning("Invalid %s=%r; using CPU count fallback.", env_var, val)
+            n = None
+    else:
+        n = None
+
+    if n is None:
+        try:
+            n = multiprocessing.cpu_count()  # returns int, may raise NotImplementedError
+        except NotImplementedError:
+            n = minimum
+
+    return max(minimum, n)
+
+threads = resolve_threads()
 
 def _localize_mesh(mesh: dict, matrix_inv: np.ndarray) -> dict:
     """Return a copy of mesh with vertices transformed by matrix_inv (4x4)."""
@@ -911,7 +934,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             repmaps[rmid] = info
         return info
 
-    it = ifcopenshell.geom.iterator(s_local, ifc_file, multiprocessing.cpu_count())
+    it = ifcopenshell.geom.iterator(s_local, ifc_file, threads)
     if not it.initialize():
         geom_log = (ifcopenshell.get_log() or "").strip()
         if "ContextType 'Annotation' not allowed" in geom_log:
@@ -1150,7 +1173,7 @@ def generate_mesh_data(ifc_file, settings):
       2) ifcopenshell.util.shape.get_shape_matrix(shape)  (if available)
       3) compose_object_placement(element.ObjectPlacement)
     """
-    it = ifcopenshell.geom.iterator(settings, ifc_file, multiprocessing.cpu_count())
+    it = ifcopenshell.geom.iterator(settings, ifc_file, threads)
     if it.initialize():
         while True:
             element = None
