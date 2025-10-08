@@ -254,15 +254,24 @@ def convert(
                 )
             except Exception as exc:
                 log.warning("Manifest resolution failed for %s: %s", path_name(target.source), exc)
-        result = _process_single_ifc(
-            target.source,
-            output_root=output_root,
-            coordinate_system=map_coordinate_system,
-            options=run_options,
-            plan=plan,
-            logger=log,
-            checkpoint=checkpoint,
-        )
+        try:
+            result = _process_single_ifc(
+                target.source,
+                output_root=output_root,
+                coordinate_system=map_coordinate_system,
+                options=run_options,
+                plan=plan,
+                logger=log,
+                checkpoint=checkpoint,
+            )
+        except Exception as exc:
+            log.error(
+                "Conversion failed for %s: %s",
+                path_name(target.source),
+                exc,
+                exc_info=True,
+            )
+            continue
         if result is None:
             log.warning("Conversion for %s produced no result; skipping.", target.source)
             continue
@@ -476,6 +485,7 @@ def _make_checkpoint_metadata(revision: Optional[str], base_name: str) -> tuple[
     tag_candidates = tag_src.replace(",", " ").split()
     tags = [t.strip() for t in tag_candidates if t.strip()] or [base_name]
     return note, tags
+
 
 def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: logging.Logger, label: str) -> None:
     """Create a checkpoint for `path` when it resides on Nucleus."""
