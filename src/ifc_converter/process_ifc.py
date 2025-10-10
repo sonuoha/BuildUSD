@@ -428,7 +428,11 @@ def _mapping_item_transform(product, mapped_item) -> np.ndarray:
     target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
     placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
 
+    # NOTE: The rest of this module still treats points as row vectors that post-multiply
+    # transforms (see _transform_points/_localize_mesh). To stay consistent, we keep the
+    # original row-vector order here.
     return origin_np @ target_np @ placement_np
+
 
 
 def _context_to_np(ctx) -> np.ndarray:

@@ -469,7 +469,7 @@ def author_prototype_layer(
             xform.ClearXformOpOrder()
             proto_prim = xform.GetPrim()
             Usd.ModelAPI(proto_prim).SetKind('component')
-            UsdGeom.Imageable(proto_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.guide)
+            UsdGeom.Imageable(proto_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
 
             mesh = write_usd_mesh(
                 stage,
@@ -482,7 +482,7 @@ def author_prototype_layer(
                 stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
             )
             if mesh is not None:
-                UsdGeom.Imageable(mesh.GetPrim()).CreatePurposeAttr().Set(UsdGeom.Tokens.guide)
+                UsdGeom.Imageable(mesh.GetPrim()).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
 
     return proto_layer, proto_paths
 
