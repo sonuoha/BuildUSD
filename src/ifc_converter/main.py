@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 import argparse
+import json
 import logging
+import re
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -21,7 +23,7 @@ from .io_utils import (
     read_text,
     stat_entry,
 )
-from .process_ifc import ConversionOptions, build_prototypes
+from .process_ifc import ConversionOptions, CurveWidthRule, build_prototypes
 from .process_usd import (
     apply_stage_anchor_transform,
     assign_world_geolocation,
@@ -40,6 +42,7 @@ __all__ = [
     "convert",
     "parse_args",
     "ConversionOptions",
+    "CurveWidthRule",
     "ConversionManifest",
 ]
 LOG = logging.getLogger(__name__)
@@ -165,7 +168,214 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Force standalone USD (no Kit). All input/output paths must be local.",
     )
+    parser.add_argument(
+        "--annotation-width-default",
+        dest="annotation_width_default",
+        type=str,
+        default=None,
+        help="Default width for annotation curves (stage units unless suffix like mm/cm/m is provided).",
+    )
+    parser.add_argument(
+        "--annotation-width-rule",
+        dest="annotation_width_rules",
+        action="append",
+        default=[],
+        help=(
+            "Annotation width override rule as comma-separated key=value pairs. "
+            "Keys: width (required), layer, curve, hierarchy, step_id, unit. "
+            "Example: width=12mm,layer=Alignment*,curve=Centerline*"
+        ),
+    )
+    parser.add_argument(
+        "--annotation-width-config",
+        dest="annotation_width_configs",
+        action="append",
+        default=[],
+        help="Path to a JSON or YAML file defining annotation curve width rules (may be provided multiple times).",
+    )
     return parser.parse_args(argv)
+
+_WIDTH_VALUE_RE = re.compile(r"^\s*(?P<value>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(?P<unit>[A-Za-z]+)?\s*$")
+
+
+def _strip_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _parse_width_value(value: Any, unit_hint: Optional[str], *, context: str) -> tuple[float, Optional[str]]:
+    if isinstance(value, dict):
+        lowered = {str(k).lower(): v for k, v in value.items()}
+        nested_value = lowered.get("value", lowered.get("amount"))
+        if nested_value is None:
+            raise ValueError(f"{context}: width mapping requires 'value' or 'amount'.")
+        nested_unit = lowered.get("unit")
+        return _parse_width_value(nested_value, nested_unit or unit_hint, context=context)
+    unit = unit_hint
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+    elif isinstance(value, str):
+        stripped = _strip_quotes(value.strip())
+        if not stripped:
+            raise ValueError(f"{context}: width is empty.")
+        match = _WIDTH_VALUE_RE.match(stripped)
+        if not match:
+            raise ValueError(f"{context}: could not parse width value {value!r}.")
+        numeric = float(match.group("value"))
+        unit_token = match.group("unit")
+        if unit_token:
+            unit = unit_token
+    else:
+        raise ValueError(f"{context}: width must be numeric or string, got {type(value).__name__}.")
+    unit_normalized = unit.strip().lower() if isinstance(unit, str) and unit.strip() else None
+    return numeric, unit_normalized
+
+
+def _rule_from_mapping(mapping: dict[str, Any], *, context: str) -> CurveWidthRule:
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{context}: rule must be a mapping, got {type(mapping).__name__}.")
+    lowered = {str(k).lower(): v for k, v in mapping.items()}
+    width_spec = lowered.pop("width", None)
+    if width_spec is None:
+        raise ValueError(f"{context}: missing required 'width' entry.")
+    unit_hint = lowered.pop("unit", None)
+    width_value, width_unit = _parse_width_value(width_spec, unit_hint, context=context)
+    layer = lowered.pop("layer", None)
+    curve = lowered.pop("curve", None)
+    hierarchy = lowered.pop("hierarchy", None)
+    step_id = lowered.pop("step_id", None)
+    if step_id is not None:
+        try:
+            step_id = int(step_id)
+        except Exception as exc:
+            raise ValueError(f"{context}: step_id must be an integer, got {step_id!r}.") from exc
+    if lowered:
+        unknown = ", ".join(sorted(lowered))
+        raise ValueError(f"{context}: unrecognised keys: {unknown}.")
+    return CurveWidthRule(
+        width=float(width_value),
+        unit=width_unit,
+        layer=layer,
+        curve=curve,
+        hierarchy=hierarchy,
+        step_id=step_id,
+    )
+
+
+def _parse_curve_width_rule_expr(expr: str) -> CurveWidthRule:
+    if not expr or not expr.strip():
+        raise ValueError("Annotation width rule cannot be empty.")
+    tokens = [token.strip() for token in expr.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError(f"Annotation width rule '{expr}' is invalid.")
+    mapping: dict[str, Any] = {}
+    for token in tokens:
+        key, sep, value = token.partition("=")
+        if not sep:
+            raise ValueError(f"Annotation width rule '{expr}' is missing '=' in token '{token}'.")
+        key_norm = key.strip().lower()
+        if key_norm in mapping:
+            raise ValueError(f"Annotation width rule '{expr}' specifies '{key_norm}' more than once.")
+        mapping[key_norm] = _strip_quotes(value.strip())
+    return _rule_from_mapping(mapping, context=f"CLI rule {expr!r}")
+
+
+def _rules_from_config_payload(payload: Any, *, source: str) -> list[CurveWidthRule]:
+    if payload is None:
+        return []
+    rules: list[CurveWidthRule] = []
+    if isinstance(payload, list):
+        for idx, entry in enumerate(payload):
+            if not isinstance(entry, dict):
+                raise ValueError(f"{source}: rule #{idx + 1} must be a mapping.")
+            rules.append(_rule_from_mapping(entry, context=f"{source} rule #{idx + 1}"))
+        return rules
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source}: configuration must be a mapping or a list.")
+    if "default" in payload:
+        rules.append(_rule_from_mapping({"width": payload["default"]}, context=f"{source} default"))
+    for idx, entry in enumerate(payload.get("rules", []) or []):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{source}: entry #{idx + 1} under 'rules' must be a mapping.")
+        rules.append(_rule_from_mapping(entry, context=f"{source} rules[{idx}]"))
+    for layer_pattern, value in (payload.get("layers") or {}).items():
+        rule_mapping = {"width": value, "layer": layer_pattern}
+        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layers[{layer_pattern}]"))
+    for curve_pattern, value in (payload.get("curves") or {}).items():
+        rule_mapping = {"width": value, "curve": curve_pattern}
+        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} curves[{curve_pattern}]"))
+    for layer_pattern, entries in (payload.get("layer_curves") or {}).items():
+        if not isinstance(entries, dict):
+            raise ValueError(f"{source}: layer_curves[{layer_pattern}] must be a mapping.")
+        for curve_pattern, value in entries.items():
+            if isinstance(value, dict):
+                rule_mapping = dict(value)
+                rule_mapping.setdefault("layer", layer_pattern)
+                rule_mapping.setdefault("curve", curve_pattern)
+            else:
+                rule_mapping = {"width": value, "layer": layer_pattern, "curve": curve_pattern}
+            rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layer_curves[{layer_pattern}][{curve_pattern}]"))
+    for hierarchy_pattern, value in (payload.get("hierarchies") or {}).items():
+        rule_mapping = {"width": value, "hierarchy": hierarchy_pattern}
+        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} hierarchies[{hierarchy_pattern}]"))
+    for layer_pattern, entries in (payload.get("layer_hierarchies") or {}).items():
+        if not isinstance(entries, dict):
+            raise ValueError(f"{source}: layer_hierarchies[{layer_pattern}] must be a mapping.")
+        for hierarchy_pattern, value in entries.items():
+            if isinstance(value, dict):
+                rule_mapping = dict(value)
+                rule_mapping.setdefault("layer", layer_pattern)
+                rule_mapping.setdefault("hierarchy", hierarchy_pattern)
+            else:
+                rule_mapping = {"width": value, "layer": layer_pattern, "hierarchy": hierarchy_pattern}
+            rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layer_hierarchies[{layer_pattern}][{hierarchy_pattern}]"))
+    return rules
+
+
+def _parse_width_config_text(text: str, *, suffix: Optional[str], source: str) -> Any:
+    suffix_lower = (suffix or "").lower()
+    if suffix_lower in {".yaml", ".yml"}:
+        try:
+            import yaml  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(f"{source}: PyYAML is required to load YAML width configuration.") from exc
+        return yaml.safe_load(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            raise
+        return yaml.safe_load(text)
+
+
+def _load_curve_width_rules_from_source(path_like: str) -> list[CurveWidthRule]:
+    suffix = path_suffix(path_like)
+    text = read_text(path_like)
+    payload = _parse_width_config_text(text, suffix=suffix, source=path_like)
+    return _rules_from_config_payload(payload, source=path_like)
+
+
+def _collect_curve_width_rules(args: argparse.Namespace) -> tuple[CurveWidthRule, ...]:
+    rules: list[CurveWidthRule] = []
+    for config_path in args.annotation_width_configs or []:
+        if not config_path:
+            continue
+        rules.extend(_load_curve_width_rules_from_source(config_path))
+    if args.annotation_width_default:
+        rules.append(
+            _rule_from_mapping(
+                {"width": args.annotation_width_default},
+                context="CLI --annotation-width-default",
+            )
+        )
+    for expr in args.annotation_width_rules or []:
+        if not expr:
+            continue
+        rules.append(_parse_curve_width_rule_expr(expr))
+    return tuple(rules)
 def convert(
     input_path: PathLike,
     *,
@@ -282,6 +492,12 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv)
     try:
+        width_rules = _collect_curve_width_rules(args)
+    except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
+        logging.error("Failed to load annotation width configuration: %s", exc)
+        raise SystemExit(2) from exc
+    options_override = replace(OPTIONS, curve_width_rules=width_rules) if width_rules else OPTIONS
+    try:
         results = convert(
             args.input_path,
             output_dir=args.output_dir,
@@ -292,6 +508,7 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             exclude_names=args.exclude,
             checkpoint=args.checkpoint,
             offline=args.offline,
+            options=options_override,
         )
     finally:
         shutdown_usd_context()
@@ -548,7 +765,7 @@ def _process_single_ifc(
             base_name=base_name,
             options=options,
         )
-        geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name)
+        geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name, options)
         persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths)
         effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
         if effective_base_point is None:
