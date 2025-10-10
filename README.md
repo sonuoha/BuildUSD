@@ -63,12 +63,14 @@ Usage (CLI)
   - python -m ifc_converter --input C:\\path\\to\\dir --all --map-coordinate-system EPSG:XXXX
 - Manifest-driven base points / federated routing:
   - python -m ifc_converter --input C:\\path\\to\\dir --all --manifest src/ifc_converter/config/sample_manifest.json
+  - python -m ifc_converter --input C:\\path\\to\\dir --all --manifest src/ifc_converter/config/sample_manifest.yaml
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m ifc_converter --input omniverse://server/Projects/IFC --all
 - Annotation curve widths:
   - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-default 15mm
   - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-rule width=0.02,layer=Survey*,curve=*Centerline*
-  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-config config/curve_widths.json
+  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-config src/ifc_converter/config/sample_annotation_widths.json
+  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-config src/ifc_converter/config/sample_annotation_widths.yaml
 
 Usage (VS Code)
 - Press F5 and pick one of the provided launch configurations in .vscode/launch.json.
@@ -99,7 +101,7 @@ Annotation Curve Width Overrides
 - Widths accept numeric values in stage units (`0.015`) or include a unit suffix (`12mm`, `1.5cm`, `0.01m`). A separate `unit` key is also accepted in configuration mappings.
 - Rule filters support `layer` (matches the IFC stem used for the geometry2d layer), `curve` (annotation name), `hierarchy` (any label or `/`-joined path in the spatial hierarchy), and `step_id`. Glob-style (`fnmatch`) patterns are applied case-insensitively.
 - Rules are evaluated in order: configuration files are loaded first, then the CLI default, followed by any CLI rule expressions. Later matches override earlier ones.
-- Example JSON configuration:
+- Example JSON configuration (see `src/ifc_converter/config/sample_annotation_widths.json`):
 
 ```json
 {
@@ -120,6 +122,28 @@ Annotation Curve Width Overrides
     "*Level 01*": "0.012"
   }
 }
+```
+
+- Example YAML configuration (see `src/ifc_converter/config/sample_annotation_widths.yaml`):
+
+```yaml
+default: 0.015
+
+layers:
+  "Survey*": 12mm
+  "Alignment*":
+    width: 18
+    unit: mm
+
+curves:
+  "*Centerline*": 0.02
+
+layer_curves:
+  "Alignment*":
+    "Offset*": 0.01
+
+hierarchies:
+  "*Level 01*": 0.012
 ```
 
 Units and Geospatial
@@ -147,7 +171,10 @@ Manifest Schema
 
 Notes
 - JSON manifests work immediately; YAML manifests require installing PyYAML.
-- A sample manifest template lives at src/ifc_converter/config/sample_manifest.json; copy or rename it locally (e.g. to src/ifc_converter/config/manifest.yaml) when preparing project-specific settings. The real manifest remains untracked by design and can be loaded from local paths or omniverse:// URIs.
+- Sample manifest templates live at:
+  - src/ifc_converter/config/sample_manifest.json (JSON with `_comment` helper fields)
+  - src/ifc_converter/config/sample_manifest.yaml (YAML with inline comments)
+  Copy one of them locally (e.g. to src/ifc_converter/config/manifest.yaml) when preparing project-specific settings. The real manifest remains untracked by design and can be loaded from local paths or omniverse:// URIs.
 - 2D annotation contexts (e.g. alignment strings in IfcAnnotation) are preserved. If the ifcopenshell geometry iterator rejects an annotation context, the pipeline emits a warning and falls back to manual curve extraction so the data still lands in the 2D geometry layer.
 
 

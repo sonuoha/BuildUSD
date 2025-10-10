@@ -1,10 +1,14 @@
 {
+  "_comment": "Sample conversion manifest showcasing defaults, master definitions, file rules, and revision metadata.",
   "defaults": {
+    "_comment": "Fallbacks applied to every IFC when no more specific rule overrides them.",
+    "master": "ARCH",
     "master_name": "Federated Model",
     "projected_crs": "EPSG:7855",
     "geodetic_crs": "EPSG:4326",
     "file_revision": "REV-DEFAULT",
     "base_point": {
+      "_comment": "Base point expressed in projected units (meters by default).",
       "easting": 333800.49,
       "northing": 5809101.468,
       "height": 0.0,
@@ -13,6 +17,15 @@
   },
   "masters": [
     {
+      "_comment": "Architectural master route referenced by defaults.master.",
+      "id": "ARCH",
+      "name": "Architecture_Master",
+      "projected_crs": "EPSG:7855",
+      "geodetic_crs": "EPSG:4326",
+      "file_revision": "REV-ARCH"
+    },
+    {
+      "_comment": "Civil master with its own CRS, base point, and geodetic anchor.",
       "id": "CIVIL",
       "name": "Civil_Master",
       "projected_crs": "EPSG:7856",
@@ -23,20 +36,33 @@
         "northing": 5809150.0,
         "height": 2.0,
         "unit": "m"
+      },
+      "lonlat": {
+        "longitude": 144.9631,
+        "latitude": -37.8136,
+        "height": 2.0
       }
     }
   ],
   "files": [
     {
-      "pattern": "BUW_*",
+      "_comment": "Route every IFC whose stem matches the glob to the civil master and override its revision/base point.",
+      "pattern": "CIV_*",
       "master": "CIVIL",
-      "file_revision": "REV-BUW"
+      "file_revision": "REV-CIV-BATCH-1",
+      "base_point": {
+        "easting": 333745.0,
+        "northing": 5809155.0,
+        "height": 1.8,
+        "unit": "m"
+      }
     },
     {
-      "name": "pass_1.ifc",
+      "_comment": "Explicit file override with its own projected/geodetic CRS and longitude/latitude anchor.",
+      "name": "bridge.ifc",
       "projected_crs": "EPSG:7855",
       "geodetic_crs": "EPSG:4979",
-      "file_revision": "REV-PASS-1",
+      "file_revision": "REV-BRIDGE-2025Q4",
       "base_point": {
         "easting": 333905.123,
         "northing": 5809205.456,
@@ -44,8 +70,8 @@
         "unit": "m"
       },
       "lonlat": {
-        "longitude": 144.9631,
-        "latitude": -37.8136,
+        "longitude": 144.9712,
+        "latitude": -37.8129,
         "height": 4.5
       }
     }
