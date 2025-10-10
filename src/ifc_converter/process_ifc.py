@@ -139,6 +139,27 @@ class MapConversionData:
     x_axis_ordinate: float = 0.0
     scale: float = 1.0
 
+    def normalized_axes(self) -> Tuple[float, float]:
+        ax = float(self.x_axis_abscissa) or 0.0
+        ay = float(self.x_axis_ordinate) or 0.0
+        length = math.hypot(ax, ay)
+        if length <= 1e-12:
+            return 1.0, 0.0
+        return ax / length, ay / length
+
+    def rotation_degrees(self) -> float:
+        ax, ay = self.normalized_axes()
+        return math.degrees(math.atan2(ay, ax))
+
+    def map_to_local_xy(self, easting: float, northing: float) -> Tuple[float, float]:
+        ax, ay = self.normalized_axes()
+        scale = self.scale or 1.0
+        d_e = float(easting) - float(self.eastings)
+        d_n = float(northing) - float(self.northings)
+        x = scale * (ax * d_e + ay * d_n)
+        y = scale * (-ay * d_e + ax * d_n)
+        return x, y
+
 @dataclass
 class InstanceRecord:
     """A single placed IFC product occurrence and its authored payload."""
@@ -174,28 +195,6 @@ class PrototypeCaches:
     instances: Dict[int, "InstanceRecord"]
     annotations: Dict[int, AnnotationCurve] = field(default_factory=dict)
     map_conversion: Optional[MapConversionData] = None
-
-
-    def normalized_axes(self) -> Tuple[float, float]:
-        ax = float(self.x_axis_abscissa) or 0.0
-        ay = float(self.x_axis_ordinate) or 0.0
-        length = math.hypot(ax, ay)
-        if length <= 1e-12:
-            return 1.0, 0.0
-        return ax / length, ay / length
-
-    def rotation_degrees(self) -> float:
-        ax, ay = self.normalized_axes()
-        return math.degrees(math.atan2(ay, ax))
-
-    def map_to_local_xy(self, easting: float, northing: float) -> Tuple[float, float]:
-        ax, ay = self.normalized_axes()
-        scale = self.scale or 1.0
-        d_e = float(easting) - float(self.eastings)
-        d_n = float(northing) - float(self.northings)
-        x = scale * (ax * d_e + ay * d_n)
-        y = scale * (-ay * d_e + ax * d_n)
-        return x, y
 
 
 
