@@ -38,3 +38,6 @@ data/output/**/*.usd*
 /tests*
 /tests/**
 tests/*
+
+# Local git worktrees
+/_worktree_*/
