@@ -104,6 +104,16 @@ class HashProto:
     canonical_frame: Optional[Tuple[float, ...]] = None
     count: int = 0
 
+@dataclass(frozen=True)
+class CurveWidthRule:
+    """User-defined width override for annotation curves authored as BasisCurves."""
+    width: float
+    unit: Optional[str] = None
+    layer: Optional[str] = None
+    curve: Optional[str] = None
+    hierarchy: Optional[str] = None
+    step_id: Optional[int] = None
+
 @dataclass
 class ConversionOptions:
     """Controls conversion behavior: instancing, hash de-dup, and metadata."""
@@ -111,6 +121,7 @@ class ConversionOptions:
     enable_hash_dedup: bool = True
     convert_metadata: bool = True
     manifest: Optional['ConversionManifest'] = None
+    curve_width_rules: Tuple[CurveWidthRule, ...] = tuple()
 
 @dataclass(frozen=True)
 class PrototypeKey:

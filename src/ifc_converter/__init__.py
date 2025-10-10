@@ -8,10 +8,12 @@ if str(_SRC_PARENT) not in sys.path:
 
 from .config.manifest import ConversionManifest
 from .main import ConversionResult, ConversionOptions, convert
+from .process_ifc import CurveWidthRule
 
 __all__ = [
     "convert",
     "ConversionOptions",
     "ConversionResult",
     "ConversionManifest",
+    "CurveWidthRule",
 ]
