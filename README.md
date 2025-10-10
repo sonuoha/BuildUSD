@@ -65,6 +65,10 @@ Usage (CLI)
   - python -m ifc_converter --input C:\\path\\to\\dir --all --manifest src/ifc_converter/config/sample_manifest.json
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m ifc_converter --input omniverse://server/Projects/IFC --all
+- Annotation curve widths:
+  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-default 15mm
+  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-rule width=0.02,layer=Survey*,curve=*Centerline*
+  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-config config/curve_widths.json
 
 Usage (VS Code)
 - Press F5 and pick one of the provided launch configurations in .vscode/launch.json.
@@ -88,7 +92,35 @@ Outputs
   - caches/<name>.json stores serialized instance metadata for later regrouping sessions.
 - Federated master stage:
   - Federated Model.usda: contains a /World default prim.
-  - Each IFC adds a child prim /World/<name> with an inactive payload to that file’s default prim.
+  - Each IFC adds a child prim /World/<name> with an inactive payload to that file's default prim.
+
+Annotation Curve Width Overrides
+- Control the `UsdGeom.BasisCurves` widths authored in geometry2d layers via `--annotation-width-default`, repeated `--annotation-width-rule`, or config files supplied with `--annotation-width-config`.
+- Widths accept numeric values in stage units (`0.015`) or include a unit suffix (`12mm`, `1.5cm`, `0.01m`). A separate `unit` key is also accepted in configuration mappings.
+- Rule filters support `layer` (matches the IFC stem used for the geometry2d layer), `curve` (annotation name), `hierarchy` (any label or `/`-joined path in the spatial hierarchy), and `step_id`. Glob-style (`fnmatch`) patterns are applied case-insensitively.
+- Rules are evaluated in order: configuration files are loaded first, then the CLI default, followed by any CLI rule expressions. Later matches override earlier ones.
+- Example JSON configuration:
+
+```json
+{
+  "default": "0.015",
+  "layers": {
+    "Survey*": "12mm"
+  },
+  "curves": {
+    "*Control*": "0.02"
+  },
+  "layer_curves": {
+    "Alignment*": {
+      "Centerline*": {"width": 18, "unit": "mm"},
+      "Offset*": "0.01"
+    }
+  },
+  "hierarchies": {
+    "*Level 01*": "0.012"
+  }
+}
+```
 
 Units and Geospatial
 - Per-file stages author metersPerUnit as needed; WGS84 (lon/lat/height) are authored on /World as Double attributes:

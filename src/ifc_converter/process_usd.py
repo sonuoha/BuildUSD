@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 import time
@@ -12,7 +13,7 @@ from .pxr_utils import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
 from .config.manifest import BasePointConfig, GeodeticCoordinate
 from .io_utils import join_path, path_stem, write_text, is_omniverse_path, stat_entry
-from .process_ifc import ConversionOptions, InstanceRecord, PrototypeCaches, PrototypeKey
+from .process_ifc import ConversionOptions, CurveWidthRule, InstanceRecord, PrototypeCaches, PrototypeKey
 from .utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
 
 try:
@@ -1082,6 +1083,7 @@ def author_geometry2d_layer(
     caches: PrototypeCaches,
     layer_path: PathLike,
     base_name: str,
+    options: ConversionOptions,
 ) -> Optional[Sdf.Layer]:
     if not getattr(caches, "annotations", None):
         return None
@@ -1140,6 +1142,113 @@ def author_geometry2d_layer(
         curves_containers[parent_path] = container_path
         return container_path
 
+    rules: Tuple[CurveWidthRule, ...] = tuple(getattr(options, "curve_width_rules", ()) or ())
+    stage_meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
+    warned_units: set[str] = set()
+    warned_widths: set[CurveWidthRule] = set()
+
+    def _pattern_match(pattern: str, candidates: Iterable[str]) -> bool:
+        pattern_norm = pattern.strip().lower()
+        if not pattern_norm:
+            return False
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            value = candidate.strip()
+            if not value:
+                continue
+            if fnmatch.fnmatchcase(value.lower(), pattern_norm):
+                return True
+        return False
+
+    def _candidate_layer_names() -> Tuple[str, ...]:
+        sanitized = _sanitize_identifier(base_name, fallback=base_name) if base_name else None
+        values = [base_name] if base_name else []
+        if sanitized and sanitized not in values:
+            values.append(sanitized)
+        return tuple(values)
+
+    layer_name_candidates = _candidate_layer_names()
+
+    def _curve_name_candidates(curve) -> Tuple[str, ...]:
+        values: List[str] = []
+        raw = getattr(curve, "name", None)
+        if raw:
+            values.append(raw)
+        sanitized = _sanitize_identifier(raw, fallback=None) if raw else None
+        if sanitized:
+            values.append(sanitized)
+        fallback = f"Geometry2D_{curve.step_id}"
+        if fallback not in values:
+            values.append(fallback)
+        return tuple(values)
+
+    def _hierarchy_candidates(curve) -> Tuple[str, ...]:
+        labels = [label for label, _ in getattr(curve, "hierarchy", ()) if label]
+        candidates: List[str] = []
+        if labels:
+            raw_path = "/".join(labels)
+            if raw_path:
+                candidates.append(raw_path)
+            sanitized_labels = [
+                _sanitize_identifier(label, fallback=label) or label for label in labels
+            ]
+            san_path = "/".join(sanitized_labels)
+            if san_path and san_path not in candidates:
+                candidates.append(san_path)
+            for label, sanitized in zip(labels, sanitized_labels):
+                if label and label not in candidates:
+                    candidates.append(label)
+                if sanitized and sanitized not in candidates:
+                    candidates.append(sanitized)
+        return tuple(candidates)
+
+    def _rule_applies(rule: CurveWidthRule, curve) -> bool:
+        if rule.layer and not _pattern_match(rule.layer, layer_name_candidates):
+            return False
+        if rule.curve and not _pattern_match(rule.curve, _curve_name_candidates(curve)):
+            return False
+        if rule.hierarchy and not _pattern_match(rule.hierarchy, _hierarchy_candidates(curve)):
+            return False
+        if rule.step_id is not None and rule.step_id != getattr(curve, "step_id", None):
+            return False
+        return True
+
+    def _convert_rule_width(rule: CurveWidthRule) -> Optional[float]:
+        try:
+            width_value = float(rule.width)
+        except Exception:
+            return None
+        if width_value <= 0.0:
+            if rule not in warned_widths:
+                print(f"?? Curve width rule ignored (non-positive width {rule.width}): {rule}")
+                warned_widths.add(rule)
+            return None
+        unit = (rule.unit or "").strip().lower()
+        if not unit or unit in {"stage", "stage_unit", "stage-units", "stageunits"}:
+            return width_value
+        factor = _UNIT_FACTORS.get(unit)
+        if factor is None:
+            if unit not in warned_units:
+                print(f"?? Unsupported curve width unit '{unit}' in rule {rule}; skipping.")
+                warned_units.add(unit)
+            return None
+        stage_unit = stage_meters_per_unit if stage_meters_per_unit > 0 else 1.0
+        return (width_value * factor) / stage_unit
+
+    def _resolved_curve_width(curve) -> Optional[float]:
+        if not rules:
+            return None
+        resolved: Optional[float] = None
+        for rule in rules:
+            if not _rule_applies(rule, curve):
+                continue
+            converted = _convert_rule_width(rule)
+            if converted is None:
+                continue
+            resolved = converted
+        return resolved
+
     with Usd.EditContext(stage, geom_layer):
         if not stage.GetPrimAtPath(inst_root_path):
             inst_root_xf = UsdGeom.Xform.Define(stage, inst_root_path)
@@ -1169,6 +1278,9 @@ def author_geometry2d_layer(
             for idx, (x, y, z) in enumerate(curve.points):
                 pt_array[idx] = (float(x), float(y), float(z))
             basis.CreatePointsAttr(pt_array)
+            width_value = _resolved_curve_width(curve)
+            if width_value is not None:
+                basis.CreateWidthsAttr(Vt.FloatArray([float(width_value)]))
             prim = basis.GetPrim()
             try:
                 prim.SetCustomDataByKey("ifc:annotationStepId", int(curve.step_id))
