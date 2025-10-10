@@ -427,21 +427,18 @@ def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, fl
     ]
 
 
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingOrigin ∘ MappingTarget (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return origin_np @ target_np
+
+
 def _mapping_item_transform(product, mapped_item) -> np.ndarray:
     """Compute the row-vector transform for an IfcMappedItem belonging to a product."""
-
-    origin_np = np.eye(4, dtype=float)
-    target_np = np.eye(4, dtype=float)
-    source = getattr(mapped_item, "MappingSource", None)
-    if source is not None:
-        origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None))
-    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
     placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
-
-    # NOTE: The rest of this module still treats points as row vectors that post-multiply
-    # transforms (see _transform_points/_localize_mesh). To stay consistent, we keep the
-    # original row-vector order here.
-    return origin_np @ target_np @ placement_np
+    return _repmap_rt_matrix(mapped_item) @ placement_np
 
 
 
@@ -1089,12 +1086,23 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             hierarchy_nodes = _collect_spatial_hierarchy(product)
             hierarchy_cache[hierarchy_key] = hierarchy_nodes
 
+        inst_transform: Optional[Tuple[float, ...]] = abs_mat
+        if abs_mat is not None:
+            inst_np = np.array(abs_np, dtype=float)
+            if mapped_items:
+                try:
+                    map_np = _repmap_rt_matrix(mapped_items[0])
+                    inst_np = inst_np @ map_np
+                except Exception:
+                    pass
+            inst_transform = tuple(inst_np.reshape(-1).tolist())
+
         instances[step_id] = InstanceRecord(
             step_id=step_id,
             product_id=product_id,
             prototype=primary_key,
             name=name,
-            transform=abs_mat,
+            transform=inst_transform,
             material_ids=list(material_ids),
             materials=list(materials),
             attributes=attributes,
