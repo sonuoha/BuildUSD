@@ -3,7 +3,6 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,15 +41,15 @@ _UNIT_FACTORS = {
 # 1. ---------------------------- Name helpers ----------------------------
 
 def sanitize_name(raw_name, fallback=None):
-    """Make a USD-legal prim name with a short uniq suffix."""
+    """Make a USD-legal prim name (deterministic; no time-based suffix)."""
     base = str(raw_name or fallback or "Unnamed")
     name = re.sub(r"[^A-Za-z0-9_]", "_", base)
+    name = re.sub(r"_+", "_", name).strip("_")
     if not name:
         name = "Unnamed"
     if name[0].isdigit():
         name = "_" + name
-    unique_suffix = f"_{int(time.time()*1000)%10000}"
-    return (name + unique_suffix)[:63]
+    return name[:63]
 
 
 def _sanitize_identifier(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
@@ -87,6 +86,7 @@ class PreparedInstance:
     materials: List[Any]
     mesh: Optional[Dict[str, Any]]
     source_path: Optional[Sdf.Path] = None
+    guid: Optional[str] = None
 
 
 # 2. ---------------------------- Mesh helpers ----------------------------
@@ -709,6 +709,7 @@ def _serialize_instance_record(record: InstanceRecord, proto_paths: Dict[Prototy
         "step_id": record.step_id,
         "product_id": record.product_id,
         "name": record.name,
+        "guid": getattr(record, "guid", None),
         "transform": _as_list(record.transform),
         "material_ids": list(record.material_ids or []),
         "materials": _json_safe(record.materials),
@@ -766,6 +767,7 @@ def _prepared_instances_from_serialized(data: Dict[str, Any]) -> List[PreparedIn
             PreparedInstance(
                 step_id=entry.get("step_id"),
                 name=entry.get("name", ""),
+                guid=entry.get("guid"),
                 transform=transform,
                 attributes=entry.get("attributes") or {},
                 hierarchy=hierarchy,
@@ -795,6 +797,7 @@ def _prepare_instances_from_cache(caches: PrototypeCaches, proto_paths: Dict[Pro
             PreparedInstance(
                 step_id=record.step_id,
                 name=record.name,
+                guid=getattr(record, "guid", None),
                 transform=tuple(record.transform) if record.transform is not None else None,
                 attributes=record.attributes or {},
                 hierarchy=tuple(record.hierarchy or tuple()),
@@ -894,6 +897,7 @@ def _prepare_instances_from_stage(stage: Usd.Stage, inst_root: Sdf.Path) -> List
             step_id = prim.GetCustomDataByKey("ifc:instanceStepId")
             if step_id is None:
                 continue
+            guid = prim.GetCustomDataByKey("ifc:guid")
             try:
                 step_val = int(step_id)
             except Exception:
@@ -931,6 +935,7 @@ def _prepare_instances_from_stage(stage: Usd.Stage, inst_root: Sdf.Path) -> List
                 PreparedInstance(
                     step_id=step_val,
                     name=prim.GetName(),
+                    guid=guid,
                     transform=transform,
                     attributes=attributes,
                     hierarchy=hierarchy,
@@ -973,6 +978,20 @@ def author_instance_layer(
     def _unique_child_name(parent_path: Sdf.Path, base: str) -> str:
         return _unique_name(base, name_counters[parent_path])
 
+    def _unique_child_name_with_guid(parent_path: Sdf.Path, base: str, guid: Optional[str]) -> str:
+        used = name_counters[parent_path]
+        candidate = base
+        if used.get(candidate, 0) == 0 and not stage.GetPrimAtPath(parent_path.AppendChild(candidate)):
+            used[candidate] = 1
+            return candidate
+        if guid:
+            token = _sanitize_identifier(guid)
+            candidate_guid = f"{base}_{token}"
+            if used.get(candidate_guid, 0) == 0 and not stage.GetPrimAtPath(parent_path.AppendChild(candidate_guid)):
+                used[candidate_guid] = 1
+                return candidate_guid
+        return _unique_child_name(parent_path, base)
+
     def _ensure_group(parent_path: Sdf.Path, label: str, step_id: Optional[int]) -> Sdf.Path:
         if step_id is not None and step_id in hierarchy_nodes_by_step:
             return hierarchy_nodes_by_step[step_id]
@@ -1014,7 +1033,7 @@ def author_instance_layer(
                 parent_path = _ensure_group(parent_path, label, step_id)
 
             base_name_candidate = _sanitize_identifier(record.name, fallback=f"Ifc_{record.step_id}")
-            inst_name = _unique_child_name(parent_path, base_name_candidate)
+            inst_name = _unique_child_name_with_guid(parent_path, base_name_candidate, getattr(record, "guid", None))
             inst_path = parent_path.AppendChild(inst_name)
 
             xform = UsdGeom.Xform.Define(stage, inst_path)
@@ -1025,6 +1044,8 @@ def author_instance_layer(
                 inst_prim.SetCustomDataByKey("ifc:instanceStepId", int(record.step_id))
             except Exception:
                 inst_prim.SetCustomDataByKey("ifc:instanceStepId", record.step_id)
+            if getattr(record, "guid", None):
+                inst_prim.SetCustomDataByKey("ifc:guid", str(record.guid))
             if record.transform:
                 try:
                     xf = np_to_gf_matrix(record.transform)
