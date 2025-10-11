@@ -428,11 +428,11 @@ def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, fl
 
 
 def _repmap_rt_matrix(mapped_item) -> np.ndarray:
-    """Return MappingOrigin ∘ MappingTarget (RepresentationMap frame to product frame)."""
+    """Return MappingTarget ∘ MappingOrigin (RepresentationMap frame to product frame)."""
     source = getattr(mapped_item, "MappingSource", None)
     origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
     target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
-    return origin_np @ target_np
+    return target_np @ origin_np
 
 
 def _mapping_item_transform(product, mapped_item) -> np.ndarray:
@@ -1087,12 +1087,25 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             hierarchy_cache[hierarchy_key] = hierarchy_nodes
 
         inst_transform: Optional[Tuple[float, ...]] = abs_mat
+        inst_np: Optional[np.ndarray] = None
         if abs_mat is not None:
             inst_np = np.array(abs_np, dtype=float)
+            place_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
             if mapped_items:
                 try:
-                    map_np = _repmap_rt_matrix(mapped_items[0])
-                    inst_np = inst_np @ map_np
+                    map_np = _repmap_rt_matrix(mapped_items[0])  # R -> P
+                    mapped_place_np = map_np @ place_np
+                    if np.allclose(inst_np, place_np, atol=1e-7):
+                        inst_np = map_np @ inst_np  # apply mapping
+                    elif np.allclose(inst_np, mapped_place_np, atol=1e-7):
+                        # iterator already baked in the mapping; leave as-is
+                        pass
+                    else:
+                        log.debug(
+                            "IfcMappedItem transform ambiguous (step %s); "
+                            "iterator matrix differs from placement and mapped placement.",
+                            step_id,
+                        )
                 except Exception:
                     pass
             inst_transform = tuple(inst_np.reshape(-1).tolist())
@@ -1110,6 +1123,17 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             hierarchy=hierarchy_nodes,
             mesh=instance_mesh,
         )
+        if inst_np is not None and getattr(product, "is_a", lambda *_: False)("IfcFooting"):
+            parent_label = hierarchy_nodes[-2][0] if len(hierarchy_nodes) > 1 else "?"
+            log.info(
+                "IfcFooting instance step=%s name=%s parent=%s translation=(%.3f, %.3f, %.3f)",
+                step_id,
+                name,
+                parent_label,
+                float(inst_np[0, 3]),
+                float(inst_np[1, 3]),
+                float(inst_np[2, 3]),
+            )
 
     annotations = extract_annotation_curves(ifc_file, hierarchy_cache)
     map_conversion = extract_map_conversion(ifc_file)
