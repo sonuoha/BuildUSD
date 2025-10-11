@@ -174,6 +174,7 @@ class InstanceRecord:
     prototype_delta: Optional[Tuple[float, ...]] = None
     hierarchy: Tuple[Tuple[str, Optional[int]], ...] = field(default_factory=tuple)
     mesh: Optional[Dict[str, Any]] = None
+    guid: Optional[str] = None
 
 @dataclass
 class AnnotationCurve:
@@ -436,9 +437,10 @@ def _repmap_rt_matrix(mapped_item) -> np.ndarray:
 
 
 def _mapping_item_transform(product, mapped_item) -> np.ndarray:
-    """Compute the row-vector transform for an IfcMappedItem belonging to a product."""
+    """R->W for a mapped item: placement (P->W) composed with map (R->P)."""
     placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
-    return _repmap_rt_matrix(mapped_item) @ placement_np
+    map_np = _repmap_rt_matrix(mapped_item)
+    return placement_np @ map_np
 
 
 
@@ -1086,30 +1088,17 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             hierarchy_nodes = _collect_spatial_hierarchy(product)
             hierarchy_cache[hierarchy_key] = hierarchy_nodes
 
-        inst_transform: Optional[Tuple[float, ...]] = abs_mat
-        inst_np: Optional[np.ndarray] = None
-        if abs_mat is not None:
-            inst_np = np.array(abs_np, dtype=float)
-            place_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
-            if mapped_items:
-                try:
-                    map_np = _repmap_rt_matrix(mapped_items[0])  # R -> P
-                    mapped_place_np = map_np @ place_np
-                    if np.allclose(inst_np, place_np, atol=1e-7):
-                        inst_np = map_np @ inst_np  # apply mapping
-                    elif np.allclose(inst_np, mapped_place_np, atol=1e-7):
-                        # iterator already baked in the mapping; leave as-is
-                        pass
-                    else:
-                        log.debug(
-                            "IfcMappedItem transform ambiguous (step %s); "
-                            "iterator matrix differs from placement and mapped placement.",
-                            step_id,
-                        )
-                except Exception:
-                    pass
-            inst_transform = tuple(inst_np.reshape(-1).tolist())
+        if mapped_items:
+            try:
+                inst_np = _mapping_item_transform(product, mapped_items[0])
+            except Exception:
+                inst_np = abs_np if abs_mat is not None else _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+        else:
+            inst_np = abs_np if abs_mat is not None else _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+        inst_np = np.array(inst_np, dtype=float)
+        inst_transform: Optional[Tuple[float, ...]] = tuple(inst_np.reshape(-1).tolist())
 
+        guid = getattr(product, "GlobalId", None)
         instances[step_id] = InstanceRecord(
             step_id=step_id,
             product_id=product_id,
@@ -1122,6 +1111,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             prototype_delta=proto_delta_tuple,
             hierarchy=hierarchy_nodes,
             mesh=instance_mesh,
+            guid=guid,
         )
         if inst_np is not None and getattr(product, "is_a", lambda *_: False)("IfcFooting"):
             parent_label = hierarchy_nodes[-2][0] if len(hierarchy_nodes) > 1 else "?"
