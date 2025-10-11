@@ -1,0 +1,613 @@
+{
+  "schema": 1,
+  "base_name": "SRL-WPD-TVC-XTTW-MOD-XTW-ESF-009815",
+  "instances": [
+    {
+      "step_id": 200,
+      "product_id": 200,
+      "name": "Strip_Footing_SF2_1500W_x_1000D_Acoustic_Shed_1707170",
+      "guid": "1vJme7LBHBJvg76YY0eJGk",
+      "transform": [
+        -0.9932052227259236,
+        0.11637605230436572,
+        0.0,
+        0.0,
+        -0.11637605230436572,
+        -0.9932052227259236,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -1013200350.3666141,
+        -5733495071.3144245,
+        0.0,
+        1.0
+      ],
+      "material_ids": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "materials": [
+        "style\n     name IfcSurfaceStyleRendering-61\n     diffuse\n            colour 0.941176 0.941176 0.941176\n     specular\n             colour 0.5 0.5 0.5"
+      ],
+      "attributes": {
+        "psets": {
+          "SRLA_Location": {
+            "SRLA_LocationClassificationCode": "En_80_35_77",
+            "SRLA_LocationClassificationTitle": "Service area buildings",
+            "SRLA_LocationCode0": "SRL",
+            "SRLA_LocationCode1": "SRE",
+            "SRLA_LocationCode2": "ESF",
+            "SRLA_LocationCode3": "BLD321",
+            "SRLA_LocationCode4": "BLD321",
+            "SRLA_LocationCode5": "1008",
+            "SRLA_LocationCode6": "N/A",
+            "SRLA_LocationCode7": "N/A",
+            "SRLA_LocationDesc0": "Suburban Rail Loop",
+            "SRLA_LocationDesc1": "SRL East",
+            "SRLA_LocationDesc2": "Emergency Support Facility",
+            "SRLA_LocationDesc3": "ESF - Intervention and Ventilation Facility",
+            "SRLA_LocationDesc4": "ESF - Intervention and Ventilation Facility",
+            "SRLA_LocationDesc5": "VENTILATION SHAFT",
+            "SRLA_LocationDesc6": "N/A",
+            "SRLA_LocationDesc7": "N/A",
+            "SRLA_PlaceDesc": "Suburban Rail Loop, SRL East,Emergency Support Facility,ESF - Intervention and Ventilation Facility",
+            "SRLA_PlaceID": "SRL-ESF-BLD321-1008-02",
+            "SRLA_ProjectLocationCode": "SRL-SRE-ESF-BLD321-1008-02",
+            "SRLA_RoomDesc": "N/A",
+            "SRLA_RoomID": "N/A"
+          },
+          "SRLA_Project": {
+            "SRLA_ContractorPhaseCode": "XTTW",
+            "SRLA_ContractorPhaseDesc": "TTW - Project wide Project wide (including tunnel wide, Burwood, ESF/IVS and Glen Waverley site)\u200b",
+            "SRLA_DesignPackageCode": "WPD-DPK-XTW-ESF-9815",
+            "SRLA_DesignPackageDesc": "ESF - ACOUSTIC SHED FOUNDATION",
+            "SRLA_DesignReviewStageCode": "DD",
+            "SRLA_DesignReviewStageDesc": "Detailed Design Phase",
+            "SRLA_DimOverallHeight": "1000",
+            "SRLA_DimOverallLength": "33373",
+            "SRLA_DimOverallWidth": "1500",
+            "SRLA_DocumentTypeCode": "MOD",
+            "SRLA_DocumentTypeDesc": "Model",
+            "SRLA_DTPIDSDisciplineCode": "C",
+            "SRLA_DTPIDSDisciplineDesc": "General",
+            "SRLA_Easting": "336901.053",
+            "SRLA_FromKm": "18.931",
+            "SRLA_Height": "102.750",
+            "SRLA_MMI": "No",
+            "SRLA_ModelApprovedDate": "07/10/2025",
+            "SRLA_ModelApprover": "M.Hamed",
+            "SRLA_ModelCheckedDate": "07/10/2025",
+            "SRLA_ModelChecker": "M.Hamed",
+            "SRLA_ModelOriginatorName": "A.Rahmatulla",
+            "SRLA_Northing": "5806897.418",
+            "SRLA_OriginatorCode": "TVC",
+            "SRLA_OriginatorDesc": "Terra Verde Consortium",
+            "SRLA_ProjectCode": "SRL",
+            "SRLA_ProjectDesc": "Suburban Rail Loop,Emergency Support Facility,ESF - Intervention and Ventilation Facility,VENTILATION SHAFT",
+            "SRLA_ProjectDisciplineCode": "XTW",
+            "SRLA_ProjectDisciplineDesc": "Temporary Works",
+            "SRLA_ProjectHeightDatum": "AHD71",
+            "SRLA_ProjectModelNumber": "SRL-WPD-TVC-XTTW-MOD-XTW-ESF-009815",
+            "SRLA_ProjectModelTitle": "ESF ACOUSTIC SHED FOUNDATION",
+            "SRLA_RevDate": "07/10/2025",
+            "SRLA_RevNo": "A",
+            "SRLA_StateCode": "CSH",
+            "SRLA_StateDesc": "CLIENT SHARED(SRLA internal use)",
+            "SRLA_SuitabilityCode": "S3",
+            "SRLA_SuitabilityDesc": "FOR REVIEW AND COMMENT",
+            "SRLA_ToKm": "18.931",
+            "SRLA_WorkPackageCode": "WPD",
+            "SRLA_WorkPackageDesc": "Tunnels GWY-BOX Package"
+          },
+          "SRLA_Asset": {
+            "GUID": "794f0a07-54b4-4b4f-9a87-1a2880bb388c-001a0ca2",
+            "SRLA_AssetClassificationCode": "Ss_20_05_15",
+            "SRLA_AssetClassificationTitle": "Concrete Foundation Systems",
+            "SRLA_AssetDesc": "Work Package D,Temporary Works,Concrete Foundation Systems",
+            "SRLA_AssetID": "WPD-XTW-FODS-000002",
+            "SRLA_AssetMaintainer": "SRLA",
+            "SRLA_AssetOperator": "SRLA",
+            "SRLA_AssetOwner": "SRLA",
+            "SRLA_AssetStatus": "Planned",
+            "SRLA_AssetStatusDate": "07/10/2025",
+            "SRLA_AssetTypeCode": "FODS",
+            "SRLA_AssetTypeName": "Foundation System",
+            "SRLA_ProjectAssetCode": "IN-SBST-FODS"
+          },
+          "TVC_General": {
+            "Length": "29406",
+            "Width": "1500",
+            "Volume": "44.11 m\u00b3",
+            "Area": "44.11 m\u00b2",
+            "Family": "Strip Footing",
+            "Family Name": "Strip Footing",
+            "Workset": "01-XTTW-TEMPORARY WORKS",
+            "Offset from Host": "250"
+          }
+        },
+        "qtos": {
+          "Qto_FootingBaseQuantities": {
+            "Length": 29405.79113070575,
+            "Width": 1500.0,
+            "Height": 1500.0000000006985,
+            "CrossSectionArea": 44.108686696062996,
+            "OuterSurfaceArea": 61.811582261411814,
+            "GrossSurfaceArea": 150.02895565353782,
+            "GrossVolume": 44.108686696062904,
+            "NetVolume": 44.108686696065455
+          }
+        }
+      },
+      "prototype_delta": null,
+      "hierarchy": [
+        [
+          "254033",
+          27
+        ],
+        [
+          "Default",
+          45
+        ],
+        [
+          "IfcBuilding_32",
+          32
+        ],
+        [
+          "DATUM 0.0",
+          36
+        ],
+        [
+          "IfcFooting",
+          null
+        ]
+      ],
+      "mesh": null,
+      "prototype": {
+        "kind": "repmap",
+        "identifier": 192
+      },
+      "prototype_path": "/World/__Prototypes/Strip_Footing_SF2_1500W_x_1000D_Acoustic_Shed_IfcFootingType_1v"
+    },
+    {
+      "step_id": 318,
+      "product_id": 318,
+      "name": "Floor_Concrete_250_SOG_1734068",
+      "guid": "1QQA27om9CRBQDnkoBNJxr",
+      "transform": [
+        -0.9932052227259236,
+        0.11637605230436572,
+        0.0,
+        0.0,
+        -0.11637605230436572,
+        -0.9932052227259236,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        339074.3573457464,
+        5812449.506271895,
+        102.5,
+        1.0
+      ],
+      "material_ids": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "materials": [
+        "style\n     name IfcSurfaceStyleRendering-61\n     diffuse\n            colour 0.941176 0.941176 0.941176\n     specular\n             colour 0.5 0.5 0.5"
+      ],
+      "attributes": {
+        "psets": {
+          "SRLA_Location": {
+            "SRLA_LocationClassificationCode": "En_80_35_77",
+            "SRLA_LocationClassificationTitle": "Service area buildings",
+            "SRLA_LocationCode0": "SRL",
+            "SRLA_LocationCode1": "SRE",
+            "SRLA_LocationCode2": "ESF",
+            "SRLA_LocationCode3": "BLD321",
+            "SRLA_LocationCode4": "BLD321",
+            "SRLA_LocationCode5": "1008",
+            "SRLA_LocationCode6": "N/A",
+            "SRLA_LocationCode7": "N/A",
+            "SRLA_LocationDesc0": "Suburban Rail Loop",
+            "SRLA_LocationDesc1": "SRL East",
+            "SRLA_LocationDesc2": "Emergency Support Facility",
+            "SRLA_LocationDesc3": "ESF - Intervention and Ventilation Facility",
+            "SRLA_LocationDesc4": "ESF - Intervention and Ventilation Facility",
+            "SRLA_LocationDesc5": "VENTILATION SHAFT",
+            "SRLA_LocationDesc6": "N/A",
+            "SRLA_LocationDesc7": "N/A",
+            "SRLA_PlaceDesc": "Suburban Rail Loop, SRL East,Emergency Support Facility,ESF - Intervention and Ventilation Facility",
+            "SRLA_PlaceID": "SRL-ESF-BLD321-1008-02",
+            "SRLA_ProjectLocationCode": "SRL-SRE-ESF-BLD321-1008-02",
+            "SRLA_RoomDesc": "N/A",
+            "SRLA_RoomID": "N/A"
+          },
+          "SRLA_Project": {
+            "SRLA_ContractorPhaseCode": "XTTW",
+            "SRLA_ContractorPhaseDesc": "TTW - Project wide Project wide (including tunnel wide, Burwood, ESF/IVS and Glen Waverley site)\u200b",
+            "SRLA_DesignPackageCode": "WPD-DPK-XTW-ESF-9815",
+            "SRLA_DesignPackageDesc": "ESF - ACOUSTIC SHED FOUNDATION",
+            "SRLA_DesignReviewStageCode": "DD",
+            "SRLA_DesignReviewStageDesc": "Detailed Design Phase",
+            "SRLA_DimOverallHeight": "250",
+            "SRLA_DimOverallLength": "29386",
+            "SRLA_DimOverallWidth": "21982",
+            "SRLA_DocumentTypeCode": "MOD",
+            "SRLA_DocumentTypeDesc": "Model",
+            "SRLA_DTPIDSDisciplineCode": "C",
+            "SRLA_DTPIDSDisciplineDesc": "General",
+            "SRLA_Easting": "336902.413",
+            "SRLA_FromKm": "18.931",
+            "SRLA_Height": "102.750",
+            "SRLA_MMI": "Yes",
+            "SRLA_ModelApprovedDate": "07/10/2025",
+            "SRLA_ModelApprover": "M.Hamed",
+            "SRLA_ModelCheckedDate": "07/10/2025",
+            "SRLA_ModelChecker": "M.Hamed",
+            "SRLA_ModelOriginatorName": "A.Rahmatulla",
+            "SRLA_Northing": "5806909.091",
+            "SRLA_OriginatorCode": "TVC",
+            "SRLA_OriginatorDesc": "Terra Verde Consortium",
+            "SRLA_ProjectCode": "SRL",
+            "SRLA_ProjectDesc": "Suburban Rail Loop,Emergency Support Facility,ESF - Intervention and Ventilation Facility,VENTILATION SHAFT",
+            "SRLA_ProjectDisciplineCode": "XTW",
+            "SRLA_ProjectDisciplineDesc": "Temporary Works",
+            "SRLA_ProjectHeightDatum": "AHD71",
+            "SRLA_ProjectModelNumber": "SRL-WPD-TVC-XTTW-MOD-XTW-ESF-009815",
+            "SRLA_ProjectModelTitle": "ESF ACOUSTIC SHED FOUNDATION",
+            "SRLA_RevDate": "07/10/2025",
+            "SRLA_RevNo": "A",
+            "SRLA_StateCode": "FOR REVIEW AND COMMENT",
+            "SRLA_StateDesc": "CLIENT SHARED(SRLA internal use)",
+            "SRLA_SuitabilityCode": "S3",
+            "SRLA_SuitabilityDesc": "FOR REVIEW AND COMMENT",
+            "SRLA_ToKm": "18.931",
+            "SRLA_WorkPackageCode": "WPD",
+            "SRLA_WorkPackageDesc": "Tunnels GWY-BOX Package"
+          },
+          "SRLA_Asset": {
+            "GUID": "5a68a087-cb02-4c6c-b68d-c6ec8b474b41-001a75b4",
+            "SRLA_AssetClassificationCode": "Ss_30_12",
+            "SRLA_AssetClassificationTitle": "Floor and deck structure systems",
+            "SRLA_AssetDesc": "Work Package D,Temporary Works,Floor and deck structure systems",
+            "SRLA_AssetID": "WPD-XTW-FLST-000003",
+            "SRLA_AssetMaintainer": "SRLA",
+            "SRLA_AssetOperator": "SRLA",
+            "SRLA_AssetOwner": "SRLA",
+            "SRLA_AssetStatus": "Planned",
+            "SRLA_AssetStatusDate": "07/10/2025",
+            "SRLA_AssetTypeCode": "FLST",
+            "SRLA_AssetTypeName": "Floor Structure",
+            "SRLA_ProjectAssetCode": "IN-BRFS-FLSY"
+          },
+          "TVC_General": {
+            "Volume": "161.55 m\u00b3",
+            "Area": "646.20 m\u00b2",
+            "Description": "SOG",
+            "Family": "Floor",
+            "Family Name": "Floor",
+            "Workset": "01-XTTW-TEMPORARY WORKS"
+          }
+        },
+        "qtos": {
+          "Qto_SlabBaseQuantities": {
+            "Depth": 249.99999999999514,
+            "Perimeter": 337.1060788103633,
+            "GrossArea": 646.1995449873914,
+            "NetArea": 646.1995449873913,
+            "GrossVolume": 161.54988624684472,
+            "NetVolume": 161.5498862468447
+          }
+        }
+      },
+      "prototype_delta": null,
+      "hierarchy": [
+        [
+          "254033",
+          27
+        ],
+        [
+          "Default",
+          45
+        ],
+        [
+          "IfcBuilding_32",
+          32
+        ],
+        [
+          "GROUND",
+          40
+        ],
+        [
+          "IfcSlab",
+          null
+        ]
+      ],
+      "mesh": {
+        "vertices": [
+          1497.7202371130488,
+          5766.533915062993,
+          0.25,
+          1497.7202371130488,
+          5766.533915062993,
+          4.85722573273506e-15,
+          1527.094057022903,
+          5766.533915062993,
+          4.85722573273506e-15,
+          1527.094057022903,
+          5766.533915062993,
+          0.25,
+          1527.1097688906075,
+          5744.551144603923,
+          4.85722573273506e-15,
+          1527.1097688906075,
+          5744.551144603923,
+          0.25,
+          1497.7202157775898,
+          5744.5301388452435,
+          4.85722573273506e-15,
+          1497.7202157775898,
+          5744.5301388452435,
+          0.25
+        ],
+        "faces": [
+          1,
+          0,
+          3,
+          2,
+          1,
+          3,
+          2,
+          3,
+          4,
+          4,
+          3,
+          5,
+          4,
+          5,
+          7,
+          6,
+          4,
+          7,
+          6,
+          7,
+          0,
+          1,
+          6,
+          0,
+          3,
+          0,
+          5,
+          0,
+          7,
+          5,
+          4,
+          1,
+          2,
+          4,
+          6,
+          1
+        ]
+      },
+      "prototype": null,
+      "prototype_path": null
+    },
+    {
+      "step_id": 446,
+      "product_id": 446,
+      "name": "Strip_Footing_SF1_2000W_x_1200_D_Acoustic_Shed_1736226",
+      "guid": "14owuQst16XOrlgVAIwVuJ",
+      "transform": [
+        -0.9932052227259236,
+        0.11637605230436572,
+        0.0,
+        0.0,
+        -0.11637605230436572,
+        -0.9932052227259236,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        -1011673257.3811837,
+        -5727750520.169821,
+        101550.0,
+        1.0
+      ],
+      "material_ids": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "materials": [
+        "style\n     name IfcSurfaceStyleRendering-61\n     diffuse\n            colour 0.941176 0.941176 0.941176\n     specular\n             colour 0.5 0.5 0.5"
+      ],
+      "attributes": {
+        "psets": {
+          "SRLA_Location": {
+            "SRLA_LocationClassificationCode": "En_80_35_77",
+            "SRLA_LocationClassificationTitle": "Service area buildings",
+            "SRLA_LocationCode0": "SRL",
+            "SRLA_LocationCode1": "SRE",
+            "SRLA_LocationCode2": "ESF",
+            "SRLA_LocationCode3": "BLD321",
+            "SRLA_LocationCode4": "BLD321",
+            "SRLA_LocationCode5": "1008",
+            "SRLA_LocationCode6": "N/A",
+            "SRLA_LocationCode7": "N/A",
+            "SRLA_LocationDesc0": "Suburban Rail Loop",
+            "SRLA_LocationDesc1": "SRL East",
+            "SRLA_LocationDesc2": "Emergency Support Facility",
+            "SRLA_LocationDesc3": "ESF - Intervention and Ventilation Facility",
+            "SRLA_LocationDesc4": "ESF - Intervention and Ventilation Facility",
+            "SRLA_LocationDesc5": "VENTILATION SHAFT",
+            "SRLA_LocationDesc6": "N/A",
+            "SRLA_LocationDesc7": "N/A",
+            "SRLA_PlaceDesc": "Suburban Rail Loop, SRL East,Emergency Support Facility,ESF - Intervention and Ventilation Facility",
+            "SRLA_PlaceID": "SRL-ESF-BLD321-1008-02",
+            "SRLA_ProjectLocationCode": "SRL-SRE-ESF-BLD321-1008-02",
+            "SRLA_RoomDesc": "N/A",
+            "SRLA_RoomID": "N/A"
+          },
+          "SRLA_Project": {
+            "SRLA_ContractorPhaseCode": "XTTW",
+            "SRLA_ContractorPhaseDesc": "TTW - Project wide Project wide (including tunnel wide, Burwood, ESF/IVS and Glen Waverley site)\u200b",
+            "SRLA_DesignPackageCode": "WPD-DPK-XTW-ESF-9815",
+            "SRLA_DesignPackageDesc": "ESF - ACOUSTIC SHED FOUNDATION",
+            "SRLA_DesignReviewStageCode": "DD",
+            "SRLA_DesignReviewStageDesc": "Detailed Design Phase",
+            "SRLA_DimOverallHeight": "1200",
+            "SRLA_DimOverallLength": "23482",
+            "SRLA_DimOverallWidth": "2000",
+            "SRLA_DocumentTypeCode": "MOD",
+            "SRLA_DocumentTypeDesc": "Model",
+            "SRLA_DTPIDSDisciplineCode": "C",
+            "SRLA_DTPIDSDisciplineDesc": "General",
+            "SRLA_Easting": "336886.744",
+            "SRLA_FromKm": "18.931",
+            "SRLA_Height": "102.750",
+            "SRLA_MMI": "No",
+            "SRLA_ModelApprovedDate": "07/10/2025",
+            "SRLA_ModelApprover": "M.Hamed",
+            "SRLA_ModelCheckedDate": "07/10/2025",
+            "SRLA_ModelChecker": "M.Hamed",
+            "SRLA_ModelOriginatorName": "A.Rahmatulla",
+            "SRLA_Northing": "5806910.161",
+            "SRLA_OriginatorCode": "TVC",
+            "SRLA_OriginatorDesc": "Terra Verde Consortium",
+            "SRLA_ProjectCode": "SRL",
+            "SRLA_ProjectDesc": "Suburban Rail Loop,Emergency Support Facility,ESF - Intervention and Ventilation Facility,VENTILATION SHAFT",
+            "SRLA_ProjectDisciplineCode": "XTW",
+            "SRLA_ProjectDisciplineDesc": "Temporary Works",
+            "SRLA_ProjectHeightDatum": "AHD71",
+            "SRLA_ProjectModelNumber": "SRL-WPD-TVC-XTTW-MOD-XTW-ESF-009815",
+            "SRLA_ProjectModelTitle": "ESF ACOUSTIC SHED FOUNDATION",
+            "SRLA_RevDate": "07/10/2025",
+            "SRLA_RevNo": "A",
+            "SRLA_StateCode": "CSH",
+            "SRLA_StateDesc": "CLIENT SHARED(SRLA internal use)",
+            "SRLA_SuitabilityCode": "S3",
+            "SRLA_SuitabilityDesc": "FOR REVIEW AND COMMENT",
+            "SRLA_ToKm": "18.931",
+            "SRLA_WorkPackageCode": "WPD",
+            "SRLA_WorkPackageDesc": "Tunnels GWY-BOX Package"
+          },
+          "SRLA_Asset": {
+            "GUID": "44cbae1a-db70-4685-8d6f-a9f292f38031-001a7e22",
+            "SRLA_AssetClassificationCode": "Ss_20_05_15",
+            "SRLA_AssetClassificationTitle": "Concrete Foundation Systems",
+            "SRLA_AssetDesc": "Work Package D,Temporary Works,Concrete Foundation Systems",
+            "SRLA_AssetID": "WPD-XTW-FODS-000004",
+            "SRLA_AssetMaintainer": "SRLA",
+            "SRLA_AssetOperator": "SRLA",
+            "SRLA_AssetOwner": "SRLA",
+            "SRLA_AssetStatus": "Planned",
+            "SRLA_AssetStatusDate": "07/10/2025",
+            "SRLA_AssetTypeCode": "FODS",
+            "SRLA_AssetTypeName": "Foundation System",
+            "SRLA_ProjectAssetCode": "IN-SBST-FODS"
+          },
+          "TVC_General": {
+            "Length": "23482",
+            "Width": "2000",
+            "Volume": "56.33 m\u00b3",
+            "Area": "46.96 m\u00b2",
+            "Family": "Strip Footing",
+            "Family Name": "Strip Footing",
+            "Workset": "01-XTTW-TEMPORARY WORKS",
+            "Offset from Host": "950"
+          }
+        },
+        "qtos": {
+          "Qto_FootingBaseQuantities": {
+            "Length": 23482.06172156029,
+            "Width": 2000.0000000000002,
+            "CrossSectionArea": 46.96412344312055,
+            "NetVolume": 56.33262550335689
+          }
+        }
+      },
+      "prototype_delta": null,
+      "hierarchy": [
+        [
+          "254033",
+          27
+        ],
+        [
+          "Default",
+          45
+        ],
+        [
+          "IfcBuilding_32",
+          32
+        ],
+        [
+          "DATUM 0.0",
+          36
+        ],
+        [
+          "IfcFooting",
+          null
+        ]
+      ],
+      "mesh": null,
+      "prototype": {
+        "kind": "repmap",
+        "identifier": 438
+      },
+      "prototype_path": "/World/__Prototypes/Strip_Footing_SF1_2000W_x_1200_D_Acoustic_Shed_IfcFootingType_1"
+    }
+  ]
+}
