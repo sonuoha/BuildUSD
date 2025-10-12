@@ -1,6 +1,18 @@
-﻿# ===============================
-# process_ifc.py (FULL REPLACEMENT)
-# ===============================
+﻿"""IFC geometry inventory and prototype construction utilities.
+
+This module wraps a single iterator-driven pass over an IFC file and produces the
+data needed by the USD writer.  It handles:
+
+* computing stable prototype keys (IfcType + mesh fingerprint + tessellation settings)
+* resolving world transforms and spatial hierarchy for every instance
+* extracting optional annotation/2D geometry and map anchor metadata
+* filtering out hidden layers and auxiliary elements (e.g. IfcOpeningElement)
+
+Most helpers are thin translations of the logic we previously maintained across a
+larger codebase.  Docstrings below call out the subtle pieces so future tweaks do not
+trip over the same unit-conversion or placement traps again.
+"""
+
 from __future__ import annotations
 import logging
 from collections import Counter
@@ -55,6 +67,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------
 
 def _resolve_threads(env_var="IFC_GEOM_THREADS", minimum=1):
+    """Determine how many geometry threads to request from ifcopenshell."""
     val = os.getenv(env_var)
     if val and val.strip():
         try: return max(minimum, int(val))
@@ -69,9 +82,11 @@ threads = _resolve_threads()
 # ---------------------------------
 
 def round_tuple_list(xs: Iterable[Iterable[float]], tol: int = 9) -> Tuple[Tuple[float, ...], ...]:
+    """Round nested iterables to improve deterministic hashing."""
     return tuple(tuple(round(float(v), tol) for v in x) for x in xs)
 
 def stable_mesh_hash(verts: Any, faces: Any) -> str:
+    """Hash mesh topology ignoring float noise and container type."""
     if hasattr(verts, "tolist"): verts_iter = verts.tolist()
     else: verts_iter = list(verts)
     if hasattr(faces, "tolist"): faces_iter = faces.tolist()
@@ -82,6 +97,7 @@ def stable_mesh_hash(verts: Any, faces: Any) -> str:
     return h.hexdigest()
 
 def sanitize_name(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
+    """Return a USD-friendly identifier derived from IFC names."""
     base = str(raw_name or fallback or "Unnamed")
     name = re.sub(r"[^A-Za-z0-9_]", "_", base)
     name = re.sub(r"_+", "_", name).strip("_")
@@ -95,6 +111,8 @@ def sanitize_name(raw_name: Optional[str], fallback: Optional[str] = None) -> st
 
 @dataclass
 class MeshProto:
+    """Prototype metadata for an IfcTypeObject-backed mesh."""
+
     repmap_id: int  # we use IfcTypeObject id here as the canonical repmap anchor
     type_name: Optional[str] = None
     type_class: Optional[str] = None
@@ -109,6 +127,8 @@ class MeshProto:
 
 @dataclass
 class HashProto:
+    """Prototype metadata keyed only by geometry hash (occurrence fallback)."""
+
     digest: str
     name: Optional[str] = None
     type_name: Optional[str] = None
@@ -123,6 +143,8 @@ class HashProto:
 
 @dataclass(frozen=True)
 class CurveWidthRule:
+    """User-configurable rule describing a desired annotation curve width."""
+
     width: float
     unit: Optional[str] = None
     layer: Optional[str] = None
@@ -132,6 +154,8 @@ class CurveWidthRule:
 
 @dataclass
 class ConversionOptions:
+    """High-level knobs used while harvesting IFC geometry."""
+
     enable_instancing: bool = True
     enable_hash_dedup: bool = True
     convert_metadata: bool = True
@@ -140,11 +164,15 @@ class ConversionOptions:
 
 @dataclass(frozen=True)
 class PrototypeKey:
+    """Stable dictionary key distinguishing repmap and hashed prototypes."""
+
     kind: Literal["repmap", "hash"]
     identifier: Union[int, str]
 
 @dataclass
 class MapConversionData:
+    """Lightweight snapshot of IfcMapConversion parameters."""
+
     eastings: float = 0.0
     northings: float = 0.0
     orthogonal_height: float = 0.0
@@ -214,6 +242,7 @@ def _as_float(v, default=0.0):
 # Minimal placement composition (matches your prior signatures)
 
 def axis2placement_to_matrix(place, length_to_m=1.0):
+    """Convert an IfcAxis2Placement to a 4×4 USD matrix in meters."""
     if place is None: return Gf.Matrix4d(1)
     coords = getattr(getattr(place, "Location", None), "Coordinates", (0.0,0.0,0.0)) or (0.0,0.0,0.0)
     loc = Gf.Vec3d(*((_as_float(c) * length_to_m) for c in (coords + (0.0,0.0,0.0))[:3]))
@@ -234,12 +263,14 @@ def axis2placement_to_matrix(place, length_to_m=1.0):
     return trans * rot
 
 def compose_object_placement(obj_placement, length_to_m=1.0):
+    """Recursively compose nested IfcLocalPlacement into a single matrix."""
     if obj_placement is None: return Gf.Matrix4d(1)
     local = axis2placement_to_matrix(getattr(obj_placement, "RelativePlacement", None), length_to_m)
     parent = compose_object_placement(getattr(obj_placement, "PlacementRelTo", None), length_to_m)
     return parent * local
 
 def gf_to_tuple16(gf: Gf.Matrix4d):
+    """Flatten a Matrix4d into a row-major 16-element tuple."""
     return tuple(gf[i][j] for i in range(4) for j in range(4))
 
 # Properties/QTOs collector (same signature)
@@ -282,6 +313,7 @@ def _extract_quantity_value(quantity):
     return None
 
 def collect_instance_attributes(product) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Collect property sets and quantities for a product (and its type)."""
     attrs: Dict[str, Dict[str, Dict[str, Any]]] = {'psets': {}, 'qtos': {}}
     def merge(container, name, data):
         if not data: return
@@ -312,6 +344,7 @@ def collect_instance_attributes(product) -> Dict[str, Dict[str, Dict[str, Any]]]
 # Mesh extraction from iterator triangulation
 
 def triangulated_to_dict(geom) -> Dict[str, Any]:
+    """Normalise an ifcopenshell triangulation into numpy arrays."""
     g = getattr(geom, "geometry", geom)
     if hasattr(g, "verts"): v = np.array(g.verts, dtype=float).reshape(-1,3)
     elif hasattr(g, "coordinates"): v = np.array(g.coordinates, dtype=float).reshape(-1,3)
@@ -324,6 +357,7 @@ def triangulated_to_dict(geom) -> Dict[str, Any]:
 # Spatial hierarchy (unchanged)
 
 def _entity_label(entity) -> str:
+    """Return a user-friendly label for hierarchy breadcrumb nodes."""
     for attr in ("Name","LongName","Description"):
         value = getattr(entity, attr, None)
         if isinstance(value, str) and value.strip(): return value.strip()
@@ -333,6 +367,7 @@ def _entity_label(entity) -> str:
     return f"{label}_{step_id}" if step_id is not None else label
 
 def _resolve_spatial_parent(element):
+    """Walk containment/decomposition relationships to find parent."""
     for rel in (getattr(element, "ContainedInStructure", None) or []):
         parent = getattr(rel, "RelatingStructure", None)
         if parent is not None: return parent
@@ -342,6 +377,7 @@ def _resolve_spatial_parent(element):
     return None
 
 def _collect_spatial_hierarchy(product) -> Tuple[Tuple[str, Optional[int]], ...]:
+    """Build the tuple of (label, step_id) from site/project down to product."""
     if product is None or not hasattr(product, "is_a"): return tuple()
     parents: List[Any] = []; seen: set[int] = set(); current = product
     while True:
@@ -368,6 +404,7 @@ def _collect_spatial_hierarchy(product) -> Tuple[Tuple[str, Optional[int]], ...]
 # Minimal map conversion (same signature as before)
 
 def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Return the preferred IfcMapConversion definition, if present."""
     best = None
     for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
         ops = getattr(ctx, "HasCoordinateOperation", None) or []
@@ -396,14 +433,16 @@ def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
 # Absolute/world transform resolver (same signature used by process_usd)
 
 def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
-    """Return the absolute/world 4x4 for THIS iterator piece.
+    """Return the absolute/world 4×4 for the iterator result.
 
     Priority:
       1) iterator's per-piece matrix (covers MappingTarget × MappingOrigin × placements)
       2) ifcopenshell.util.shape.get_shape_matrix(shape) (robust fallback)
       3) composed IfcLocalPlacement (last resort)
 
-    NOTE: Never elide identity — author explicit transforms on instances.
+    The order mirrors ifcopenshell's behaviour and keeps instancing stable even
+    when representation maps are nested.  Identity matrices are left intact so
+    USD always has an explicit transform op.
     """
     # 1) iterator-provided per-piece matrix
     tr = getattr(shape, "transformation", None)
@@ -482,6 +521,7 @@ def _object_placement_to_np(obj_placement) -> np.ndarray:
         return np.eye(4, dtype=float)
     return _gf_matrix_to_np(gf_matrix)
 def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
     """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
     if op is None:
         return np.eye(4, dtype=float)
@@ -568,6 +608,7 @@ def _map_conversion_to_np(conv) -> np.ndarray:
     return mat
 
 def _context_to_np(ctx) -> np.ndarray:
+    """Compose nested representation contexts into a single matrix."""
     transform = np.eye(4, dtype=float)
     visited = set()
     current = ctx
@@ -617,6 +658,7 @@ def _layer_is_hidden(layer) -> bool:
 
 
 def _entity_on_hidden_layer(entity) -> bool:
+    """Return True if the entity or any of its representations are hidden."""
     seen: set[int] = set()
 
     def _collect(obj):
@@ -654,6 +696,7 @@ def _entity_on_hidden_layer(entity) -> bool:
     return False
 
 def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    """Traverse curve/curve-set items and gather 3D points."""
     if item is None:
         return []
     if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
@@ -707,6 +750,7 @@ def extract_annotation_curves(
     ifc_file,
     hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]],
 ) -> Dict[int, AnnotationCurve]:
+    """Harvest annotation curves (alignment strings, polylines, etc.)."""
     annotations: Dict[int, AnnotationCurve] = {}
     try:
         contexts = [
@@ -816,9 +860,13 @@ def get_type_name(prod):
 # ---------------------------------
 
 def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
-    """Single-pass iterator: builds prototype caches and per-instance records.
-    Prototype identity = (Defining Type id, base geometry hash, settings fp)
-    Instance transform = absolute/world 4×4 (resolve_absolute_matrix)
+    """Run the ifcopenshell iterator and build prototype/instance caches.
+
+    The iterator is evaluated exactly once.  Geometry is grouped by
+    ``(IfcTypeObject id, mesh hash, tessellation settings)`` so USD can emit
+    instanced prototypes without re-tessellating representation maps.  The
+    function also records per-instance transforms, attribute dictionaries, 2‑D
+    annotation curves, and optional map conversion metadata.
     """
     settings = ifcopenshell.geom.settings()
     # keep geometry in local coords; do not bake placement
