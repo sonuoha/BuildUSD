@@ -1,8 +1,11 @@
-# Write a complete `process_usd.py` file that aligns with the user's `main.py`
-# and the new IFC iterator (type+geom anchored prototypes, instanceable Xform,
-# mesh under /Geom, instances reference the prototype Xform path).
-#
-# This file is self-contained and mirrors the signatures they already use.
+"""USD authoring helpers for the ifc_converter pipeline.
+
+The functions below consume the prototype/instance caches produced by
+``process_ifc`` and emit the various USD layers (prototypes, materials,
+instances, 2D geometry) expected by ``main.py``.  The code mirrors the behaviour
+of the original project but has been pared back to the essentials required by
+the new iterator-driven workflow.
+"""
 
 from __future__ import annotations
 
@@ -55,6 +58,7 @@ def sanitize_name(raw_name, fallback=None):
     return name[:63]
 
 def _sanitize_identifier(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
+    """Return a USD-safe token useful for attribute or namespace names."""
     base = str(raw_name or fallback or "Unnamed")
     name = re.sub(r"[^A-Za-z0-9_]", "_", base)
     name = re.sub(r"_+", "_", name).strip("_")
@@ -66,6 +70,7 @@ def _sanitize_identifier(raw_name: Optional[str], fallback: Optional[str] = None
 
 
 def _unique_name(base: str, used: Dict[str, int]) -> str:
+    """Generate a unique name by appending an incrementing suffix when needed."""
     count = used.get(base, 0)
     used[base] = count + 1
     if count == 0:
@@ -167,7 +172,7 @@ class PreparedInstance:
 # ---------------- Stage helpers ----------------
 
 def create_usd_stage(usd_path, meters_per_unit=1.0):
-    """Create a new USD stage with Z-up and a /World default prim."""
+    """Create a new USD stage with Z-up and a `/World` default prim."""
     if isinstance(usd_path, Path):
         identifier = usd_path.resolve().as_posix()
     else:
@@ -185,9 +190,7 @@ def create_usd_stage(usd_path, meters_per_unit=1.0):
 def write_usd_mesh(stage, parent_path, mesh_name, verts, faces, abs_mat=None,
                    material_ids=None, stage_meters_per_unit=1.0,
                    scale_matrix_translation=False):
-    """
-    Author a mesh with local points + single absolute xformOp:transform.
-    """
+    """Author a Mesh prim beneath ``parent_path`` with the supplied data."""
     mesh_path = Sdf.Path(parent_path).AppendChild(mesh_name)
     mesh = UsdGeom.Mesh.Define(stage, mesh_path)
 
@@ -235,6 +238,7 @@ def _flatten_mesh_arrays(mesh: Dict[str, Any]) -> Optional[Tuple[List[float], Li
 # ---------------- Prototype authoring ----------------
 
 def _name_for_repmap(proto: Any) -> str:
+    """Return the prototype prim name for a repmap-backed prototype."""
     # Use Defining Type name EXACTLY (as requested)
     if getattr(proto, "type_name", None):
         return _sanitize_identifier(proto.type_name)
@@ -242,6 +246,7 @@ def _name_for_repmap(proto: Any) -> str:
 
 
 def _name_for_hash(proto: Any) -> str:
+    """Return the prototype name for a hash-backed (occurrence) mesh."""
     base = (getattr(proto, "name", None) or getattr(proto, "type_name", None)
             or "Fallback")
     digest = getattr(proto, "digest", "unknown")
@@ -249,12 +254,14 @@ def _name_for_hash(proto: Any) -> str:
 
 
 def _layer_identifier(path: PathLike) -> str:
+    """Normalise layer paths to a USD identifier string."""
     if isinstance(path, Path):
         return path.resolve().as_posix()
     return str(path)
 
 
 def _iter_prototypes(caches: PrototypeCaches) -> Iterable[Tuple[PrototypeKey, Any]]:
+    """Yield prototypes in a deterministic order for layer authoring."""
     for rep_id, proto in sorted(caches.repmaps.items()):
         yield PrototypeKey(kind="repmap", identifier=rep_id), proto
     for digest, proto in sorted(caches.hashes.items()):
