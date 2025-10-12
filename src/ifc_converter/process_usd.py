@@ -860,19 +860,102 @@ def apply_stage_anchor_transform(
     base_point: Optional[BasePointConfig] = None,
     *,
     align_axes_to_map: bool = False,
-    enable_geo_anchor: bool = True,
+    enable_geo_anchor: bool = True,  # kept for signature compatibility (unused)
     projected_crs: Optional[str] = None,
     lonlat: Optional[GeodeticCoordinate] = None,
-    map_easting: Optional[float] = None,
-    map_northing: Optional[float] = None,
-    map_height: Optional[float] = 0.0,
-    unit_hint: str = "m",
-    coordinate_system: Optional[str] = None,
-    longitude: Optional[float] = None,
-    latitude: Optional[float] = None,
-    altitude: float = 0.0,
+    **_unused,
 ) -> None:
-    return None
+    """Anchor the USD stage to the survey/base-point reference frame.
+
+    - Translates /World so the requested base-point (map coordinates) sits at the origin
+      in stage space. Units are respected (base-point unit → meters → stage units).
+    - When `align_axes_to_map` and an IfcMapConversion are present, rotates /World so the
+      local XY axes honour the published map azimuth.
+    - Persists the chosen anchor (translation/rotation) as prim custom data for debugging.
+    - If geodetic lon/lat is supplied, writes them as authored attributes on /World so any
+      downstream consumer can recover survey metadata.
+    """
+
+    world_prim = stage.GetPrimAtPath("/World")
+    if not world_prim:
+        world_xf = UsdGeom.Xform.Define(stage, "/World")
+        world_prim = world_xf.GetPrim()
+    world_xf = UsdGeom.Xformable(world_prim)
+    world_xf.ClearXformOpOrder()
+
+    stage_meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
+    def _unit_to_meters(value: float, unit: Optional[str]) -> float:
+        if unit is None:
+            return float(value)
+        factor = _UNIT_FACTORS.get(unit.strip().lower(), None)
+        if factor is None:
+            return float(value)
+        return float(value) * factor
+
+    bp_easting_m = bp_northing_m = bp_height_m = 0.0
+    bp_unit = None
+    if base_point is not None:
+        bp_unit = base_point.unit or "m"
+        bp_easting_m = _unit_to_meters(base_point.easting, bp_unit)
+        bp_northing_m = _unit_to_meters(base_point.northing, bp_unit)
+        bp_height_m = _unit_to_meters(base_point.height, bp_unit)
+
+    map_conv = getattr(caches, "map_conversion", None)
+    translation_stage = Gf.Vec3d(0.0, 0.0, 0.0)
+    rotation_deg = 0.0
+
+    if map_conv is not None:
+        if base_point is not None:
+            scale = float(getattr(map_conv, "scale", 1.0) or 1.0)
+            try:
+                local_x, local_y = map_conv.map_to_local_xy(bp_easting_m, bp_northing_m)
+            except Exception:
+                local_x = bp_easting_m * scale
+                local_y = bp_northing_m * scale
+            map_ortho_height = float(getattr(map_conv, "orthogonal_height", 0.0) or 0.0)
+            local_z = (bp_height_m - map_ortho_height) * scale
+            translation_stage = Gf.Vec3d(
+                -local_x / stage_meters_per_unit,
+                -local_y / stage_meters_per_unit,
+                -local_z / stage_meters_per_unit,
+            )
+        if align_axes_to_map:
+            try:
+                rotation_deg = float(map_conv.rotation_degrees())
+            except Exception:
+                rotation_deg = 0.0
+    elif base_point is not None:
+        translation_stage = Gf.Vec3d(
+            -bp_easting_m / stage_meters_per_unit,
+            -bp_northing_m / stage_meters_per_unit,
+            -bp_height_m / stage_meters_per_unit,
+        )
+
+    anchor_matrix = Gf.Matrix4d(1.0)
+    if rotation_deg:
+        anchor_matrix.SetRotate(Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), rotation_deg))
+    anchor_matrix.SetTranslateOnly(translation_stage)
+    world_xf.AddTransformOp().Set(anchor_matrix)
+
+    # Persist anchor metadata for downstream tools
+    world_prim.SetCustomDataByKey(
+        "ifc:stageAnchor",
+        {
+            "translation_stage_units": [float(translation_stage[i]) for i in range(3)],
+            "rotation_degrees": float(rotation_deg),
+            "applied_projected_crs": projected_crs or "",
+            "base_point_unit": bp_unit or "",
+        },
+    )
+
+    if lonlat is not None:
+        attr_lon = world_prim.CreateAttribute("ifc:longitude", Sdf.ValueTypeNames.Double)
+        attr_lon.Set(float(lonlat.longitude))
+        attr_lat = world_prim.CreateAttribute("ifc:latitude", Sdf.ValueTypeNames.Double)
+        attr_lat.Set(float(lonlat.latitude))
+        if lonlat.height is not None:
+            attr_h = world_prim.CreateAttribute("ifc:ellipsoidalHeight", Sdf.ValueTypeNames.Double)
+            attr_h.Set(float(lonlat.height))
 
 
 # ---------------- Federated master view — stub (retain signature) ----------------
