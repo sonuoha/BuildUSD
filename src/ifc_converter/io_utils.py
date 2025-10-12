@@ -220,11 +220,25 @@ def list_directory(path: PathLike, include_deleted: bool = False) -> List[ListEn
 def stat_entry(path: PathLike):
     if is_omniverse_path(path):
         client = _require_omni_client()
-        # In stat_entry, if is_omniverse_path:
-        result, resolved, entry = client.stat(_normalize_nucleus_path(_as_string(path)))  # If stat also resolves—confirm via test
+        response = client.stat(_normalize_nucleus_path(_as_string(path)))
+        if not isinstance(response, tuple):
+            raise RuntimeError(f"Unexpected omni.client.stat response for {path}: {response!r}")
+        if len(response) == 3:
+            result, resolved, entry = response
+        elif len(response) == 2:
+            result, entry = response
+            resolved = None
+        else:
+            raise RuntimeError(f"Unexpected omni.client.stat tuple size {len(response)} for {path}: {response!r}")
         if result != client.Result.OK:
             return None
-        return entry  # Or wrap in a dict with 'resolved': resolved
+        # Return the raw entry (and optionally stash resolved path for callers that expect it)
+        if resolved is not None and hasattr(entry, "resolved_path"):
+            try:
+                entry.resolved_path = resolved
+            except Exception:
+                pass
+        return entry
     p = Path(path)
     if not p.exists():
         return None
