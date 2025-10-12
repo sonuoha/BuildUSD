@@ -25,10 +25,8 @@ src/ifc_converter/config/manifest.yaml
 /data/input/*.ifc
 
 # Generated USD artifacts
-output/*.usd*
-output/**/*.usd*
-data/output/*.usd*
-data/output/**/*.usd*
+output/
+data/output/
 
 *.sh
 *.bat
