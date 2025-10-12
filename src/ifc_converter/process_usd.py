@@ -9,7 +9,7 @@ the new iterator-driven workflow.
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from textwrap import dedent
 import fnmatch
 import json
@@ -257,7 +257,40 @@ def _layer_identifier(path: PathLike) -> str:
     """Normalise layer paths to a USD identifier string."""
     if isinstance(path, Path):
         return path.resolve().as_posix()
-    return str(path)
+    return str(path).replace("\\", "/")
+
+
+def _sublayer_identifier(parent_layer: Sdf.Layer, child_path: PathLike) -> str:
+    """
+    Compute a stable asset path to author into `parent_layer.subLayerPaths`.
+
+    Preference order:
+        1. Omniverse identifiers stay absolute (already portable).
+        2. Relative path from the parent layer directory when possible.
+        3. Raw POSIX string fallback.
+    """
+    raw_child = str(child_path)
+    if is_omniverse_path(raw_child):
+        return raw_child.replace("\\", "/")
+
+    parent_real = getattr(parent_layer, "realPath", None)
+    if parent_real:
+        try:
+            parent_dir = Path(parent_real).resolve().parent
+            child_path_obj = Path(child_path) if isinstance(child_path, Path) else Path(raw_child)
+            child_abs = child_path_obj.resolve()
+            rel = child_abs.relative_to(parent_dir)
+            return PurePosixPath(rel.as_posix()).as_posix()
+        except Exception:
+            pass
+
+    if isinstance(child_path, Path):
+        return child_path.as_posix()
+
+    try:
+        return PurePosixPath(raw_child).as_posix()
+    except Exception:
+        return raw_child.replace("\\", "/")
 
 
 def _iter_prototypes(caches: PrototypeCaches) -> Iterable[Tuple[PrototypeKey, Any]]:
@@ -285,8 +318,9 @@ def author_prototype_layer(
     proto_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
 
     root_layer = stage.GetRootLayer()
-    if proto_layer.identifier not in root_layer.subLayerPaths:
-        root_layer.subLayerPaths.append(proto_layer.identifier)
+    root_sub_path = _sublayer_identifier(root_layer, layer_path)
+    if root_sub_path not in root_layer.subLayerPaths:
+        root_layer.subLayerPaths.append(root_sub_path)
 
     proto_root = Sdf.Path("/World/__Prototypes")
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
@@ -369,10 +403,13 @@ def author_material_layer(
     material_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
 
     root_layer = stage.GetRootLayer()
-    if material_layer.identifier not in root_layer.subLayerPaths:
-        root_layer.subLayerPaths.append(material_layer.identifier)
-    if material_layer.identifier not in proto_layer.subLayerPaths:
-        proto_layer.subLayerPaths.append(material_layer.identifier)
+    root_sub_path = _sublayer_identifier(root_layer, layer_path)
+    if root_sub_path not in root_layer.subLayerPaths:
+        root_layer.subLayerPaths.append(root_sub_path)
+
+    proto_sub_path = _sublayer_identifier(proto_layer, layer_path)
+    if proto_sub_path not in proto_layer.subLayerPaths:
+        proto_layer.subLayerPaths.append(proto_sub_path)
 
     material_root = Sdf.Path("/World/__Materials")
     material_paths: Dict[PrototypeKey, List[Sdf.Path]] = {}
@@ -439,8 +476,9 @@ def author_instance_layer(
     inst_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
 
     root_layer = stage.GetRootLayer()
-    if inst_layer.identifier not in root_layer.subLayerPaths:
-        root_layer.subLayerPaths.append(inst_layer.identifier)
+    root_sub_path = _sublayer_identifier(root_layer, layer_path)
+    if root_sub_path not in root_layer.subLayerPaths:
+        root_layer.subLayerPaths.append(root_sub_path)
 
     inst_root_name = _sanitize_identifier(f"{base_name}_Instances", fallback="Instances")
     inst_root = Sdf.Path(f"/World/{inst_root_name}")
@@ -699,8 +737,9 @@ def author_geometry2d_layer(
     geom_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
 
     root_layer = stage.GetRootLayer()
-    if geom_layer.identifier not in root_layer.subLayerPaths:
-        root_layer.subLayerPaths.append(geom_layer.identifier)
+    root_sub_path = _sublayer_identifier(root_layer, layer_path)
+    if root_sub_path not in root_layer.subLayerPaths:
+        root_layer.subLayerPaths.append(root_sub_path)
 
     name_counters: Dict[Sdf.Path, Dict[str, int]] = defaultdict(dict)
     hierarchy_nodes: Dict[Tuple[Sdf.Path, str, Optional[int]], Sdf.Path] = {}
