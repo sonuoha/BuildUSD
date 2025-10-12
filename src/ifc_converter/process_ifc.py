@@ -545,6 +545,28 @@ def _mapping_item_transform(product, mapped_item) -> np.ndarray:
     map_np = _repmap_rt_matrix(mapped_item)
     return placement_np @ map_np
 
+
+def _map_conversion_to_np(conv) -> np.ndarray:
+    """Build a 4x4 from IfcMapConversion parameters."""
+    scale = _as_float(getattr(conv, "Scale", 1.0) or 1.0, 1.0)
+    east = _as_float(getattr(conv, "Eastings", 0.0), 0.0)
+    north = _as_float(getattr(conv, "Northings", 0.0), 0.0)
+    height = _as_float(getattr(conv, "OrthogonalHeight", 0.0), 0.0)
+    ax = _as_float(getattr(conv, "XAxisAbscissa", 1.0), 1.0)
+    ay = _as_float(getattr(conv, "XAxisOrdinate", 0.0), 0.0)
+    norm = math.hypot(ax, ay) or 1.0
+    cos = ax / norm
+    sin = ay / norm
+    mat = np.eye(4, dtype=float)
+    mat[0, 0] = cos * scale
+    mat[0, 1] = -sin * scale
+    mat[1, 0] = sin * scale
+    mat[1, 1] = cos * scale
+    mat[0, 3] = east
+    mat[1, 3] = north
+    mat[2, 3] = height
+    return mat
+
 def _context_to_np(ctx) -> np.ndarray:
     transform = np.eye(4, dtype=float)
     visited = set()
@@ -554,6 +576,14 @@ def _context_to_np(ctx) -> np.ndarray:
         wcs = getattr(current, "WorldCoordinateSystem", None)
         if wcs is not None:
             transform = transform @ _axis_placement_to_np(wcs)
+        for op in getattr(current, "HasCoordinateOperation", None) or []:
+            if op is None:
+                continue
+            if op.is_a("IfcMapConversion"):
+                try:
+                    transform = transform @ _map_conversion_to_np(op)
+                except Exception:
+                    continue
         current = getattr(current, "ParentContext", None)
     return transform
 
