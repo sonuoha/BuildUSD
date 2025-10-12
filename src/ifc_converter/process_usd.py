@@ -414,6 +414,21 @@ def author_instance_layer(
     base_name: str,
     options: ConversionOptions,
 ) -> Sdf.Layer:
+    """
+    Author a layer containing instanceable prototype references.
+
+    This function is responsible for creating a new layer containing all
+    instanceable prototype references, including any transforms or metadata
+    associated with the instances.
+
+    :param stage: The USD stage to author the layer in.
+    :param caches: The cached prototype meshes.
+    :param proto_paths: A mapping from prototype key to USD path.
+    :param layer_path: The path to the layer to be created.
+    :param base_name: The base name of the layer.
+    :param options: Optional conversion options.
+    :return: The authored layer.
+    """
     inst_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
 
     root_layer = stage.GetRootLayer()
