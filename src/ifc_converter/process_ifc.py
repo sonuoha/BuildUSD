@@ -587,11 +587,77 @@ def _context_to_np(ctx) -> np.ndarray:
         current = getattr(current, "ParentContext", None)
     return transform
 
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if text in {"F", "FALSE", "NO", "0"}:
+        return False
+    if text in {"T", "TRUE", "YES", "1"}:
+        return True
+    return None
+
+
+def _layer_is_hidden(layer) -> bool:
+    if layer is None:
+        return False
+    for attr in ("LayerOn", "LayerVisible", "LayerVisibility"):
+        if _to_bool(getattr(layer, attr, None)) is False:
+            return True
+    for attr in ("LayerFrozen", "LayerBlocked"):
+        if _to_bool(getattr(layer, attr, None)) is True:
+            return True
+    return False
+
+
+def _entity_on_hidden_layer(entity) -> bool:
+    seen: set[int] = set()
+
+    def _collect(obj):
+        if obj is None:
+            return
+        for layer in getattr(obj, "LayerAssignments", None) or []:
+            if layer is None:
+                continue
+            try:
+                lid = int(layer.id())
+            except Exception:
+                lid = id(layer)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            yield layer
+
+    for layer in _collect(entity):
+        if _layer_is_hidden(layer):
+            return True
+
+    rep = getattr(entity, "Representation", None)
+    if rep is not None:
+        for layer in _collect(rep):
+            if _layer_is_hidden(layer):
+                return True
+        for representation in getattr(rep, "Representations", []) or []:
+            for layer in _collect(representation):
+                if _layer_is_hidden(layer):
+                    return True
+            for item in getattr(representation, "Items", []) or []:
+                for layer in _collect(item):
+                    if _layer_is_hidden(layer):
+                        return True
+    return False
+
 def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
     if item is None:
         return []
     if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
-        pts = []
+        pts: List[Tuple[float, float, float]] = []
         for p in getattr(item, "Points", []) or []:
             try:
                 pts.append(_cartesian_point_to_tuple(p))
@@ -599,27 +665,43 @@ def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
                 continue
         return pts
     if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
-        pts = []
-        for seg in getattr(item, "Segments", []) or []:
-            parent = getattr(seg, "ParentCurve", None)
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
             pts.extend(_extract_curve_points(parent))
         return pts
     if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
         return _extract_curve_points(getattr(item, "BasisCurve", None))
     if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
-        pts = []
-        for el in getattr(item, "Elements", []) or []:
-            pts.extend(_extract_curve_points(el))
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
         return pts
     if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
-        src = getattr(item, "MappingSource", None)
-        mapped = getattr(src, "MappedRepresentation", None) if src else None
-        if mapped is not None:
-            pts = []
-            for sub in getattr(mapped, "Items", []) or []:
-                pts.extend(_extract_curve_points(sub))
-            return pts
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
     return []
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
+
 
 def extract_annotation_curves(
     ifc_file,
@@ -649,6 +731,8 @@ def extract_annotation_curves(
         return cached
 
     for product in ifc_file.by_type("IfcProduct") or []:
+        if _entity_on_hidden_layer(product):
+            continue
         rep = getattr(product, "Representation", None)
         if not rep:
             continue
@@ -800,6 +884,10 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             continue
 
         if hasattr(product, "is_a") and product.is_a("IfcOpeningElement"):
+            if not iterator.next(): break
+            continue
+
+        if _entity_on_hidden_layer(product):
             if not iterator.next(): break
             continue
 
