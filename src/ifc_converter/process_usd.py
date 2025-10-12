@@ -73,6 +73,77 @@ def _unique_name(base: str, used: Dict[str, int]) -> str:
     return f"{base}_{count}"
 
 
+def _author_namespaced_dictionary_attributes(prim: Usd.Prim, namespace: str, entries: Dict[str, Any]) -> None:
+    """Write IFC property dictionaries into BIMData:* USD attributes."""
+    if not entries:
+        return
+
+    root_ns = "BIMData"
+    ns_map = {"pset": "Psets", "qtos": "QTO", "qto": "QTO"}
+    ns1 = ns_map.get(namespace.lower(), _sanitize_identifier(namespace, fallback="Meta"))
+
+    def _set_attr(full_name: str, value: Any) -> None:
+        if isinstance(value, bool):
+            attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.Bool)
+            attr.Set(bool(value))
+            return
+        if isinstance(value, int) and not isinstance(value, bool):
+            attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.Int)
+            attr.Set(int(value))
+            return
+        if isinstance(value, float):
+            attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.Double)
+            attr.Set(float(value))
+            return
+        if isinstance(value, (list, tuple)):
+            seq = list(value)
+            if all(isinstance(v, bool) for v in seq):
+                attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.BoolArray)
+                attr.Set(Vt.BoolArray([bool(v) for v in seq]))
+                return
+            if all(isinstance(v, int) and not isinstance(v, bool) for v in seq):
+                attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.IntArray)
+                attr.Set(Vt.IntArray([int(v) for v in seq]))
+                return
+            if all(isinstance(v, (int, float)) for v in seq):
+                attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.DoubleArray)
+                attr.Set(Vt.DoubleArray([float(v) for v in seq]))
+                return
+            if all(isinstance(v, str) for v in seq):
+                attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.StringArray)
+                attr.Set(Vt.StringArray([str(v) for v in seq]))
+                return
+            attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.String)
+            attr.Set(str(value))
+            return
+        attr = prim.CreateAttribute(full_name, Sdf.ValueTypeNames.String)
+        attr.Set(str(value))
+
+    for set_name, payload in entries.items():
+        if payload is None:
+            continue
+        set_token = _sanitize_identifier(set_name, fallback="Unnamed")
+        if isinstance(payload, dict):
+            for prop_name, prop_value in payload.items():
+                if prop_value is None:
+                    continue
+                prop_token = _sanitize_identifier(prop_name, fallback="Value")
+                full_attr = f"{root_ns}:{ns1}:{set_token}:{prop_token}"
+                _set_attr(full_attr, prop_value)
+        else:
+            full_attr = f"{root_ns}:{ns1}:{set_token}:Value"
+            _set_attr(full_attr, payload)
+
+
+def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, Any]]) -> None:
+    if not attributes or not isinstance(attributes, dict):
+        return
+    psets = attributes.get("psets", {})
+    qtos = attributes.get("qtos", {})
+    _author_namespaced_dictionary_attributes(prim, "pset", psets)
+    _author_namespaced_dictionary_attributes(prim, "qto", qtos)
+
+
 # ---------------- PreparedInstance (used by grouping/variants) ----------------
 
 @dataclass
@@ -422,6 +493,9 @@ def author_instance_layer(
 
             if record.transform is not None:
                 xform.AddTransformOp().Set(np_to_gf_matrix(record.transform))
+
+            if getattr(options, "convert_metadata", True) and getattr(record, "attributes", None):
+                _author_instance_attributes(inst_prim, record.attributes)
 
             # Per-instance mesh fallback (non-instanced geometry)
             if record.mesh:
@@ -941,20 +1015,19 @@ def apply_stage_anchor_transform(
     anchor_matrix.SetTranslateOnly(translation_stage)
     world_xf.AddTransformOp().Set(anchor_matrix)
 
-    # Persist anchor metadata for downstream tools
-    world_prim.SetCustomDataByKey(
-        "ifc:stageAnchor",
-        {
-            "translation_stage_units": [float(translation_stage[i]) for i in range(3)],
-            "rotation_degrees": float(rotation_deg),
-            "applied_projected_crs": projected_crs or "",
-        "base_point_unit": bp_unit or "",
-        "base_point_easting_m": float(bp_easting_m),
-        "base_point_northing_m": float(bp_northing_m),
-        "base_point_height_m": float(bp_height_m),
-        "map_conversion_scale": float(getattr(map_conv, "scale", 1.0) or 1.0) if map_conv else None,
-    },
-)
+    translation_attr = world_prim.CreateAttribute("ifc:stageAnchorTranslation", Sdf.ValueTypeNames.Double3)
+    translation_attr.Set(tuple(float(translation_stage[i]) for i in range(3)))
+    rotation_attr = world_prim.CreateAttribute("ifc:stageAnchorRotationDegrees", Sdf.ValueTypeNames.Double)
+    rotation_attr.Set(float(rotation_deg))
+    bp_attr = world_prim.CreateAttribute("ifc:stageAnchorBasePointMeters", Sdf.ValueTypeNames.Double3)
+    bp_attr.Set((float(bp_easting_m), float(bp_northing_m), float(bp_height_m)))
+    unit_attr = world_prim.CreateAttribute("ifc:stageAnchorBasePointUnit", Sdf.ValueTypeNames.String)
+    unit_attr.Set(bp_unit or "")
+    crs_attr = world_prim.CreateAttribute("ifc:stageAnchorProjectedCRS", Sdf.ValueTypeNames.String)
+    crs_attr.Set(projected_crs or "")
+    if map_conv is not None:
+        scale_attr = world_prim.CreateAttribute("ifc:stageAnchorMapScale", Sdf.ValueTypeNames.Double)
+        scale_attr.Set(float(getattr(map_conv, "scale", 1.0) or 1.0))
 
     if lonlat is not None:
         longitude = float(lonlat.longitude)
