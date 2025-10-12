@@ -799,6 +799,10 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             if not iterator.next(): break
             continue
 
+        if hasattr(product, "is_a") and product.is_a("IfcOpeningElement"):
+            if not iterator.next(): break
+            continue
+
         geom = getattr(shape, "geometry", None)
         if geom is None:
             if not iterator.next(): break
