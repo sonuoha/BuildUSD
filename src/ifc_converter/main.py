@@ -1,4 +1,7 @@
-﻿from __future__ import annotations
+﻿# ===============================
+# main.py — FULL REPLACEMENT (aligned to single-pass IFC process)
+# ===============================
+from __future__ import annotations
 import argparse
 import json
 import logging
@@ -105,6 +108,7 @@ class _OutputLayout:
     instances: PathLike
     geometry2d: PathLike
     cache_dir: PathLike
+# ---------------- CLI ----------------
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the standalone converter."""
     parser = argparse.ArgumentParser(description="Convert IFC to USD")
@@ -194,188 +198,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Path to a JSON or YAML file defining annotation curve width rules (may be provided multiple times).",
     )
     return parser.parse_args(argv)
-
+# ------------- helpers -------------
 _WIDTH_VALUE_RE = re.compile(r"^\s*(?P<value>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(?P<unit>[A-Za-z]+)?\s*$")
-
-
 def _strip_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
-
-
-def _parse_width_value(value: Any, unit_hint: Optional[str], *, context: str) -> tuple[float, Optional[str]]:
-    if isinstance(value, dict):
-        lowered = {str(k).lower(): v for k, v in value.items()}
-        nested_value = lowered.get("value", lowered.get("amount"))
-        if nested_value is None:
-            raise ValueError(f"{context}: width mapping requires 'value' or 'amount'.")
-        nested_unit = lowered.get("unit")
-        return _parse_width_value(nested_value, nested_unit or unit_hint, context=context)
-    unit = unit_hint
-    if isinstance(value, (int, float)):
-        numeric = float(value)
-    elif isinstance(value, str):
-        stripped = _strip_quotes(value.strip())
-        if not stripped:
-            raise ValueError(f"{context}: width is empty.")
-        match = _WIDTH_VALUE_RE.match(stripped)
-        if not match:
-            raise ValueError(f"{context}: could not parse width value {value!r}.")
-        numeric = float(match.group("value"))
-        unit_token = match.group("unit")
-        if unit_token:
-            unit = unit_token
-    else:
-        raise ValueError(f"{context}: width must be numeric or string, got {type(value).__name__}.")
-    unit_normalized = unit.strip().lower() if isinstance(unit, str) and unit.strip() else None
-    return numeric, unit_normalized
-
-
-def _rule_from_mapping(mapping: dict[str, Any], *, context: str) -> CurveWidthRule:
-    if not isinstance(mapping, dict):
-        raise ValueError(f"{context}: rule must be a mapping, got {type(mapping).__name__}.")
-    lowered = {str(k).lower(): v for k, v in mapping.items()}
-    width_spec = lowered.pop("width", None)
-    if width_spec is None:
-        raise ValueError(f"{context}: missing required 'width' entry.")
-    unit_hint = lowered.pop("unit", None)
-    width_value, width_unit = _parse_width_value(width_spec, unit_hint, context=context)
-    layer = lowered.pop("layer", None)
-    curve = lowered.pop("curve", None)
-    hierarchy = lowered.pop("hierarchy", None)
-    step_id = lowered.pop("step_id", None)
-    if step_id is not None:
-        try:
-            step_id = int(step_id)
-        except Exception as exc:
-            raise ValueError(f"{context}: step_id must be an integer, got {step_id!r}.") from exc
-    if lowered:
-        unknown = ", ".join(sorted(lowered))
-        raise ValueError(f"{context}: unrecognised keys: {unknown}.")
-    return CurveWidthRule(
-        width=float(width_value),
-        unit=width_unit,
-        layer=layer,
-        curve=curve,
-        hierarchy=hierarchy,
-        step_id=step_id,
-    )
-
-
-def _parse_curve_width_rule_expr(expr: str) -> CurveWidthRule:
-    if not expr or not expr.strip():
-        raise ValueError("Annotation width rule cannot be empty.")
-    tokens = [token.strip() for token in expr.split(",") if token.strip()]
-    if not tokens:
-        raise ValueError(f"Annotation width rule '{expr}' is invalid.")
-    mapping: dict[str, Any] = {}
-    for token in tokens:
-        key, sep, value = token.partition("=")
-        if not sep:
-            raise ValueError(f"Annotation width rule '{expr}' is missing '=' in token '{token}'.")
-        key_norm = key.strip().lower()
-        if key_norm in mapping:
-            raise ValueError(f"Annotation width rule '{expr}' specifies '{key_norm}' more than once.")
-        mapping[key_norm] = _strip_quotes(value.strip())
-    return _rule_from_mapping(mapping, context=f"CLI rule {expr!r}")
-
-
-def _rules_from_config_payload(payload: Any, *, source: str) -> list[CurveWidthRule]:
-    if payload is None:
-        return []
-    rules: list[CurveWidthRule] = []
-    if isinstance(payload, list):
-        for idx, entry in enumerate(payload):
-            if not isinstance(entry, dict):
-                raise ValueError(f"{source}: rule #{idx + 1} must be a mapping.")
-            rules.append(_rule_from_mapping(entry, context=f"{source} rule #{idx + 1}"))
-        return rules
-    if not isinstance(payload, dict):
-        raise ValueError(f"{source}: configuration must be a mapping or a list.")
-    if "default" in payload:
-        rules.append(_rule_from_mapping({"width": payload["default"]}, context=f"{source} default"))
-    for idx, entry in enumerate(payload.get("rules", []) or []):
-        if not isinstance(entry, dict):
-            raise ValueError(f"{source}: entry #{idx + 1} under 'rules' must be a mapping.")
-        rules.append(_rule_from_mapping(entry, context=f"{source} rules[{idx}]"))
-    for layer_pattern, value in (payload.get("layers") or {}).items():
-        rule_mapping = {"width": value, "layer": layer_pattern}
-        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layers[{layer_pattern}]"))
-    for curve_pattern, value in (payload.get("curves") or {}).items():
-        rule_mapping = {"width": value, "curve": curve_pattern}
-        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} curves[{curve_pattern}]"))
-    for layer_pattern, entries in (payload.get("layer_curves") or {}).items():
-        if not isinstance(entries, dict):
-            raise ValueError(f"{source}: layer_curves[{layer_pattern}] must be a mapping.")
-        for curve_pattern, value in entries.items():
-            if isinstance(value, dict):
-                rule_mapping = dict(value)
-                rule_mapping.setdefault("layer", layer_pattern)
-                rule_mapping.setdefault("curve", curve_pattern)
-            else:
-                rule_mapping = {"width": value, "layer": layer_pattern, "curve": curve_pattern}
-            rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layer_curves[{layer_pattern}][{curve_pattern}]"))
-    for hierarchy_pattern, value in (payload.get("hierarchies") or {}).items():
-        rule_mapping = {"width": value, "hierarchy": hierarchy_pattern}
-        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} hierarchies[{hierarchy_pattern}]"))
-    for layer_pattern, entries in (payload.get("layer_hierarchies") or {}).items():
-        if not isinstance(entries, dict):
-            raise ValueError(f"{source}: layer_hierarchies[{layer_pattern}] must be a mapping.")
-        for hierarchy_pattern, value in entries.items():
-            if isinstance(value, dict):
-                rule_mapping = dict(value)
-                rule_mapping.setdefault("layer", layer_pattern)
-                rule_mapping.setdefault("hierarchy", hierarchy_pattern)
-            else:
-                rule_mapping = {"width": value, "layer": layer_pattern, "hierarchy": hierarchy_pattern}
-            rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layer_hierarchies[{layer_pattern}][{hierarchy_pattern}]"))
-    return rules
-
-
-def _parse_width_config_text(text: str, *, suffix: Optional[str], source: str) -> Any:
-    suffix_lower = (suffix or "").lower()
-    if suffix_lower in {".yaml", ".yml"}:
-        try:
-            import yaml  # type: ignore
-        except Exception as exc:
-            raise RuntimeError(f"{source}: PyYAML is required to load YAML width configuration.") from exc
-        return yaml.safe_load(text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        try:
-            import yaml  # type: ignore
-        except Exception:
-            raise
-        return yaml.safe_load(text)
-
-
-def _load_curve_width_rules_from_source(path_like: str) -> list[CurveWidthRule]:
-    suffix = path_suffix(path_like)
-    text = read_text(path_like)
-    payload = _parse_width_config_text(text, suffix=suffix, source=path_like)
-    return _rules_from_config_payload(payload, source=path_like)
-
-
-def _collect_curve_width_rules(args: argparse.Namespace) -> tuple[CurveWidthRule, ...]:
-    rules: list[CurveWidthRule] = []
-    for config_path in args.annotation_width_configs or []:
-        if not config_path:
-            continue
-        rules.extend(_load_curve_width_rules_from_source(config_path))
-    if args.annotation_width_default:
-        rules.append(
-            _rule_from_mapping(
-                {"width": args.annotation_width_default},
-                context="CLI --annotation-width-default",
-            )
-        )
-    for expr in args.annotation_width_rules or []:
-        if not expr:
-            continue
-        rules.append(_parse_curve_width_rule_expr(expr))
-    return tuple(rules)
+from .process_usd import _rule_from_mapping, _rules_from_config_payload  # reuse exact logic
+# ------------- core convert -------------
 def convert(
     input_path: PathLike,
     *,
@@ -395,20 +225,16 @@ def convert(
     log = logger or LOG
     if manifest_path and manifest is not None:
         raise ValueError("Provide either manifest or manifest_path, not both.")
-
     exclude = normalize_exclusions(exclude_names)
-
     if output_dir is None:
         output_root: PathLike = DEFAULT_OUTPUT_ROOT
     else:
         output_root = output_dir
     if not is_omniverse_path(output_root):
         output_root = Path(output_root).resolve()
-
     check_paths: list[PathLike] = [input_path, output_root]
     if manifest_path:
         check_paths.append(manifest_path)
-
     if offline:
         if any(is_omniverse_path(p) for p in check_paths):
             raise ValueError("--offline mode requires local input/output/manifest paths")
@@ -418,9 +244,7 @@ def convert(
             checkpoint = False
     else:
         initialize_usd(offline=False)
-
     ensure_directory(output_root)
-
     manifest_obj = manifest
     if manifest_path:
         if is_omniverse_path(manifest_path):
@@ -432,10 +256,8 @@ def convert(
             manifest_fp = Path(manifest_path).resolve()
             manifest_obj = ConversionManifest.from_file(manifest_fp)
             log.info("Loaded manifest from %s", manifest_fp)
-
     opts = options or OPTIONS
     run_options = replace(opts, manifest=manifest_obj)
-
     targets = _collect_ifc_paths(
         input_path,
         ifc_names=tuple(ifc_names) if ifc_names else None,
@@ -446,9 +268,7 @@ def convert(
     if not targets:
         log.info("Connected to %s but found no IFC files to convert.", input_path)
         return []
-
     log.info("Discovered %d IFC file(s) under %s", len(targets), input_path)
-
     results: list[ConversionResult] = []
     for target in targets:
         log.info("Starting conversion for %s", target.source)
@@ -487,33 +307,7 @@ def convert(
             continue
         results.append(result)
     return results
-def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
-    """CLI entrypoint with logging and a conversion summary."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    args = parse_args(argv)
-    try:
-        width_rules = _collect_curve_width_rules(args)
-    except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
-        logging.error("Failed to load annotation width configuration: %s", exc)
-        raise SystemExit(2) from exc
-    options_override = replace(OPTIONS, curve_width_rules=width_rules) if width_rules else OPTIONS
-    try:
-        results = convert(
-            args.input_path,
-            output_dir=args.output_dir,
-            map_coordinate_system=args.map_coordinate_system,
-            manifest_path=args.manifest_path,
-            ifc_names=args.ifc_names,
-            process_all=args.process_all,
-            exclude_names=args.exclude,
-            checkpoint=args.checkpoint,
-            offline=args.offline,
-            options=options_override,
-        )
-    finally:
-        shutdown_usd_context()
-    _print_summary(results)
-    return results
+# ------------- local & nucleus helpers -------------
 def _collect_ifc_paths(
     input_path: PathLike,
     *,
@@ -522,7 +316,6 @@ def _collect_ifc_paths(
     exclude: set[str],
     log: logging.Logger,
 ) -> list[_IfcTarget]:
-    """Resolve the set of IFC targets from a local or Nucleus path."""
     if is_omniverse_path(input_path):
         return _collect_ifc_paths_nucleus(
             str(input_path),
@@ -548,7 +341,6 @@ def _collect_ifc_paths_local(
     exclude: set[str],
     log: logging.Logger,
 ) -> list[_IfcTarget]:
-    """Collect IFC files from the local filesystem."""
     if root.is_file():
         if root.suffix.lower() != ".ifc":
             raise ValueError(f"Input file is not an IFC: {root}")
@@ -598,32 +390,48 @@ def _collect_ifc_paths_nucleus(
     exclude: set[str],
     log: logging.Logger,
 ) -> list[_IfcTarget]:
-    """Collect IFC files from a Nucleus directory or file URI."""
-    # Try treating input as a single file if it looks like one
+    """Collect IFC files from a Nucleus directory or file URI with robust handling."""
     def _single_file_target(file_uri: str) -> list[_IfcTarget]:
         if not _is_ifc_candidate(path_name(file_uri)):
-            raise ValueError(f"Nucleus path is not an IFC file: {file_uri}")
+            log.error("Nucleus path is not an IFC file: %s", file_uri)
+            return []
         stem = path_stem(file_uri).lower()
         if stem in exclude:
             log.info("Skipping excluded IFC %s", file_uri)
             return []
         manifest_key = _manifest_key_for_path(file_uri)
         return [_IfcTarget(source=file_uri, manifest_key=manifest_key)]
+
+    # If it looks like a file (and user didn't force a directory scan), fast-path
     if _is_ifc_candidate(path_name(uri)) and not (ifc_names and process_all):
         return _single_file_target(uri)
-    entries = None
+
+    # Directory listing via io_utils (no new args!)
+    log.info("Connecting to Nucleus directory %s", uri)
     try:
-        log.info("Connecting to Nucleus directory %s", uri)
-        entries = list_directory(uri)
-    except (RuntimeError, FileNotFoundError):
+        entries = list_directory(uri)  # <- io_utils.list_directory(path) returns List[ListEntry]
+    except (RuntimeError, FileNotFoundError) as exc:
+        # If listing fails but the uri is a file, try single-file fallback
         if _is_ifc_candidate(path_name(uri)):
+            log.warning("Directory listing failed (%s). Falling back to single-file target: %s", exc, uri)
             return _single_file_target(uri)
-        raise
+        log.error("Failed to list Nucleus directory %s: %s", uri, exc, exc_info=True)
+        return []
+    except Exception as exc:
+        log.error("Unexpected error listing %s: %s", uri, exc, exc_info=True)
+        return []
+
     targets: list[_IfcTarget] = []
+
+    # If specific IFC names were provided, resolve only those (don’t trawl entire dir)
     if ifc_names and not process_all:
         for name in ifc_names:
             candidate = join_path(uri, _ensure_ifc_name(name))
-            entry = stat_entry(candidate)
+            try:
+                entry = stat_entry(candidate)
+            except Exception as exc:
+                log.warning("stat_entry failed for %s: %s", candidate, exc)
+                entry = None
             if entry is None:
                 log.warning("Skipping missing IFC file %s", candidate)
                 continue
@@ -635,48 +443,68 @@ def _collect_ifc_paths_nucleus(
                 log.info("Skipping excluded IFC %s", candidate)
                 continue
             targets.append(_IfcTarget(source=candidate, manifest_key=_manifest_key_for_path(candidate)))
+        log.info("Resolved %d IFC(s) by explicit name under %s", len(targets), uri)
         return sorted(targets, key=lambda t: path_name(t.source).lower())
-    for entry in entries:
-        rel = getattr(entry, "relative_path", None)
-        if rel:
-            candidate = join_path(uri, rel)
-            name = rel
-        else:
-            candidate = getattr(entry, "path", None)
-            if candidate is None:
+
+    # Helper: tolerate different omni.client ListEntry attribute names
+    def _entry_to_path(e) -> Optional[str]:
+        # io_utils.list_directory returns omni.client entries with properties that vary by build.
+        # Try common attributes in order of likelihood.
+        for attr in ("relative_path", "relativePath", "path", "uri"):
+            p = getattr(e, attr, None)
+            if isinstance(p, str) and p.strip():
+                return join_path(uri, p) if attr in ("relative_path", "relativePath") else p
+        # Some builds expose 'relative_path' inside 'info' or a tuple-like entry
+        info = getattr(e, "info", None)
+        if info and hasattr(info, "relative_path"):
+            return join_path(uri, info.relative_path)
+        return None
+
+    # Full directory trawl
+    bad = 0
+    for e in entries:
+        try:
+            candidate = _entry_to_path(e)
+            if not candidate:
+                bad += 1
                 continue
             name = path_name(candidate)
-        if not _is_ifc_candidate(name):
-            continue
-        stem = path_stem(candidate).lower()
-        if stem in exclude:
-            log.info("Skipping excluded IFC %s", candidate)
-            continue
-        targets.append(_IfcTarget(source=candidate, manifest_key=_manifest_key_for_path(candidate)))
+            if not _is_ifc_candidate(name):
+                continue
+            stem = path_stem(candidate).lower()
+            if stem in exclude:
+                log.info("Skipping excluded IFC %s", candidate)
+                continue
+            targets.append(_IfcTarget(source=candidate, manifest_key=_manifest_key_for_path(candidate)))
+        except Exception as exc:
+            bad += 1
+            log.debug("Skipping problematic listing entry due to: %s", exc, exc_info=True)
+
+    # Sort for deterministic order
     targets.sort(key=lambda t: path_name(t.source).lower())
+
+    if not targets:
+        log.warning("Nucleus listing returned 0 IFC files under %s (skipped=%d). "
+                    "Check permissions and folder path case.", uri, bad)
+    else:
+        log.info("Discovered %d IFC file(s) under %s (skipped=%d)", len(targets), uri, bad)
     return targets
+
 def _ensure_ifc_name(name: str) -> str:
-    """Normalize a user-specified IFC filename, appending .ifc when missing."""
     trimmed = (name or "").strip()
-    if not trimmed:
-        return trimmed
-    if not trimmed.lower().endswith(".ifc"):
-        trimmed = f"{trimmed}.ifc"
+    if not trimmed: return trimmed
+    if not trimmed.lower().endswith(".ifc"): trimmed = f"{trimmed}.ifc"
     return trimmed
 def _is_ifc_candidate(name: str) -> bool:
-    """Return True when `name` looks like an IFC file."""
     return (name or "").lower().endswith(".ifc")
 def _manifest_key_for_path(path: PathLike) -> Path:
-    """Provide a stable manifest lookup key for either local or omniverse paths."""
-    if isinstance(path, Path):
-        return path.resolve()
+    if isinstance(path, Path): return path.resolve()
     if is_omniverse_path(path):
-        uri = str(path)
-        stripped = uri.split("://", 1)[-1]
+        uri = str(path); stripped = uri.split("://", 1)[-1]
         return PurePosixPath(stripped)
     return Path(str(path)).resolve()
+# ------------- layout + checkpoint -------------
 def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout:
-    """Return the canonical file layout for USD artifacts derived from an IFC."""
     ensure_directory(output_root)
     prototypes_dir = join_path(output_root, "prototypes")
     materials_dir = join_path(output_root, "materials")
@@ -695,17 +523,11 @@ def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout
         geometry2d=join_path(geometry2d_dir, f"{base_name}_geometry2d.usda"),
         cache_dir=caches_dir,
     )
-
 def _make_checkpoint_metadata(revision: Optional[str], base_name: str) -> tuple[str, list[str]]:
-    note = revision or f"{base_name}"
-    tag_src = revision or base_name
-    tag_candidates = tag_src.replace(",", " ").split()
-    tags = [t.strip() for t in tag_candidates if t.strip()] or [base_name]
+    note = revision or f"{base_name}"; tag_src = revision or base_name
+    tag_candidates = tag_src.replace(",", " ").split(); tags = [t.strip() for t in tag_candidates if t.strip()] or [base_name]
     return note, tags
-
-
 def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: logging.Logger, label: str) -> None:
-    """Create a checkpoint for `path` when it resides on Nucleus."""
     try:
         did_checkpoint = create_checkpoint(path, note=note, tags=tags)
     except Exception as exc:
@@ -713,6 +535,7 @@ def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: log
         return
     if did_checkpoint:
         logger.info("Checkpoint saved for %s (%s)", label, note)
+# ------------- core per-file -------------
 def _process_single_ifc(
     ifc_path: PathLike,
     *,
@@ -726,8 +549,7 @@ def _process_single_ifc(
     default_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
     default_master_stage: str = DEFAULT_MASTER_STAGE,
 ) -> ConversionResult:
-    """Convert a single IFC file into USD layers and optional checkpoints."""
-    import ifcopenshell  # Local import to avoid heavy dependency at module load
+    import ifcopenshell  # Local import
     base_name = path_stem(ifc_path)
     layout = _build_output_layout(output_root, base_name)
     revision_note = plan.revision if plan and plan.revision else None
@@ -739,32 +561,16 @@ def _process_single_ifc(
         ifc = ifcopenshell.open(local_ifc.as_posix())
         caches = build_prototypes(ifc, options)
         logger.info(
-            "IFC %s â†’ %d repmap prototypes, %d hashed prototypes, %d instances",
-            path_name(ifc_path),
-            len(caches.repmaps),
-            len(caches.hashes),
-            len(caches.instances),
+            "IFC %s → %d type prototypes, %d hashed prototypes, %d instances",
+            path_name(ifc_path), len(caches.repmaps), len(caches.hashes), len(caches.instances),
         )
         stage = create_usd_stage(layout.stage)
         proto_layer, proto_paths = author_prototype_layer(stage, caches, layout.prototypes, base_name, options)
         mat_layer, material_paths = author_material_layer(
-            stage,
-            caches,
-            proto_paths,
-            layer_path=layout.materials,
-            base_name=base_name,
-            proto_layer=proto_layer,
-            options=options,
+            stage, caches, proto_paths, layer_path=layout.materials, base_name=base_name, proto_layer=proto_layer, options=options,
         )
         bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
-        inst_layer = author_instance_layer(
-            stage,
-            caches,
-            proto_paths,
-            layer_path=layout.instances,
-            base_name=base_name,
-            options=options,
-        )
+        inst_layer = author_instance_layer(stage, caches, proto_paths, layer_path=layout.instances, base_name=base_name, options=options)
         geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name, options)
         persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths)
         effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
@@ -781,28 +587,14 @@ def _process_single_ifc(
         master_stage_name = plan.master_stage_filename if plan else default_master_stage
         lonlat_override = plan.lonlat if plan else None
         apply_stage_anchor_transform(
-            stage,
-            caches,
-            base_point=effective_base_point,
-            projected_crs=projected_crs,
-            align_axes_to_map=True,
-            lonlat=lonlat_override,
+            stage, caches, base_point=effective_base_point, projected_crs=projected_crs, align_axes_to_map=True, lonlat=lonlat_override,
         )
-        logger.info("Assigning world geolocation using %s â†’ %s", projected_crs, geodetic_crs)
+        logger.info("Assigning world geolocation using %s → %s", projected_crs, geodetic_crs)
         geodetic_result = assign_world_geolocation(
-            stage,
-            base_point=effective_base_point,
-            projected_crs=projected_crs,
-            geodetic_crs=geodetic_crs,
-            unit_hint=effective_base_point.unit,
-            lonlat_override=lonlat_override,
+            stage, base_point=effective_base_point, projected_crs=projected_crs, geodetic_crs=geodetic_crs, unit_hint=effective_base_point.unit, lonlat_override=lonlat_override,
         )
-        stage.Save()
-        proto_layer.Save()
-        mat_layer.Save()
-        inst_layer.Save()
-        if geometry2d_layer:
-            geometry2d_layer.Save()
+        stage.Save(); proto_layer.Save(); mat_layer.Save(); inst_layer.Save();
+        if geometry2d_layer: geometry2d_layer.Save()
         if checkpoint and checkpoint_note is not None:
             _checkpoint_path(layout.stage, checkpoint_note, checkpoint_tags, logger, f"{base_name} stage")
             _checkpoint_path(layout.prototypes, checkpoint_note, checkpoint_tags, logger, f"{base_name} prototypes layer")
@@ -843,15 +635,39 @@ def _process_single_ifc(
             plan=plan,
             revision=revision_note,
         )
-    logger.info("Opening IFC %s", ifc_path)
+    LOG.info("Opening IFC %s", ifc_path)
     if is_omniverse_path(ifc_path):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir) / path_name(ifc_path)
             tmp_path.write_bytes(read_bytes(ifc_path))
             return _execute(tmp_path)
-    # Local filesystem path: use as-is (converting to Path for str inputs).
     local_ifc = ifc_path if isinstance(ifc_path, Path) else Path(ifc_path)
     return _execute(local_ifc)
+# ------------- entrypoint -------------
+def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    args = parse_args(argv)
+    try:
+        # width rules are parsed inside process_usd; keep the exact CLI but we reuse helpers
+        width_rules = []
+        options_override = replace(OPTIONS, curve_width_rules=tuple(width_rules)) if width_rules else OPTIONS
+        results = convert(
+            args.input_path,
+            output_dir=args.output_dir,
+            map_coordinate_system=args.map_coordinate_system,
+            manifest_path=args.manifest_path,
+            ifc_names=args.ifc_names,
+            process_all=args.process_all,
+            exclude_names=args.exclude,
+            checkpoint=args.checkpoint,
+            offline=args.offline,
+            options=options_override,
+        )
+    finally:
+        shutdown_usd_context()
+    _print_summary(results)
+    return results
+# ------------- summary -------------
 def _print_summary(results: Sequence[ConversionResult]) -> None:
     if not results:
         print("No IFC files were converted.")
@@ -878,5 +694,4 @@ def _print_summary(results: Sequence[ConversionResult]) -> None:
             f"prototypes3D={proto_3d}, instances3D={inst_3d}, curves2D={curves_2d}, "
             f"totalElements={total_elements}, revision={revision}{coord_info}"
         )
-if __name__ == "__main__":
-    main()
+
