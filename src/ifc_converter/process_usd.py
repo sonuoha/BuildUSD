@@ -884,6 +884,8 @@ def apply_stage_anchor_transform(
     world_xf.ClearXformOpOrder()
 
     stage_meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
+    if stage_meters_per_unit <= 0.0:
+        stage_meters_per_unit = 1.0
     def _unit_to_meters(value: float, unit: Optional[str]) -> float:
         if unit is None:
             return float(value)
@@ -892,8 +894,8 @@ def apply_stage_anchor_transform(
             return float(value)
         return float(value) * factor
 
-    bp_easting_m = bp_northing_m = bp_height_m = 0.0
     bp_unit = None
+    bp_easting_m = bp_northing_m = bp_height_m = 0.0
     if base_point is not None:
         bp_unit = base_point.unit or "m"
         bp_easting_m = _unit_to_meters(base_point.easting, bp_unit)
@@ -905,15 +907,17 @@ def apply_stage_anchor_transform(
     rotation_deg = 0.0
 
     if map_conv is not None:
+        scale = float(getattr(map_conv, "scale", 1.0) or 1.0)
+        eastings_m = float(getattr(map_conv, "eastings", 0.0) or 0.0) * scale
+        northings_m = float(getattr(map_conv, "northings", 0.0) or 0.0) * scale
+        ortho_height_m = float(getattr(map_conv, "orthogonal_height", 0.0) or 0.0) * scale
         if base_point is not None:
-            scale = float(getattr(map_conv, "scale", 1.0) or 1.0)
-            try:
-                local_x, local_y = map_conv.map_to_local_xy(bp_easting_m, bp_northing_m)
-            except Exception:
-                local_x = bp_easting_m * scale
-                local_y = bp_northing_m * scale
-            map_ortho_height = float(getattr(map_conv, "orthogonal_height", 0.0) or 0.0)
-            local_z = (bp_height_m - map_ortho_height) * scale
+            d_e = bp_easting_m - eastings_m
+            d_n = bp_northing_m - northings_m
+            ax, ay = map_conv.normalized_axes()
+            local_x = ax * d_e + ay * d_n
+            local_y = -ay * d_e + ax * d_n
+            local_z = bp_height_m - ortho_height_m
             translation_stage = Gf.Vec3d(
                 -local_x / stage_meters_per_unit,
                 -local_y / stage_meters_per_unit,
@@ -944,18 +948,34 @@ def apply_stage_anchor_transform(
             "translation_stage_units": [float(translation_stage[i]) for i in range(3)],
             "rotation_degrees": float(rotation_deg),
             "applied_projected_crs": projected_crs or "",
-            "base_point_unit": bp_unit or "",
-        },
-    )
+        "base_point_unit": bp_unit or "",
+        "base_point_easting_m": float(bp_easting_m),
+        "base_point_northing_m": float(bp_northing_m),
+        "base_point_height_m": float(bp_height_m),
+        "map_conversion_scale": float(getattr(map_conv, "scale", 1.0) or 1.0) if map_conv else None,
+    },
+)
 
     if lonlat is not None:
-        attr_lon = world_prim.CreateAttribute("ifc:longitude", Sdf.ValueTypeNames.Double)
-        attr_lon.Set(float(lonlat.longitude))
-        attr_lat = world_prim.CreateAttribute("ifc:latitude", Sdf.ValueTypeNames.Double)
-        attr_lat.Set(float(lonlat.latitude))
-        if lonlat.height is not None:
-            attr_h = world_prim.CreateAttribute("ifc:ellipsoidalHeight", Sdf.ValueTypeNames.Double)
-            attr_h.Set(float(lonlat.height))
+        longitude = float(lonlat.longitude)
+        latitude = float(lonlat.latitude)
+        height_val = float(lonlat.height) if lonlat.height is not None else None
+        for attr_name, value in (
+            ("ifc:longitude", longitude),
+            ("ifc:latitude", latitude),
+        ):
+            attr = world_prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Double)
+            attr.Set(value)
+        if height_val is not None:
+            attr = world_prim.CreateAttribute("ifc:ellipsoidalHeight", Sdf.ValueTypeNames.Double)
+            attr.Set(height_val)
+        cesium_lon = world_prim.CreateAttribute("CesiumLongitude", Sdf.ValueTypeNames.Double)
+        cesium_lon.Set(longitude)
+        cesium_lat = world_prim.CreateAttribute("CesiumLatitude", Sdf.ValueTypeNames.Double)
+        cesium_lat.Set(latitude)
+        if height_val is not None:
+            cesium_h = world_prim.CreateAttribute("CesiumHeight", Sdf.ValueTypeNames.Double)
+            cesium_h.Set(height_val)
 
 
 # ---------------- Federated master view — stub (retain signature) ----------------
