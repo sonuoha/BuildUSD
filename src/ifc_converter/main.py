@@ -619,6 +619,14 @@ def _collect_ifc_paths_nucleus(
     return targets
 
 def _ensure_ifc_name(name: str) -> str:
+    """Strips and normalises an IFC file name, appending '.ifc' if necessary.
+
+    Args:
+        name: The IFC file name to normalise.
+
+    Returns:
+        A trimmed and normalised IFC file name (with '.ifc' appended if necessary).
+    """
     trimmed = (name or "").strip()
     if not trimmed: return trimmed
     if not trimmed.lower().endswith(".ifc"): trimmed = f"{trimmed}.ifc"
@@ -643,6 +651,7 @@ def _manifest_key_for_path(path: PathLike) -> Path:
         uri = str(path); stripped = uri.split("://", 1)[-1]
         return PurePosixPath(stripped)
     return Path(str(path)).resolve()
+
 # ------------- layout + checkpoint -------------
 def _build_output_layout(output_root: PathLike, base_name: str, usd_format: str) -> _OutputLayout:
     ensure_directory(output_root)
