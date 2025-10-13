@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import tempfile
 import sys
 from dataclasses import dataclass, replace
@@ -53,15 +52,17 @@ LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT_ROOT = Path(r"C:\Users\samue\_dev\datasets\ifc\tvc").resolve()
 DEFAULT_OUTPUT_ROOT = ROOT / "data" / "output"
+
+# ---------------- constants ----------------
 OPTIONS = ConversionOptions(
     enable_instancing=True,
-    enable_hash_dedup=False,
+    enable_hash_dedup=True,
     convert_metadata=True,
 )
 DEFAULT_MASTER_STAGE = "Federated Model.usda"
 DEFAULT_USD_FORMAT = "usdc"
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
-DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB = 500.0
+DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB = 50.0
 DEFAULT_GEODETIC_CRS = "EPSG:4326"
 DEFAULT_BASE_POINT = BasePointConfig(
     easting=333800.4900,
@@ -220,7 +221,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     return parser.parse_args(argv)
 # ------------- helpers -------------
-_WIDTH_VALUE_RE = re.compile(r"^\s*(?P<value>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(?P<unit>[A-Za-z]+)?\s*$")
 def _strip_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
@@ -231,6 +231,99 @@ from .process_usd import (
     _rules_from_config_payload,
     _sublayer_identifier,
 )  # reuse exact logic
+
+
+def _parse_annotation_width_rule_spec(spec: str, *, index: int) -> CurveWidthRule:
+    """Parse a --annotation-width-rule specification into a CurveWidthRule."""
+    if not spec or "=" not in spec:
+        raise ValueError(
+            f"--annotation-width-rule #{index}: expected comma-separated key=value pairs; got {spec!r}."
+        )
+    mapping: dict[str, Any] = {}
+    for raw_part in spec.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        key, sep, value = part.partition("=")
+        if not sep:
+            raise ValueError(
+                f"--annotation-width-rule #{index}: segment {raw_part!r} is missing '='."
+            )
+        key_norm = key.strip().lower()
+        if not key_norm:
+            raise ValueError(
+                f"--annotation-width-rule #{index}: segment {raw_part!r} has an empty key."
+            )
+        value_norm = _strip_quotes(value.strip())
+        mapping[key_norm] = value_norm
+    if "width" not in mapping:
+        raise ValueError(f"--annotation-width-rule #{index}: missing required 'width=' entry.")
+    return _rule_from_mapping(mapping, context=f"--annotation-width-rule #{index}")
+
+
+def _load_annotation_width_config(path: PathLike) -> list[CurveWidthRule]:
+    """Load annotation width rules from a JSON or YAML configuration file."""
+    source = str(path)
+    try:
+        text = read_text(path)
+    except Exception as exc:
+        raise ValueError(f"Failed to read annotation width config {source}: {exc}") from exc
+    suffix = (path_suffix(path) or "").lower()
+    payload: Any | None = None
+    errors: list[str] = []
+    parse_order: tuple[str, ...]
+    if suffix in {".yaml", ".yml"}:
+        parse_order = ("yaml", "json")
+    elif suffix == ".json":
+        parse_order = ("json", "yaml")
+    else:
+        parse_order = ("json", "yaml")
+    for fmt in parse_order:
+        if fmt == "json":
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as exc:
+                errors.append(f"JSON: {exc}")
+                payload = None
+            else:
+                break
+        elif fmt == "yaml":
+            try:
+                import yaml  # type: ignore
+            except ImportError as exc:
+                errors.append(f"YAML: PyYAML not installed ({exc}).")
+                continue
+            try:
+                payload = yaml.safe_load(text)
+            except Exception as exc:
+                errors.append(f"YAML: {exc}")
+                payload = None
+            else:
+                break
+    if payload is None:
+        detail = "; ".join(errors) if errors else "no parser succeeded"
+        raise ValueError(f"Failed to parse annotation width config {source}: {detail}.")
+    return _rules_from_config_payload(payload, source=source)
+
+
+def _gather_annotation_width_rules(args: argparse.Namespace) -> tuple[CurveWidthRule, ...]:
+    """Return ordered curve-width rules based on CLI defaults, configs, and overrides."""
+    rules: list[CurveWidthRule] = []
+    default_spec = getattr(args, "annotation_width_default", None)
+    if default_spec:
+        rules.append(
+            _rule_from_mapping(
+                {"width": default_spec},
+                context="--annotation-width-default",
+            )
+        )
+    config_paths = tuple(getattr(args, "annotation_width_configs", None) or ())
+    for config_path in config_paths:
+        rules.extend(_load_annotation_width_config(config_path))
+    inline_specs = tuple(getattr(args, "annotation_width_rules", None) or ())
+    for index, spec in enumerate(inline_specs, start=1):
+        rules.append(_parse_annotation_width_rule_spec(spec, index=index))
+    return tuple(rules)
 # ------------- core convert -------------
 def convert(
     input_path: PathLike,
@@ -1033,9 +1126,17 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv)
     try:
-        # width rules are parsed inside process_usd; keep the exact CLI but we reuse helpers
-        width_rules = []
-        options_override = replace(OPTIONS, curve_width_rules=tuple(width_rules)) if width_rules else OPTIONS
+        width_rules = _gather_annotation_width_rules(args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        shutdown_usd_context()
+        raise SystemExit(2) from exc
+    if width_rules:
+        LOG.info("Loaded %d annotation width rule(s).", len(width_rules))
+        for idx, rule in enumerate(width_rules, start=1):
+            LOG.debug("Annotation width rule %d: %s", idx, rule)
+    options_override = replace(OPTIONS, curve_width_rules=width_rules) if width_rules else OPTIONS
+    try:
         results = convert(
             args.input_path,
             output_dir=args.output_dir,
