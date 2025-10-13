@@ -622,10 +622,13 @@ def author_material_layer(
                         shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.emissive_color))
                     surface_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
                     material_prim.CreateSurfaceOutput().ConnectToSource(surface_output)
-                    material_prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(
+                    material_usd_prim = material_prim.GetPrim()
+                    material_usd_prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(
                         Gf.Vec3f(*props.display_color)
                     )
-                    material_prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(float(props.opacity))
+                    material_usd_prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(
+                        float(props.opacity)
+                    )
                     log.debug(
                         "Authored material %s (color=%.3f,%.3f,%.3f opacity=%.3f)",
                         material_prim_path,
