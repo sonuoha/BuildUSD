@@ -3,7 +3,7 @@ IFC → USD Converter (Federated)
 Overview
 - Converts IFC files to USD with prototypes, materials, and instances.
 - Adds WGS84 geolocation attributes to /World.
-- Builds a federated master stage (Federated Model.usda) that payloads each per-file stage under /World/<discipline>.
+- Provides a separate federation CLI (`python -m ifc_converter.federate`) that assembles per-file stages into project master files without touching conversion outputs.
 - Authors IFC properties/quantities as USD attributes under a BIMData namespace.
 
 Requirements
@@ -64,6 +64,9 @@ Usage (CLI)
 - Manifest-driven base points / federated routing:
   - python -m ifc_converter --input C:\\path\\to\\dir --all --manifest src/ifc_converter/config/sample_manifest.json
   - python -m ifc_converter --input C:\\path\\to\\dir --all --manifest src/ifc_converter/config/sample_manifest.yaml
+- Assemble masters after conversion:
+  - python -m ifc_converter.federate --stage-root data/output --manifest src/ifc_converter/config/sample_manifest.json
+  - python -m ifc_converter.federate --stage-root data/output --manifest src/ifc_converter/config/sample_manifest.yaml --masters-root data/federated
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m ifc_converter --input omniverse://server/Projects/IFC --all
 - Annotation curve widths:
@@ -92,9 +95,9 @@ Outputs
     - /World/<file>_Instances preserves the IFC spatial hierarchy (Project/Site/Storey/Class).
     - Optional grouping variants (see src/ifc_converter/process_usd.py:author_instance_grouping_variant) can reorganize instances on demand without losing the canonical hierarchy.
   - caches/<name>.json stores serialized instance metadata for later regrouping sessions.
-- Federated master stage:
-  - Federated Model.usda: contains a /World default prim.
-  - Each IFC adds a child prim /World/<name> with an inactive payload to that file's default prim.
+- Optional federated masters (run `python -m ifc_converter.federate --manifest ...` after conversion):
+  - Creates master stage(s) defined in the manifest without overwriting per-file outputs.
+  - Each converted stage is referenced beneath `/World/<stage_name>` (inactive by default) so you can compose projects on demand.
 
 Annotation Curve Width Overrides
 - Control the `UsdGeom.BasisCurves` widths authored in geometry2d layers via `--annotation-width-default`, repeated `--annotation-width-rule`, or config files supplied with `--annotation-width-config`.
@@ -149,7 +152,7 @@ hierarchies:
 Units and Geospatial
 - Per-file stages author metersPerUnit as needed; WGS84 (lon/lat/height) are authored on /World as Double attributes:
   - cesium:georeferenceOrigin:longitude, cesium:georeferenceOrigin:latitude, cesium:georeferenceOrigin:height
-- Federated Model.usda is authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
+- Federated masters created via `ifc_converter.federate` are authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
 
 IFC Metadata as USD Attributes
 - IFC psets/qtos are authored as attributes (not customData) using:
@@ -157,10 +160,10 @@ IFC Metadata as USD Attributes
   - BIMData:QTO:<QtoName>:<PropName>
 - Types are inferred (Bool/Int/Double and arrays; fallback String).
 
-Federated Stage Behavior
-- Each converted USD stage is added as a payload under /World/<file_stem> in Federated Model.usda.
+Federated Stage Behavior (via `ifc_converter.federate`)
+- Each converted USD stage is referenced as a payload under `/World/<file_stem>` in the manifest-selected master stage.
 - Payload prims are authored inactive (unloaded by default). Activate to load content.
-- Targets the payload stage’s default prim to avoid /World nesting when possible.
+- The payload targets the stage's default prim so additional `/World` nesting is avoided when possible.
 
 Programmatic Use
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
