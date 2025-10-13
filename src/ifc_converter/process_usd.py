@@ -14,6 +14,7 @@ from textwrap import dedent
 import fnmatch
 import json
 import re
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -386,6 +387,167 @@ def _prototype_materials(caches: PrototypeCaches, key: PrototypeKey) -> List[Any
     return list(getattr(proto, "materials", []) or [])
 
 
+@dataclass(frozen=True)
+class _MaterialProperties:
+    name: str
+    display_color: Tuple[float, float, float]
+    opacity: float
+    emissive_color: Optional[Tuple[float, float, float]] = None
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _resolve_color_value(obj: Any) -> Optional[Tuple[float, float, float]]:
+    """Extract an RGB tuple from various ifcopenshell colour representations."""
+    if obj is None:
+        return None
+    if isinstance(obj, (list, tuple)):
+        vals = [float(v) for v in obj[:3]]
+        if len(vals) == 3:
+            return tuple(vals)
+        return None
+    if isinstance(obj, dict):
+        for keys in (("Red", "Green", "Blue"), ("R", "G", "B"), ("red", "green", "blue"), ("x", "y", "z")):
+            if all(k in obj for k in keys):
+                try:
+                    vals = [float(obj[k]) for k in keys]
+                    return tuple(vals[:3])
+                except Exception:
+                    continue
+        return None
+    for attr_set in (("Red", "Green", "Blue"), ("R", "G", "B"), ("red", "green", "blue")):
+        values = []
+        success = True
+        for attr in attr_set:
+            if hasattr(obj, attr):
+                component = getattr(obj, attr)
+                component_val = _as_float(component)
+                if component_val is None:
+                    success = False
+                    break
+                values.append(component_val)
+            else:
+                success = False
+                break
+        if success and len(values) == 3:
+            return tuple(values)
+    if hasattr(obj, "rgb"):
+        try:
+            values = obj.rgb
+            if isinstance(values, (list, tuple)) and len(values) >= 3:
+                return tuple(float(v) for v in values[:3])
+        except Exception:
+            pass
+    return None
+
+
+def _extract_material_properties(
+    material: Any,
+    *,
+    prototype_label: str,
+    index: int,
+) -> Optional[_MaterialProperties]:
+    """Derive a usable material definition from an ifcopenshell geometry material."""
+    def _get_value(obj: Any, *names: str) -> Any:
+        for name in names:
+            if isinstance(obj, dict) and name in obj:
+                value = obj[name]
+                if value is not None:
+                    return value
+            elif hasattr(obj, name):
+                value = getattr(obj, name)
+                if value is not None:
+                    return value
+        return None
+
+    name_value = _get_value(material, "name", "Name", "label", "Label", "description", "Description")
+    if isinstance(name_value, str):
+        name_value = name_value.strip()
+    if not name_value:
+        name_value = f"{prototype_label}_Material_{index + 1}"
+
+    color_source = _get_value(
+        material,
+        "diffuse_color",
+        "DiffuseColor",
+        "DiffuseColour",
+        "diffuseColour",
+        "albedo",
+        "AlbedoColor",
+        "Color",
+        "colour",
+    )
+    color = _resolve_color_value(color_source)
+    if color is None:
+        color = _resolve_color_value(material)
+    if color is None:
+        color = (0.8, 0.8, 0.8)
+    max_component = max(color)
+    if max_component > 1.0:
+        # Assume 0-255 range; normalise to 0-1
+        color = tuple(float(c) / 255.0 for c in color)
+    display_color = _normalize_color(tuple(float(c) for c in color))
+
+    transparency = _get_value(
+        material,
+        "transparency",
+        "Transparency",
+        "TransparencyFactor",
+        "transparencyFactor",
+    )
+    opacity_value: Optional[float] = None
+    if transparency is not None:
+        transparency_float = _as_float(transparency)
+        if transparency_float is not None:
+            opacity_value = 1.0 - transparency_float
+    opacity_attr = _get_value(material, "opacity", "Opacity", "Alpha")
+    if opacity_attr is not None:
+        opacity_candidate = _as_float(opacity_attr)
+        if opacity_candidate is not None:
+            opacity_value = opacity_candidate
+    if opacity_value is None:
+        opacity_value = 1.0
+    opacity = max(0.0, min(1.0, float(opacity_value)))
+
+    emissive_source = _get_value(
+        material,
+        "emissive_color",
+        "EmissiveColor",
+        "EmissionColor",
+        "Emission",
+    )
+    emissive_color = _resolve_color_value(emissive_source)
+    if emissive_color is not None:
+        max_emissive = max(emissive_color)
+        if max_emissive > 1.0:
+            emissive_color = tuple(float(c) / 255.0 for c in emissive_color)
+        emissive_color = _normalize_color(tuple(float(c) for c in emissive_color))
+
+    return _MaterialProperties(
+        name=name_value,
+        display_color=display_color,
+        opacity=opacity,
+        emissive_color=emissive_color,
+    )
+
+
+def _material_signature(props: _MaterialProperties) -> Tuple[Any, ...]:
+    emissive = tuple(round(c, 5) for c in props.emissive_color) if props.emissive_color else None
+    return (
+        tuple(round(c, 5) for c in props.display_color),
+        round(props.opacity, 5),
+        emissive,
+        sanitize_name(props.name, fallback="Material").lower(),
+    )
+
+
 def author_material_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
@@ -401,6 +563,7 @@ def author_material_layer(
     changing any public signatures.
     """
     material_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
+    log = logging.getLogger(__name__)
 
     root_layer = stage.GetRootLayer()
     root_sub_path = _sublayer_identifier(root_layer, layer_path)
@@ -414,11 +577,72 @@ def author_material_layer(
     material_root = Sdf.Path("/World/__Materials")
     material_paths: Dict[PrototypeKey, List[Sdf.Path]] = {}
     used_names: Dict[str, int] = {}
+    authored_signatures: Dict[Tuple[Any, ...], Sdf.Path] = {}
 
     with Usd.EditContext(stage, material_layer):
         UsdGeom.Scope.Define(stage, material_root)
-        # Intentionally left minimal; bind later if you need.
-        # Return empty mapping to keep caller logic intact.
+
+        for key, proto in _iter_prototypes(caches):
+            proto_path = proto_paths.get(key)
+            if proto_path is None:
+                continue
+            materials = _prototype_materials(caches, key)
+            if not materials:
+                continue
+
+            proto_label = sanitize_name(proto_path.name, fallback="Prototype")
+            material_prims: List[Sdf.Path] = []
+
+            for idx, material in enumerate(materials):
+                props = _extract_material_properties(material, prototype_label=proto_label, index=idx)
+                if props is None:
+                    continue
+                signature = _material_signature(props)
+                material_prim_path = authored_signatures.get(signature)
+                if material_prim_path is None:
+                    base_name = sanitize_name(props.name, fallback=f"{proto_label}_Material")
+                    count = used_names.get(base_name, 0)
+                    used_names[base_name] = count + 1
+                    if count:
+                        token = f"{base_name}_{count}"
+                    else:
+                        token = base_name
+                    material_prim_path = material_root.AppendChild(token)
+                    authored_signatures[signature] = material_prim_path
+
+                    material_prim = UsdShade.Material.Define(stage, material_prim_path)
+                    shader_path = material_prim_path.AppendChild("PreviewSurface")
+                    shader = UsdShade.Shader.Define(stage, shader_path)
+                    shader.CreateIdAttr("UsdPreviewSurface")
+                    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.display_color))
+                    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+                    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.5)
+                    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(props.opacity))
+                    if props.emissive_color:
+                        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.emissive_color))
+                    material_prim.CreateSurfaceOutput().ConnectToSource(shader, "surface")
+                    material_prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(
+                        Gf.Vec3f(*props.display_color)
+                    )
+                    material_prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(float(props.opacity))
+                    log.debug(
+                        "Authored material %s (color=%.3f,%.3f,%.3f opacity=%.3f)",
+                        material_prim_path,
+                        props.display_color[0],
+                        props.display_color[1],
+                        props.display_color[2],
+                        props.opacity,
+                    )
+
+                material_prims.append(material_prim_path)
+
+            if material_prims:
+                material_paths[key] = material_prims
+                log.debug(
+                    "Prototype %s uses %d material(s)",
+                    proto_path,
+                    len(material_prims),
+                )
 
     return material_layer, material_paths
 
@@ -446,6 +670,24 @@ def bind_materials_to_prototypes(
             if not mat_prim:
                 continue
             UsdShade.MaterialBindingAPI(mesh_prim).Bind(UsdShade.Material(mat_prim))
+            display_attr = mat_prim.GetAttribute("displayColor")
+            if display_attr and display_attr.HasAuthoredValue():
+                try:
+                    color_value = display_attr.Get()
+                except Exception:
+                    color_value = None
+                if color_value is not None:
+                    if isinstance(color_value, Gf.Vec3f):
+                        color_vec = color_value
+                    else:
+                        try:
+                            color_vec = Gf.Vec3f(float(color_value[0]), float(color_value[1]), float(color_value[2]))
+                        except Exception:
+                            color_vec = None
+                    if color_vec is not None:
+                        mesh_geom = UsdGeom.Mesh(mesh_prim)
+                        mesh_display_attr = mesh_geom.GetDisplayColorAttr()
+                        mesh_display_attr.Set(Vt.Vec3fArray([color_vec]))
 
 
 # ---------------- Instance authoring ----------------
