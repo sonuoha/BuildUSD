@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import tempfile
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Sequence, Union
@@ -59,7 +60,8 @@ OPTIONS = ConversionOptions(
 )
 DEFAULT_MASTER_STAGE = "Federated Model.usda"
 DEFAULT_USD_FORMAT = "usdc"
-USD_FORMAT_CHOICES = ("usdc", "usda", "usd")
+USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
+DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB = 500.0
 DEFAULT_GEODETIC_CRS = "EPSG:4326"
 DEFAULT_BASE_POINT = BasePointConfig(
     easting=333800.4900,
@@ -204,7 +206,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="usd_format",
         choices=USD_FORMAT_CHOICES,
         default=DEFAULT_USD_FORMAT,
-        help="Output USD format to use (default: %(default)s)",
+        help="Output USD format to use (default: %(default)s). Use 'auto' to heuristically pick between USDA and USDC.",
+    )
+    parser.add_argument(
+        "--usd-auto-binary-threshold-mb",
+        dest="usd_auto_binary_threshold_mb",
+        type=float,
+        default=DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB,
+        help=(
+            "When using --usd-format usda, re-export layers as usdc when the file exceeds this many megabytes "
+            "(set to 0 to disable; default: %(default)s). Auto mode also relies on this threshold for its heuristic."
+        ),
     )
     return parser.parse_args(argv)
 # ------------- helpers -------------
@@ -213,7 +225,12 @@ def _strip_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
-from .process_usd import _rule_from_mapping, _rules_from_config_payload  # reuse exact logic
+from .process_usd import (
+    _layer_identifier,
+    _rule_from_mapping,
+    _rules_from_config_payload,
+    _sublayer_identifier,
+)  # reuse exact logic
 # ------------- core convert -------------
 def convert(
     input_path: PathLike,
@@ -227,6 +244,7 @@ def convert(
     exclude_names: Sequence[str] | None = None,
     options: ConversionOptions | None = None,
     usd_format: str = DEFAULT_USD_FORMAT,
+    usd_auto_binary_threshold_mb: float | None = DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB,
     logger: logging.Logger | None = None,
     checkpoint: bool = False,
     offline: bool = False,
@@ -256,6 +274,11 @@ def convert(
         initialize_usd(offline=False)
     ensure_directory(output_root)
     usd_format_normalized = _normalise_usd_format(usd_format)
+    auto_binary_threshold = (
+        usd_auto_binary_threshold_mb
+        if usd_auto_binary_threshold_mb is not None and usd_auto_binary_threshold_mb > 0
+        else None
+    )
     manifest_obj = manifest
     if manifest_path:
         if is_omniverse_path(manifest_path):
@@ -305,6 +328,7 @@ def convert(
                 logger=log,
                 checkpoint=checkpoint,
                 usd_format=usd_format_normalized,
+                usd_auto_binary_threshold_mb=auto_binary_threshold,
             )
         except Exception as exc:
             log.error(
@@ -538,6 +562,8 @@ def _build_output_layout(output_root: PathLike, base_name: str, usd_format: str)
     for directory in (prototypes_dir, materials_dir, instances_dir, geometry2d_dir, caches_dir):
         ensure_directory(directory)
     ext = _normalise_usd_format(usd_format)
+    if ext == "auto":
+        raise ValueError("Auto USD format must be resolved before building the output layout.")
     stage_path = join_path(output_root, f"{base_name}.{ext}")
     ensure_parent_directory(stage_path)
     return _OutputLayout(
@@ -548,6 +574,297 @@ def _build_output_layout(output_root: PathLike, base_name: str, usd_format: str)
         geometry2d=join_path(geometry2d_dir, f"{base_name}_geometry2d.{ext}"),
         cache_dir=caches_dir,
     )
+
+
+def _update_sublayer_reference(
+    root_layer,
+    old_reference: str,
+    new_reference: str,
+    label: str,
+    logger: logging.Logger,
+) -> bool:
+    """Replace a subLayerPaths entry, returning True when an update occurred."""
+    if old_reference == new_reference:
+        return False
+    try:
+        existing = list(root_layer.subLayerPaths)
+    except Exception as exc:
+        logger.debug("Unable to read subLayerPaths while updating %s layer: %s", label, exc)
+        return False
+    try:
+        index = existing.index(old_reference)
+    except ValueError:
+        logger.debug(
+            "Expected %s sublayer reference %s not present; skipping update to %s",
+            label,
+            old_reference,
+            new_reference,
+        )
+        return False
+    existing[index] = new_reference
+    root_layer.subLayerPaths = existing
+    return True
+
+
+BYTES_PER_MB = 1024 * 1024
+
+
+@dataclass(slots=True)
+class _AutoFormatEstimate:
+    mesh_bytes: int
+    prototype_count: int
+    hash_count: int
+    instance_count: int
+    annotation_count: int
+
+
+def _estimate_array_nbytes(value: Any) -> int:
+    """Best-effort byte size estimate for array-like payloads."""
+    if value is None:
+        return 0
+    if hasattr(value, "nbytes"):
+        try:
+            return int(value.nbytes)
+        except Exception:
+            pass
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    if isinstance(value, (list, tuple)):
+        total = 0
+        for item in value:
+            if isinstance(item, (list, tuple)):
+                total += _estimate_array_nbytes(item)
+            elif isinstance(item, (bytes, bytearray, memoryview)):
+                total += len(item)
+            elif isinstance(item, (int, float)):
+                total += 8
+            else:
+                total += _estimate_array_nbytes(item)
+        return total
+    try:
+        return int(sys.getsizeof(value))
+    except Exception:
+        return 0
+
+
+def _estimate_mesh_payload_bytes(mesh: Any) -> int:
+    """Return summed byte estimates for mesh dictionary payloads."""
+    if mesh is None:
+        return 0
+    if isinstance(mesh, dict):
+        return sum(_estimate_array_nbytes(v) for v in mesh.values())
+    return _estimate_array_nbytes(mesh)
+
+
+def _estimate_auto_payload(caches: PrototypeCaches) -> _AutoFormatEstimate:
+    """Aggregate lightweight metrics used for auto USD format heuristics."""
+    prototype_mesh_bytes = 0
+    for proto in caches.repmaps.values():
+        prototype_mesh_bytes += _estimate_mesh_payload_bytes(getattr(proto, "mesh", None))
+    for proto in caches.hashes.values():
+        prototype_mesh_bytes += _estimate_mesh_payload_bytes(getattr(proto, "mesh", None))
+    annotation_count = len(getattr(caches, "annotations", {}) or {})
+    return _AutoFormatEstimate(
+        mesh_bytes=prototype_mesh_bytes,
+        prototype_count=len(caches.repmaps),
+        hash_count=len(caches.hashes),
+        instance_count=len(caches.instances),
+        annotation_count=annotation_count,
+    )
+
+
+def _select_auto_usd_format(
+    caches: PrototypeCaches,
+    *,
+    threshold_mb: float | None,
+    base_name: str,
+    logger: logging.Logger,
+) -> tuple[str, _AutoFormatEstimate]:
+    """Choose an authoring format based on heuristic cache metrics."""
+    estimate = _estimate_auto_payload(caches)
+    threshold_bytes: int | None = None
+    if threshold_mb is not None and threshold_mb > 0:
+        threshold_bytes = int(threshold_mb * BYTES_PER_MB)
+    estimate_mb = estimate.mesh_bytes / BYTES_PER_MB if estimate.mesh_bytes else 0.0
+
+    if threshold_bytes is None:
+        chosen = DEFAULT_USD_FORMAT
+        logger.warning(
+            "Auto USD format for %s: threshold disabled, defaulting to %s. "
+            "Heuristic mesh payload sum ≈ %.1f MB; actual USD size may differ.",
+            base_name,
+            chosen.upper(),
+            estimate_mb,
+        )
+        return chosen, estimate
+
+    if estimate.mesh_bytes >= threshold_bytes:
+        chosen = "usdc"
+        logger.warning(
+            "Auto USD format for %s: summed prototype mesh array nbytes ≈ %.1f MB exceeds threshold %.1f MB; "
+            "selecting USDC. This decision is heuristic—the final USD size may vary.",
+            base_name,
+            estimate_mb,
+            threshold_mb,
+        )
+    else:
+        chosen = "usda"
+        logger.info(
+            "Auto USD format for %s: summed prototype mesh array nbytes ≈ %.1f MB below threshold %.1f MB; "
+            "selecting USDA. This decision is heuristic—the final USD size may vary.",
+            base_name,
+            estimate_mb,
+            threshold_mb,
+        )
+    logger.debug(
+        "Auto USD heuristic details for %s: prototypes=%d, hashed=%d, instances=%d, annotations=%d, mesh_bytes=%d.",
+        base_name,
+        estimate.prototype_count,
+        estimate.hash_count,
+        estimate.instance_count,
+        estimate.annotation_count,
+        estimate.mesh_bytes,
+    )
+    return chosen, estimate
+
+
+def _maybe_convert_layers_to_usdc(
+    stage,
+    layout: _OutputLayout,
+    *,
+    proto_layer,
+    material_layer,
+    inst_layer,
+    geometry2d_layer,
+    threshold_mb: float,
+    logger: logging.Logger,
+) -> tuple[_OutputLayout, list[Path]]:
+    """Convert large text-based layers to usdc when they exceed the configured threshold."""
+    threshold_bytes = int(max(threshold_mb, 0.0) * 1024 * 1024)
+    if threshold_bytes <= 0:
+        return layout, []
+    root_layer = stage.GetRootLayer()
+    paths_to_remove: list[Path] = []
+    sublayers_modified = False
+
+    def _convert_layer(layer_obj, current_path: PathLike, label: str) -> PathLike:
+        nonlocal sublayers_modified
+        if layer_obj is None:
+            return current_path
+        path_str = str(current_path)
+        if is_omniverse_path(path_str):
+            return current_path
+        path_obj = Path(path_str)
+        if not path_obj.exists():
+            return current_path
+        suffix = path_obj.suffix.lower()
+        if suffix in {".usd", ".usdc"}:
+            return current_path
+        try:
+            size_bytes = path_obj.stat().st_size
+        except OSError as exc:
+            logger.debug("Unable to stat %s layer at %s: %s", label, path_obj, exc)
+            return current_path
+        if size_bytes <= threshold_bytes:
+            return current_path
+        target_path = path_obj.with_suffix(".usdc")
+        try:
+            layer_obj.Export(_layer_identifier(target_path), args={"format": "usdc"})
+        except Exception as exc:
+            logger.warning(
+                "Failed to re-export %s layer %s as usdc: %s", label, path_obj, exc
+            )
+            return current_path
+        size_mb = size_bytes / (1024 * 1024)
+        logger.info(
+            "%s layer %s exceeded %.1f MB (%.1f MB actual); switched to %s",
+            label.capitalize(),
+            path_obj,
+            threshold_mb,
+            size_mb,
+            target_path,
+        )
+        old_ref = _sublayer_identifier(root_layer, current_path)
+        new_ref = _sublayer_identifier(root_layer, target_path)
+        if _update_sublayer_reference(root_layer, old_ref, new_ref, label, logger):
+            sublayers_modified = True
+        if not is_omniverse_path(path_str):
+            paths_to_remove.append(path_obj)
+        return target_path
+
+    new_prototypes = _convert_layer(proto_layer, layout.prototypes, "prototype")
+    new_materials = _convert_layer(material_layer, layout.materials, "material")
+    new_instances = _convert_layer(inst_layer, layout.instances, "instance")
+    new_geometry2d = (
+        _convert_layer(geometry2d_layer, layout.geometry2d, "geometry2d")
+        if geometry2d_layer is not None
+        else layout.geometry2d
+    )
+
+    updated_layout = replace(
+        layout,
+        prototypes=new_prototypes,
+        materials=new_materials,
+        instances=new_instances,
+        geometry2d=new_geometry2d,
+    )
+
+    stage_converted = False
+    stage_path_str = str(updated_layout.stage)
+    if not is_omniverse_path(stage_path_str):
+        stage_path_obj = Path(stage_path_str)
+        if stage_path_obj.exists() and stage_path_obj.suffix.lower() == ".usda":
+            try:
+                stage_size = stage_path_obj.stat().st_size
+            except OSError as exc:
+                logger.debug("Unable to stat stage layer at %s: %s", stage_path_obj, exc)
+            else:
+                if stage_size > threshold_bytes:
+                    target_stage_path = stage_path_obj.with_suffix(".usdc")
+                    try:
+                        root_layer.Export(_layer_identifier(target_stage_path), args={"format": "usdc"})
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to re-export stage %s as usdc: %s",
+                            stage_path_obj,
+                            exc,
+                        )
+                    else:
+                        size_mb = stage_size / (1024 * 1024)
+                        logger.info(
+                            "Stage %s exceeded %.1f MB (%.1f MB actual); switched to %s",
+                            stage_path_obj.name,
+                            threshold_mb,
+                            size_mb,
+                            target_stage_path,
+                        )
+                        updated_layout = replace(updated_layout, stage=target_stage_path)
+                        paths_to_remove.append(stage_path_obj)
+                        stage_converted = True
+
+    if sublayers_modified and not stage_converted:
+        try:
+            root_layer.Save()
+        except Exception as exc:
+            logger.warning("Failed to persist updated sublayer references: %s", exc)
+
+    return updated_layout, paths_to_remove
+
+
+def _cleanup_paths(paths: Sequence[Path], logger: logging.Logger) -> None:
+    """Best-effort removal of temporary files produced during auto conversion."""
+    for candidate in paths:
+        path_obj = candidate if isinstance(candidate, Path) else Path(str(candidate))
+        path_str = str(path_obj)
+        if is_omniverse_path(path_str):
+            continue
+        try:
+            if path_obj.exists():
+                path_obj.unlink()
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            logger.debug("Unable to remove temporary USD file %s: %s", path_obj, exc)
 def _make_checkpoint_metadata(revision: Optional[str], base_name: str) -> tuple[str, list[str]]:
     note = revision or f"{base_name}"; tag_src = revision or base_name
     tag_candidates = tag_src.replace(",", " ").split(); tags = [t.strip() for t in tag_candidates if t.strip()] or [base_name]
@@ -571,13 +888,13 @@ def _process_single_ifc(
     logger: logging.Logger,
     checkpoint: bool,
     usd_format: str = DEFAULT_USD_FORMAT,
+    usd_auto_binary_threshold_mb: float | None = DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB,
     default_base_point: BasePointConfig = DEFAULT_BASE_POINT,
     default_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
     default_master_stage: str = DEFAULT_MASTER_STAGE,
 ) -> ConversionResult:
     import ifcopenshell  # Local import
     base_name = path_stem(ifc_path)
-    layout = _build_output_layout(output_root, base_name, usd_format)
     revision_note = plan.revision if plan and plan.revision else None
     checkpoint_note: Optional[str] = None
     checkpoint_tags: list[str] = []
@@ -590,6 +907,15 @@ def _process_single_ifc(
             "IFC %s → %d type prototypes, %d hashed prototypes, %d instances",
             path_name(ifc_path), len(caches.repmaps), len(caches.hashes), len(caches.instances),
         )
+        authoring_format = _normalise_usd_format(usd_format)
+        if authoring_format == "auto":
+            authoring_format, _ = _select_auto_usd_format(
+                caches,
+                threshold_mb=usd_auto_binary_threshold_mb,
+                base_name=base_name,
+                logger=logger,
+            )
+        layout = _build_output_layout(output_root, base_name, authoring_format)
         stage = create_usd_stage(layout.stage)
         proto_layer, proto_paths = author_prototype_layer(stage, caches, layout.prototypes, base_name, options)
         mat_layer, material_paths = author_material_layer(
@@ -619,8 +945,24 @@ def _process_single_ifc(
         geodetic_result = assign_world_geolocation(
             stage, base_point=effective_base_point, projected_crs=projected_crs, geodetic_crs=geodetic_crs, unit_hint=effective_base_point.unit, lonlat_override=lonlat_override,
         )
-        stage.Save(); proto_layer.Save(); mat_layer.Save(); inst_layer.Save();
-        if geometry2d_layer: geometry2d_layer.Save()
+        stage.Save()
+        proto_layer.Save()
+        mat_layer.Save()
+        inst_layer.Save()
+        if geometry2d_layer:
+            geometry2d_layer.Save()
+        paths_to_cleanup: list[Path] = []
+        if authoring_format == "usda" and usd_auto_binary_threshold_mb and usd_auto_binary_threshold_mb > 0:
+            layout, paths_to_cleanup = _maybe_convert_layers_to_usdc(
+                stage,
+                layout,
+                proto_layer=proto_layer,
+                material_layer=mat_layer,
+                inst_layer=inst_layer,
+                geometry2d_layer=geometry2d_layer,
+                threshold_mb=usd_auto_binary_threshold_mb,
+                logger=logger,
+            )
         if checkpoint and checkpoint_note is not None:
             _checkpoint_path(layout.stage, checkpoint_note, checkpoint_tags, logger, f"{base_name} stage")
             _checkpoint_path(layout.prototypes, checkpoint_note, checkpoint_tags, logger, f"{base_name} prototypes layer")
@@ -628,10 +970,10 @@ def _process_single_ifc(
             _checkpoint_path(layout.instances, checkpoint_note, checkpoint_tags, logger, f"{base_name} instances layer")
             if geometry2d_layer:
                 _checkpoint_path(layout.geometry2d, checkpoint_note, checkpoint_tags, logger, f"{base_name} 2D geometry layer")
-        logger.info("Wrote stage %s", layout.stage)
+        logger.info("Wrote stage %s", str(layout.stage))
         master_stage_path = join_path(output_root, master_stage_name)
         ensure_parent_directory(master_stage_path)
-        update_federated_view(master_stage_path, layout.stage, base_name, parent_prim_path="/World")
+        update_federated_view(master_stage_path, str(layout.stage), base_name, parent_prim_path="/World")
         if checkpoint and checkpoint_note is not None:
             _checkpoint_path(master_stage_path, checkpoint_note, checkpoint_tags, logger, f"{base_name} master stage")
         counts = {
@@ -641,14 +983,31 @@ def _process_single_ifc(
             "total_elements": len(caches.instances) + len(getattr(caches, "annotations", {}) or {}),
         }
         layers = {
-            "prototype": proto_layer.identifier,
-            "material": mat_layer.identifier,
-            "instance": inst_layer.identifier,
-            "geometry2d": geometry2d_layer.identifier if geometry2d_layer else None,
+            "prototype": str(layout.prototypes),
+            "material": str(layout.materials),
+            "instance": str(layout.instances),
+            "geometry2d": str(layout.geometry2d) if geometry2d_layer else None,
         }
         if geometry2d_layer:
-            layers["annotation"] = geometry2d_layer.identifier
+            layers["annotation"] = str(layout.geometry2d)
         coordinates = tuple(geodetic_result) if geodetic_result else None
+        close_stage = getattr(stage, "Close", None)
+        if callable(close_stage):
+            try:
+                close_stage()
+            except Exception as exc:
+                logger.debug("stage.Close() failed for %s: %s", layout.stage, exc)
+        for layer_handle in (proto_layer, mat_layer, inst_layer, geometry2d_layer):
+            if layer_handle is None:
+                continue
+            close_layer = getattr(layer_handle, "Close", None)
+            if callable(close_layer):
+                try:
+                    close_layer()
+                except Exception as exc:
+                    identifier = getattr(layer_handle, "identifier", "<anonymous>")
+                    logger.debug("layer.Close() failed for %s: %s", identifier, exc)
+        _cleanup_paths(paths_to_cleanup, logger)
         return ConversionResult(
             ifc_path=ifc_path,
             stage_path=layout.stage,
@@ -689,6 +1048,7 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             offline=args.offline,
             options=options_override,
             usd_format=args.usd_format,
+            usd_auto_binary_threshold_mb=args.usd_auto_binary_threshold_mb,
         )
     finally:
         shutdown_usd_context()
