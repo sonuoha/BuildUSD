@@ -620,7 +620,8 @@ def author_material_layer(
                     shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(props.opacity))
                     if props.emissive_color:
                         shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.emissive_color))
-                    material_prim.CreateSurfaceOutput().ConnectToSource(shader, "surface")
+                    surface_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+                    material_prim.CreateSurfaceOutput().ConnectToSource(surface_output)
                     material_prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(
                         Gf.Vec3f(*props.display_color)
                     )
