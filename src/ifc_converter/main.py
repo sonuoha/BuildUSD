@@ -58,6 +58,8 @@ OPTIONS = ConversionOptions(
     convert_metadata=True,
 )
 DEFAULT_MASTER_STAGE = "Federated Model.usda"
+DEFAULT_USD_FORMAT = "usdc"
+USD_FORMAT_CHOICES = ("usdc", "usda", "usd")
 DEFAULT_GEODETIC_CRS = "EPSG:4326"
 DEFAULT_BASE_POINT = BasePointConfig(
     easting=333800.4900,
@@ -197,6 +199,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Path to a JSON or YAML file defining annotation curve width rules (may be provided multiple times).",
     )
+    parser.add_argument(
+        "--usd-format",
+        dest="usd_format",
+        choices=USD_FORMAT_CHOICES,
+        default=DEFAULT_USD_FORMAT,
+        help="Output USD format to use (default: %(default)s)",
+    )
     return parser.parse_args(argv)
 # ------------- helpers -------------
 _WIDTH_VALUE_RE = re.compile(r"^\s*(?P<value>[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*(?P<unit>[A-Za-z]+)?\s*$")
@@ -217,6 +226,7 @@ def convert(
     process_all: bool = False,
     exclude_names: Sequence[str] | None = None,
     options: ConversionOptions | None = None,
+    usd_format: str = DEFAULT_USD_FORMAT,
     logger: logging.Logger | None = None,
     checkpoint: bool = False,
     offline: bool = False,
@@ -245,6 +255,7 @@ def convert(
     else:
         initialize_usd(offline=False)
     ensure_directory(output_root)
+    usd_format_normalized = _normalise_usd_format(usd_format)
     manifest_obj = manifest
     if manifest_path:
         if is_omniverse_path(manifest_path):
@@ -293,6 +304,7 @@ def convert(
                 plan=plan,
                 logger=log,
                 checkpoint=checkpoint,
+                usd_format=usd_format_normalized,
             )
         except Exception as exc:
             log.error(
@@ -497,6 +509,18 @@ def _ensure_ifc_name(name: str) -> str:
     return trimmed
 def _is_ifc_candidate(name: str) -> bool:
     return (name or "").lower().endswith(".ifc")
+
+
+def _normalise_usd_format(fmt: str) -> str:
+    """Return a validated USD format string, defaulting when necessary."""
+    value = (fmt or DEFAULT_USD_FORMAT).lower()
+    if value not in USD_FORMAT_CHOICES:
+        logging.getLogger(__name__).warning(
+            "Unsupported usd_format %s; falling back to %s", fmt, DEFAULT_USD_FORMAT
+        )
+        return DEFAULT_USD_FORMAT
+    return value
+
 def _manifest_key_for_path(path: PathLike) -> Path:
     if isinstance(path, Path): return path.resolve()
     if is_omniverse_path(path):
@@ -504,7 +528,7 @@ def _manifest_key_for_path(path: PathLike) -> Path:
         return PurePosixPath(stripped)
     return Path(str(path)).resolve()
 # ------------- layout + checkpoint -------------
-def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout:
+def _build_output_layout(output_root: PathLike, base_name: str, usd_format: str) -> _OutputLayout:
     ensure_directory(output_root)
     prototypes_dir = join_path(output_root, "prototypes")
     materials_dir = join_path(output_root, "materials")
@@ -513,14 +537,15 @@ def _build_output_layout(output_root: PathLike, base_name: str) -> _OutputLayout
     caches_dir = join_path(output_root, "caches")
     for directory in (prototypes_dir, materials_dir, instances_dir, geometry2d_dir, caches_dir):
         ensure_directory(directory)
-    stage_path = join_path(output_root, f"{base_name}.usda")
+    ext = _normalise_usd_format(usd_format)
+    stage_path = join_path(output_root, f"{base_name}.{ext}")
     ensure_parent_directory(stage_path)
     return _OutputLayout(
         stage=stage_path,
-        prototypes=join_path(prototypes_dir, f"{base_name}_prototypes.usda"),
-        materials=join_path(materials_dir, f"{base_name}_materials.usda"),
-        instances=join_path(instances_dir, f"{base_name}_instances.usda"),
-        geometry2d=join_path(geometry2d_dir, f"{base_name}_geometry2d.usda"),
+        prototypes=join_path(prototypes_dir, f"{base_name}_prototypes.{ext}"),
+        materials=join_path(materials_dir, f"{base_name}_materials.{ext}"),
+        instances=join_path(instances_dir, f"{base_name}_instances.{ext}"),
+        geometry2d=join_path(geometry2d_dir, f"{base_name}_geometry2d.{ext}"),
         cache_dir=caches_dir,
     )
 def _make_checkpoint_metadata(revision: Optional[str], base_name: str) -> tuple[str, list[str]]:
@@ -545,13 +570,14 @@ def _process_single_ifc(
     plan: ResolvedFilePlan | None,
     logger: logging.Logger,
     checkpoint: bool,
+    usd_format: str = DEFAULT_USD_FORMAT,
     default_base_point: BasePointConfig = DEFAULT_BASE_POINT,
     default_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
     default_master_stage: str = DEFAULT_MASTER_STAGE,
 ) -> ConversionResult:
     import ifcopenshell  # Local import
     base_name = path_stem(ifc_path)
-    layout = _build_output_layout(output_root, base_name)
+    layout = _build_output_layout(output_root, base_name, usd_format)
     revision_note = plan.revision if plan and plan.revision else None
     checkpoint_note: Optional[str] = None
     checkpoint_tags: list[str] = []
@@ -662,6 +688,7 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             checkpoint=args.checkpoint,
             offline=args.offline,
             options=options_override,
+            usd_format=args.usd_format,
         )
     finally:
         shutdown_usd_context()
@@ -694,4 +721,3 @@ def _print_summary(results: Sequence[ConversionResult]) -> None:
             f"prototypes3D={proto_3d}, instances3D={inst_3d}, curves2D={curves_2d}, "
             f"totalElements={total_elements}, revision={revision}{coord_info}"
         )
-
