@@ -1362,10 +1362,31 @@ def update_federated_view(
     payload_prim_name: Optional[str] = None,
     parent_prim_path: str = "/World",
 ) -> Sdf.Layer:
-    stage = Usd.Stage.CreateNew(str(master_stage_path))
-    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
-    world = UsdGeom.Xform.Define(stage, "/World")
-    stage.SetDefaultPrim(world.GetPrim())
+    identifier = _layer_identifier(master_stage_path)
+    stage = Usd.Stage.Open(identifier)
+    created = False
+    if stage is None:
+        stage = Usd.Stage.CreateNew(identifier)
+        created = True
+    parent_path = Sdf.Path(parent_prim_path or "/World")
+    if not parent_path:
+        parent_path = Sdf.Path("/World")
+    parent_prim = stage.GetPrimAtPath(parent_path)
+    if not parent_prim:
+        parent_prim = UsdGeom.Xform.Define(stage, parent_path).GetPrim()
+    if not stage.HasDefaultPrim() or stage.GetDefaultPrim() != parent_prim:
+        stage.SetDefaultPrim(parent_prim)
+    if created:
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    payload_name = payload_prim_name or sanitize_name(path_stem(payload_stage_path))
+    target_path = parent_path.AppendChild(payload_name)
+    payload_prim = stage.GetPrimAtPath(target_path)
+    if not payload_prim:
+        payload_prim = stage.DefinePrim(target_path, "Xform")
+    refs = payload_prim.GetReferences()
+    refs.ClearReferences()
+    refs.AddReference(_layer_identifier(payload_stage_path))
+    UsdGeom.Imageable(payload_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
     stage.GetRootLayer().Save()
     return stage.GetRootLayer()
 

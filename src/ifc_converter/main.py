@@ -33,11 +33,10 @@ from .process_usd import (
     author_instance_layer,
     author_material_layer,
     author_prototype_layer,
-    author_geometry2d_layer,
     bind_materials_to_prototypes,
+    author_geometry2d_layer,
     create_usd_stage,
     persist_instance_cache,
-    update_federated_view,
 )
 from .usd_context import initialize_usd, shutdown_usd_context
 __all__ = [
@@ -1029,7 +1028,6 @@ def _process_single_ifc(
                 f"No projected CRS available for {path_name(ifc_path)}; supply --map-coordinate-system or manifest override."
             )
         geodetic_crs = plan.geodetic_crs if plan and plan.geodetic_crs else default_geodetic_crs
-        master_stage_name = plan.master_stage_filename if plan else default_master_stage
         lonlat_override = plan.lonlat if plan else None
         apply_stage_anchor_transform(
             stage, caches, base_point=effective_base_point, projected_crs=projected_crs, align_axes_to_map=True, lonlat=lonlat_override,
@@ -1064,11 +1062,8 @@ def _process_single_ifc(
             if geometry2d_layer:
                 _checkpoint_path(layout.geometry2d, checkpoint_note, checkpoint_tags, logger, f"{base_name} 2D geometry layer")
         logger.info("Wrote stage %s", str(layout.stage))
-        master_stage_path = join_path(output_root, master_stage_name)
-        ensure_parent_directory(master_stage_path)
-        update_federated_view(master_stage_path, str(layout.stage), base_name, parent_prim_path="/World")
-        if checkpoint and checkpoint_note is not None:
-            _checkpoint_path(master_stage_path, checkpoint_note, checkpoint_tags, logger, f"{base_name} master stage")
+        master_stage_name = plan.master_stage_filename if plan else default_master_stage
+        master_stage_path = join_path(output_root, master_stage_name) if master_stage_name else None
         counts = {
             "prototypes_3d": len(caches.repmaps) + len(caches.hashes),
             "instances_3d": len(caches.instances),
@@ -1182,3 +1177,7 @@ def _print_summary(results: Sequence[ConversionResult]) -> None:
             f"prototypes3D={proto_3d}, instances3D={inst_3d}, curves2D={curves_2d}, "
             f"totalElements={total_elements}, revision={revision}{coord_info}"
         )
+    print(
+        "\nUse `python -m ifc_converter.federate --stage-root <output_dir> --manifest <manifest>` "
+        "to assemble or refresh federated master stages without rerunning conversion."
+    )
