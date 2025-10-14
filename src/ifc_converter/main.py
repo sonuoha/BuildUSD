@@ -55,7 +55,7 @@ DEFAULT_OUTPUT_ROOT = ROOT / "data" / "output"
 # ---------------- constants ----------------
 OPTIONS = ConversionOptions(
     enable_instancing=True,
-    enable_hash_dedup=True,
+    enable_hash_dedup=False,
     convert_metadata=True,
 )
 DEFAULT_MASTER_STAGE = "Federated Model.usda"
