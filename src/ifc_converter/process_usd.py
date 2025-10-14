@@ -629,24 +629,11 @@ def author_material_layer(
                     material_usd_prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(
                         float(props.opacity)
                     )
-                    log.debug(
-                        "Authored material %s (color=%.3f,%.3f,%.3f opacity=%.3f)",
-                        material_prim_path,
-                        props.display_color[0],
-                        props.display_color[1],
-                        props.display_color[2],
-                        props.opacity,
-                    )
 
                 material_prims.append(material_prim_path)
 
             if material_prims:
                 material_paths[key] = material_prims
-                log.debug(
-                    "Prototype %s uses %d material(s)",
-                    proto_path,
-                    len(material_prims),
-                )
 
     return material_layer, material_paths
 
