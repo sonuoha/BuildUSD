@@ -485,6 +485,31 @@ def _gf_matrix_to_np(matrix) -> np.ndarray:
     except Exception:
         return np.eye(4, dtype=float)
 
+
+def _tuple16_to_np(mat16) -> Optional[np.ndarray]:
+    """Return a 4x4 numpy array for a flattened matrix tuple, or None if invalid."""
+    if mat16 is None:
+        return None
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return arr
+
+
+def _is_affine_invertible_tuple(mat16, *, atol: float = 1e-9) -> bool:
+    """Heuristic check that a flattened 4x4 matrix represents an invertible affine transform."""
+    arr = _tuple16_to_np(mat16)
+    if arr is None:
+        return False
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0], dtype=float), atol=atol):
+        return False
+    try:
+        det = float(np.linalg.det(arr[:3, :3]))
+    except Exception:
+        return False
+    return abs(det) > atol
+
 def _axis_placement_to_np(axis_placement) -> np.ndarray:
     """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
     if axis_placement is None:
@@ -1019,7 +1044,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                         mesh=mesh_dict,
                         materials=list(materials),
                         material_ids=list(material_ids),
-                        canonical_frame=xf_tuple,
+                        canonical_frame=None,
                         settings_fp=settings_fp,
                         count=0,
                     )
@@ -1028,7 +1053,8 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 if not bucket.materials and materials: bucket.materials = list(materials)
                 if not bucket.material_ids and material_ids: bucket.material_ids = list(material_ids)
                 if bucket.mesh is None: bucket.mesh = mesh_dict
-                if bucket.canonical_frame is None: bucket.canonical_frame = xf_tuple
+                if bucket.canonical_frame is None and xf_tuple is not None and _is_affine_invertible_tuple(xf_tuple):
+                    bucket.canonical_frame = xf_tuple
                 primary_key = PrototypeKey(kind="hash", identifier=digest)
             else:
                 instance_mesh = mesh_dict
@@ -1052,17 +1078,23 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         if options.enable_instancing and primary_key is not None and primary_key.kind == "hash":
             bucket = hashes.get(primary_key.identifier)
             if bucket:
+                if bucket.canonical_frame is None and xf_tuple is not None and _is_affine_invertible_tuple(xf_tuple):
+                    bucket.canonical_frame = xf_tuple
                 canonical_frame = bucket.canonical_frame
                 if canonical_frame is not None:
                     instance_transform_tuple = canonical_frame
                 if canonical_frame is not None and xf_tuple is not None:
                     try:
-                        canonical_np = np.array(canonical_frame, dtype=float).reshape(4, 4)
-                        xf_np = np.array(xf_tuple, dtype=float).reshape(4, 4)
+                        canonical_np = _tuple16_to_np(canonical_frame)
+                        xf_np = _tuple16_to_np(xf_tuple)
+                        if canonical_np is None or xf_np is None:
+                            raise ValueError("invalid transform data")
                         delta_np = np.matmul(np.linalg.inv(canonical_np), xf_np)
                         if not np.allclose(delta_np, np.eye(4), atol=1e-8):
                             proto_delta_tuple = tuple(float(delta_np[i, j]) for i in range(4) for j in range(4))
                     except Exception:
+                        bucket.canonical_frame = None
+                        instance_transform_tuple = xf_tuple
                         proto_delta_tuple = None
 
         attributes = collect_instance_attributes(product) if options.convert_metadata else {}
