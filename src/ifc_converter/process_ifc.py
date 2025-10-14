@@ -865,9 +865,15 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     The iterator is evaluated exactly once.  Geometry is grouped by
     ``(IfcTypeObject id, mesh hash, tessellation settings)`` so USD can emit
     instanced prototypes without re-tessellating representation maps.  The
-    function also records per-instance transforms, attribute dictionaries, 2‑D
+    function also records per-instance transforms, attribute dictionaries, 2-D
     annotation curves, and optional map conversion metadata.
     """
+    if options.enable_hash_dedup:
+        log.info(
+            "Hash-based prototype de-duplication is ENABLED (experimental). "
+            "Identical tessellated occurrences will share hashed prototypes; "
+            "set enable_hash_dedup=False to opt out if issues arise."
+        )
     settings = ifcopenshell.geom.settings()
     # keep geometry in local coords; do not bake placement
     for k, v in {
@@ -1042,17 +1048,22 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         except Exception: product_id = None
 
         proto_delta_tuple: Optional[Tuple[float, ...]] = None
+        instance_transform_tuple = xf_tuple
         if options.enable_instancing and primary_key is not None and primary_key.kind == "hash":
             bucket = hashes.get(primary_key.identifier)
-            if bucket and bucket.canonical_frame is not None and xf_tuple is not None:
-                try:
-                    canonical_np = np.array(bucket.canonical_frame, dtype=float).reshape(4,4)
-                    xf_np = np.array(xf_tuple, dtype=float).reshape(4,4)
-                    delta_np = np.matmul(np.linalg.inv(canonical_np), xf_np)
-                    if not np.allclose(delta_np, np.eye(4), atol=1e-8):
-                        proto_delta_tuple = tuple(float(delta_np[i, j]) for i in range(4) for j in range(4))
-                except Exception:
-                    proto_delta_tuple = None
+            if bucket:
+                canonical_frame = bucket.canonical_frame
+                if canonical_frame is not None:
+                    instance_transform_tuple = canonical_frame
+                if canonical_frame is not None and xf_tuple is not None:
+                    try:
+                        canonical_np = np.array(canonical_frame, dtype=float).reshape(4, 4)
+                        xf_np = np.array(xf_tuple, dtype=float).reshape(4, 4)
+                        delta_np = np.matmul(np.linalg.inv(canonical_np), xf_np)
+                        if not np.allclose(delta_np, np.eye(4), atol=1e-8):
+                            proto_delta_tuple = tuple(float(delta_np[i, j]) for i in range(4) for j in range(4))
+                    except Exception:
+                        proto_delta_tuple = None
 
         attributes = collect_instance_attributes(product) if options.convert_metadata else {}
 
@@ -1079,7 +1090,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             product_id=product_id,
             prototype=primary_key,
             name=name,
-            transform=xf_tuple,
+            transform=instance_transform_tuple,
             material_ids=list(material_ids),
             materials=list(materials),
             attributes=attributes,
