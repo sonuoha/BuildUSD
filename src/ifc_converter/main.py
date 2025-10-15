@@ -10,6 +10,7 @@ import sys
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Sequence, Union
+
 from .config.manifest import BasePointConfig, ConversionManifest, ResolvedFilePlan
 from .io_utils import (
     ensure_directory,
@@ -1024,7 +1025,15 @@ def _process_single_ifc(
             stage, caches, proto_paths, layer_path=layout.materials, base_name=base_name, proto_layer=proto_layer, options=options,
         )
         bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
-        inst_layer = author_instance_layer(stage, caches, proto_paths, layer_path=layout.instances, base_name=base_name, options=options)
+        inst_layer = author_instance_layer(
+            stage,
+            caches,
+            proto_paths,
+            material_paths,
+            layer_path=layout.instances,
+            base_name=base_name,
+            options=options,
+        )
         geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name, options)
         persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths)
         effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
@@ -1072,8 +1081,7 @@ def _process_single_ifc(
             if geometry2d_layer:
                 _checkpoint_path(layout.geometry2d, checkpoint_note, checkpoint_tags, logger, f"{base_name} 2D geometry layer")
         logger.info("Wrote stage %s", str(layout.stage))
-        master_stage_name = plan.master_stage_filename if plan else default_master_stage
-        master_stage_path = join_path(output_root, master_stage_name) if master_stage_name else None
+        master_stage_path = None
         counts = {
             "prototypes_3d": len(caches.repmaps) + len(caches.hashes),
             "instances_3d": len(caches.instances),
@@ -1126,6 +1134,8 @@ def _process_single_ifc(
             return _execute(tmp_path)
     local_ifc = ifc_path if isinstance(ifc_path, Path) else Path(ifc_path)
     return _execute(local_ifc)
+
+
 # ------------- entrypoint -------------
 def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
