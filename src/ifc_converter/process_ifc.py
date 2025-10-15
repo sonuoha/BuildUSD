@@ -80,6 +80,92 @@ threads = _resolve_threads()
 # ---------------------------------
 # Small utilities
 # ---------------------------------
+_BASE_GEOM_SETTINGS: Dict[str, Any] = {
+    "use-world-coords": False,
+    "weld-vertices": True,
+    "disable-opening-subtractions": False,
+    "apply-default-materials": False,
+    "deflection-tolerance": 0.01,
+    "angle-tolerance": 15.0,
+}
+
+_HIGH_DETAIL_OVERRIDES: Dict[str, Any] = {
+    "deflection-tolerance": 0.0025,
+    "angle-tolerance": 5.0,
+}
+
+_HIGH_DETAIL_CLASSES = {
+    "IFCSTAIR",
+    "IFCSTAIRFLIGHT",
+    "IFCRAILING",
+    "IFCPLATE",
+    "IFCMEMBER",
+    "IFCBEAM",
+}
+
+_BREP_FALLBACK_CLASSES = {
+    "IFCSTAIR",
+    "IFCSTAIRFLIGHT",
+    "IFCRAILING",
+    "IFCPLATE",
+    "IFCMEMBER",
+}
+
+
+def _apply_geom_settings(settings, overrides: Dict[str, Any]) -> None:
+    """Apply iterator settings while tolerating different schema naming conventions."""
+    for key, value in overrides.items():
+        try:
+            settings.set(key, value)
+        except Exception:
+            try:
+                alt_key = str(key).replace("-", "_").upper()
+                settings.set(alt_key, value)
+            except Exception:
+                pass
+
+
+def _settings_fingerprint(settings) -> str:
+    """Return a stable hash describing tessellation settings used for a shape."""
+    fingerprint_keys = [
+        "use-world-coords",
+        "weld-vertices",
+        "disable-opening-subtractions",
+        "apply-default-materials",
+        "deflection-tolerance",
+        "angle-tolerance",
+        "max-facet",
+    ]
+    fp_vals: List[str] = []
+    for key in fingerprint_keys:
+        try:
+            if hasattr(settings, "get"):
+                val = settings.get(key)
+            else:
+                val = getattr(settings, key, None)
+        except Exception:
+            val = None
+        if val is not None:
+            fp_vals.append(str(val))
+    if not fp_vals:
+        fp_vals.append(str(id(settings)))
+    return hashlib.md5("|".join(fp_vals).encode("utf-8")).hexdigest()
+
+
+def _remesh_product_geometry(product, settings, *, use_brep: bool = False):
+    """Create a fresh geometry shape for a product using the supplied settings."""
+    try:
+        kwargs = {"use_python_opencascade": True} if use_brep else {}
+        return ifcopenshell.geom.create_shape(settings, product, **kwargs)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.debug(
+            "High detail remesh failed for %s (brep=%s): %s",
+            getattr(product, "GlobalId", None),
+            use_brep,
+            exc,
+        )
+        return None
+
 
 def round_tuple_list(xs: Iterable[Iterable[float]], tol: int = 9) -> Tuple[Tuple[float, ...], ...]:
     """Round nested iterables to improve deterministic hashing."""
@@ -900,17 +986,11 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             "set enable_hash_dedup=False to opt out if issues arise."
         )
     settings = ifcopenshell.geom.settings()
-    # keep geometry in local coords; do not bake placement
-    for k, v in {
-        "use-world-coords": False,
-        "weld-vertices": True,
-        "disable-opening-subtractions": False,
-        "apply-default-materials": False,
-    }.items():
-        try: settings.set(k, v)
-        except Exception:
-            try: settings.set(str(k).replace("-","_").upper(), v)
-            except Exception: pass
+    _apply_geom_settings(settings, _BASE_GEOM_SETTINGS)
+    high_detail_settings = ifcopenshell.geom.settings()
+    high_overrides = dict(_BASE_GEOM_SETTINGS)
+    high_overrides.update(_HIGH_DETAIL_OVERRIDES)
+    _apply_geom_settings(high_detail_settings, high_overrides)
 
     repmaps: Dict[int, MeshProto] = {}
     repmap_counts: Counter = Counter()
@@ -919,29 +999,9 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     instances: Dict[int, InstanceRecord] = {}
     hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]] = {}
 
-    fingerprint_keys = [
-        "use-world-coords",
-        "weld-vertices",
-        "disable-opening-subtractions",
-        "apply-default-materials",
-        "deflection-tolerance",
-        "angle-tolerance",
-        "max-facet",
-    ]
-    fp_vals: List[str] = []
-    for key in fingerprint_keys:
-        try:
-            if hasattr(settings, "get"):
-                val = settings.get(key)
-            else:
-                val = getattr(settings, key, None)
-        except Exception:
-            val = None
-        if val is not None:
-            fp_vals.append(str(val))
-    if not fp_vals:
-        fp_vals.append(str(id(settings)))
-    settings_fp = hashlib.md5("|".join(fp_vals).encode("utf-8")).hexdigest()
+    settings_fp_base = _settings_fingerprint(settings)
+    settings_fp_high = _settings_fingerprint(high_detail_settings)
+    settings_fp_brep = hashlib.md5(f"{settings_fp_high}|brep".encode("utf-8")).hexdigest()
 
     iterator = ifcopenshell.geom.iterator(settings, ifc_file, threads)
     if not iterator.initialize():
@@ -975,16 +1035,63 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             if not iterator.next(): break
             continue
 
-        # Mesh + hash
+        materials = list(getattr(geom, "materials", []) or [])
+        material_ids = list(getattr(geom, "material_ids", []) or [])
+        settings_fp_current = settings_fp_base
+
+        product_class = product.is_a() if hasattr(product, "is_a") else None
+        product_class_upper = product_class.upper() if isinstance(product_class, str) else None
+        needs_high_detail = product_class_upper in _HIGH_DETAIL_CLASSES if product_class_upper else False
+        allow_brep_fallback = product_class_upper in _BREP_FALLBACK_CLASSES if product_class_upper else False
+
+        def _mesh_from_geom(candidate_geom):
+            try:
+                tri = triangulated_to_dict(candidate_geom)
+                if tri["faces"].size == 0:
+                    return None
+                return tri
+            except Exception:
+                return None
+
+        mesh_dict = None
+        mesh_hash = None
+
+        if needs_high_detail:
+            remeshed = _remesh_product_geometry(product, high_detail_settings)
+            if remeshed is not None:
+                high_geom = getattr(remeshed, "geometry", remeshed)
+                high_mesh = _mesh_from_geom(high_geom)
+                if high_mesh is not None:
+                    geom = high_geom
+                    mesh_dict = high_mesh
+                    settings_fp_current = settings_fp_high
+                    materials = list(getattr(remeshed, "materials", materials) or materials)
+                    material_ids = list(getattr(remeshed, "material_ids", material_ids) or material_ids)
+
+        if mesh_dict is None:
+            mesh_dict = _mesh_from_geom(geom)
+
+        if (mesh_dict is None or mesh_dict["faces"].size == 0) and allow_brep_fallback:
+            remeshed_brep = _remesh_product_geometry(product, high_detail_settings, use_brep=True)
+            if remeshed_brep is not None:
+                brep_geom = getattr(remeshed_brep, "geometry", remeshed_brep)
+                brep_mesh = _mesh_from_geom(brep_geom)
+                if brep_mesh is not None:
+                    geom = brep_geom
+                    mesh_dict = brep_mesh
+                    settings_fp_current = settings_fp_brep
+                    materials = list(getattr(remeshed_brep, "materials", materials) or materials)
+                    material_ids = list(getattr(remeshed_brep, "material_ids", material_ids) or material_ids)
+
+        if mesh_dict is None:
+            if not iterator.next(): break
+            continue
+
         try:
-            mesh_dict = triangulated_to_dict(geom)
             mesh_hash = stable_mesh_hash(mesh_dict["vertices"], mesh_dict["faces"])
         except Exception:
             if not iterator.next(): break
             continue
-
-        materials = list(getattr(geom, "materials", []) or [])
-        material_ids = list(getattr(geom, "material_ids", []) or [])
 
         # World transform
         xf_tuple = resolve_absolute_matrix(shape, product)
@@ -1022,18 +1129,18 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 if info.type_guid is None and type_guid is not None: info.type_guid = type_guid
 
             if info.mesh is None and mesh_hash is not None:
-                info.mesh = mesh_dict; info.mesh_hash = mesh_hash; info.settings_fp = settings_fp
+                info.mesh = mesh_dict; info.mesh_hash = mesh_hash; info.settings_fp = settings_fp_current
                 if not info.materials and materials: info.materials = list(materials)
                 if not info.material_ids and material_ids: info.material_ids = list(material_ids)
                 info.count = 0
 
-            if info.mesh is not None and info.mesh_hash == mesh_hash and info.settings_fp == settings_fp:
+            if info.mesh is not None and info.mesh_hash == mesh_hash and info.settings_fp == settings_fp_current:
                 info.count += 1; repmap_counts[type_id] += 1
                 primary_key = PrototypeKey(kind="repmap", identifier=type_id)
 
         if primary_key is None:
             if options.enable_hash_dedup and mesh_hash is not None:
-                digest = f"{mesh_hash}|{settings_fp}"
+                digest = f"{mesh_hash}|{settings_fp_current}"
                 bucket = hashes.get(digest)
                 if bucket is None:
                     bucket = HashProto(
@@ -1045,7 +1152,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                         materials=list(materials),
                         material_ids=list(material_ids),
                         canonical_frame=None,
-                        settings_fp=settings_fp,
+                        settings_fp=settings_fp_current,
                         count=0,
                     )
                     hashes[digest] = bucket
