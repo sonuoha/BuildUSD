@@ -654,13 +654,16 @@ def bind_materials_to_prototypes(
             mesh_prim = stage.GetPrimAtPath(mesh_path)
             if not mesh_prim:
                 continue
+            proto_prim = stage.GetPrimAtPath(proto_path)
+            if not proto_prim:
+                continue
             materials = material_paths.get(key)
             if not materials:
                 continue
             mat_prim = stage.GetPrimAtPath(materials[0])
             if not mat_prim:
                 continue
-            UsdShade.MaterialBindingAPI(mesh_prim).Bind(UsdShade.Material(mat_prim))
+            UsdShade.MaterialBindingAPI(proto_prim).Bind(UsdShade.Material(mat_prim))
             display_attr = mat_prim.GetAttribute("displayColor")
             if display_attr and display_attr.HasAuthoredValue():
                 try:
