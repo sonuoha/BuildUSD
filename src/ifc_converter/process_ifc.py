@@ -85,13 +85,13 @@ _BASE_GEOM_SETTINGS: Dict[str, Any] = {
     "weld-vertices": True,
     "disable-opening-subtractions": False,
     "apply-default-materials": False,
-    "deflection-tolerance": 0.01,
-    "angle-tolerance": 15.0,
+    "mesher-linear-deflection": 0.005,
+    "mesher-angular-deflection": 0.5,
 }
 
 _HIGH_DETAIL_OVERRIDES: Dict[str, Any] = {
-    "deflection-tolerance": 0.0025,
-    "angle-tolerance": 5.0,
+    "mesher-linear-deflection": 0.0015,
+    "mesher-angular-deflection": 0.2,
 }
 
 _HIGH_DETAIL_CLASSES = {
@@ -110,6 +110,13 @@ _BREP_FALLBACK_CLASSES = {
     "IFCPLATE",
     "IFCMEMBER",
 }
+
+
+_PROXY_SHORT_DIM_THRESHOLD = 0.06  # metres
+_PROXY_SLENDER_RATIO = 40.0
+_PROXY_SMALL_DIAGONAL = 3.0
+_PROXY_FACE_COUNT_THRESHOLD = 120
+_PROXY_AREA_PER_FACE_THRESHOLD = 0.02
 
 
 def _apply_geom_settings(settings, overrides: Dict[str, Any]) -> None:
@@ -165,6 +172,62 @@ def _remesh_product_geometry(product, settings, *, use_brep: bool = False):
             exc,
         )
         return None
+
+
+def _mesh_stats(mesh: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    verts = mesh.get("vertices")
+    faces = mesh.get("faces")
+    if verts is None or faces is None:
+        return None
+    try:
+        mins = np.min(verts, axis=0)
+        maxs = np.max(verts, axis=0)
+    except Exception:
+        return None
+    dims = maxs - mins
+    dx, dy, dz = float(dims[0]), float(dims[1]), float(dims[2])
+    diagonal = float(np.linalg.norm(dims))
+    longest = float(np.max(dims)) if dims.size else 0.0
+    shortest = float(np.min(dims)) if dims.size else 0.0
+    face_count = int(faces.shape[0]) if hasattr(faces, "shape") else len(faces)
+    area = float(2.0 * (dx * dy + dx * dz + dy * dz))
+    area_per_face = area / max(face_count, 1)
+    return {
+        "dims": (dx, dy, dz),
+        "diagonal": diagonal,
+        "longest": longest,
+        "shortest": shortest,
+        "face_count": face_count,
+        "area": area,
+        "area_per_face": area_per_face,
+    }
+
+
+def _proxy_requires_high_detail(stats: Dict[str, float]) -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
+    face_count = int(stats.get("face_count", 0))
+    if face_count <= 0:
+        return False, reasons
+    shortest = float(stats.get("shortest", 0.0))
+    longest = float(stats.get("longest", 0.0))
+    diagonal = float(stats.get("diagonal", 0.0))
+    area_per_face = float(stats.get("area_per_face", 0.0))
+
+    thin = shortest <= _PROXY_SHORT_DIM_THRESHOLD
+    slender = shortest > 0.0 and longest / max(shortest, 1e-6) >= _PROXY_SLENDER_RATIO
+    small = diagonal <= _PROXY_SMALL_DIAGONAL
+    sparse = face_count <= _PROXY_FACE_COUNT_THRESHOLD or area_per_face >= _PROXY_AREA_PER_FACE_THRESHOLD
+
+    if thin and slender:
+        reasons.append(
+            f"slender (shortest={shortest:.3f}m longest={longest:.3f}m)"
+        )
+    if small and sparse:
+        reasons.append(
+            f"small_sparse (diag={diagonal:.3f}m faces={face_count} area/face={area_per_face:.4f})"
+        )
+
+    return (len(reasons) > 0), reasons
 
 
 def round_tuple_list(xs: Iterable[Iterable[float]], tol: int = 9) -> Tuple[Tuple[float, ...], ...]:
@@ -245,6 +308,7 @@ class ConversionOptions:
     enable_instancing: bool = True
     enable_hash_dedup: bool = True
     convert_metadata: bool = True
+    enable_high_detail_remesh: bool = True
     manifest: Optional['ConversionManifest'] = None
     curve_width_rules: Tuple[CurveWidthRule, ...] = tuple()
 
@@ -985,12 +1049,17 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             "Identical tessellated occurrences will share hashed prototypes; "
             "set enable_hash_dedup=False to opt out if issues arise."
         )
+    enable_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
+    if not enable_high_detail:
+        log.info("High-detail remeshing is DISABLED; using iterator tessellation only.")
     settings = ifcopenshell.geom.settings()
     _apply_geom_settings(settings, _BASE_GEOM_SETTINGS)
-    high_detail_settings = ifcopenshell.geom.settings()
-    high_overrides = dict(_BASE_GEOM_SETTINGS)
-    high_overrides.update(_HIGH_DETAIL_OVERRIDES)
-    _apply_geom_settings(high_detail_settings, high_overrides)
+    high_detail_settings = None
+    if enable_high_detail:
+        high_detail_settings = ifcopenshell.geom.settings()
+        high_overrides = dict(_BASE_GEOM_SETTINGS)
+        high_overrides.update(_HIGH_DETAIL_OVERRIDES)
+        _apply_geom_settings(high_detail_settings, high_overrides)
 
     repmaps: Dict[int, MeshProto] = {}
     repmap_counts: Counter = Counter()
@@ -1000,8 +1069,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]] = {}
 
     settings_fp_base = _settings_fingerprint(settings)
-    settings_fp_high = _settings_fingerprint(high_detail_settings)
-    settings_fp_brep = hashlib.md5(f"{settings_fp_high}|brep".encode("utf-8")).hexdigest()
+    if enable_high_detail and high_detail_settings is not None:
+        settings_fp_high = _settings_fingerprint(high_detail_settings)
+        settings_fp_brep = hashlib.md5(f"{settings_fp_high}|brep".encode("utf-8")).hexdigest()
+    else:
+        settings_fp_high = settings_fp_base
+        settings_fp_brep = settings_fp_base
 
     iterator = ifcopenshell.geom.iterator(settings, ifc_file, threads)
     if not iterator.initialize():
@@ -1041,8 +1114,6 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
 
         product_class = product.is_a() if hasattr(product, "is_a") else None
         product_class_upper = product_class.upper() if isinstance(product_class, str) else None
-        needs_high_detail = product_class_upper in _HIGH_DETAIL_CLASSES if product_class_upper else False
-        allow_brep_fallback = product_class_upper in _BREP_FALLBACK_CLASSES if product_class_upper else False
 
         def _mesh_from_geom(candidate_geom):
             try:
@@ -1053,10 +1124,34 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             except Exception:
                 return None
 
-        mesh_dict = None
         mesh_hash = None
+        mesh_dict_base = _mesh_from_geom(geom)
+        mesh_dict = mesh_dict_base
+        mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+        detail_reasons: List[str] = []
+        detail_mode = "base"
 
+        needs_high_detail = (
+            enable_high_detail and product_class_upper in _HIGH_DETAIL_CLASSES if product_class_upper else False
+        )
         if needs_high_detail:
+            detail_reasons.append("class_match")
+        allow_brep_fallback = (
+            enable_high_detail and product_class_upper in _BREP_FALLBACK_CLASSES if product_class_upper else False
+        )
+
+        if (
+            enable_high_detail
+            and not needs_high_detail
+            and product_class_upper == "IFCBUILDINGELEMENTPROXY"
+            and mesh_stats is not None
+        ):
+            proxy_needs_high_detail, proxy_reasons = _proxy_requires_high_detail(mesh_stats)
+            if proxy_needs_high_detail:
+                needs_high_detail = True
+                detail_reasons.extend(proxy_reasons)
+
+        if needs_high_detail and high_detail_settings is not None:
             remeshed = _remesh_product_geometry(product, high_detail_settings)
             if remeshed is not None:
                 high_geom = getattr(remeshed, "geometry", remeshed)
@@ -1064,14 +1159,27 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 if high_mesh is not None:
                     geom = high_geom
                     mesh_dict = high_mesh
+                    mesh_stats = _mesh_stats(high_mesh)
                     settings_fp_current = settings_fp_high
                     materials = list(getattr(remeshed, "materials", materials) or materials)
                     material_ids = list(getattr(remeshed, "material_ids", material_ids) or material_ids)
+                    detail_mode = "high"
+                else:
+                    mesh_dict = mesh_dict_base
+                    mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+                    detail_reasons.append("high_detail_failed_empty_geometry")
+            else:
+                mesh_dict = mesh_dict_base
+                mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+                detail_reasons.append("high_detail_remesh_failed")
 
-        if mesh_dict is None:
-            mesh_dict = _mesh_from_geom(geom)
-
-        if (mesh_dict is None or mesh_dict["faces"].size == 0) and allow_brep_fallback:
+        if (
+            enable_high_detail
+            and high_detail_settings is not None
+            and (mesh_dict is None or mesh_dict["faces"].size == 0)
+            and allow_brep_fallback
+        ):
+            detail_reasons.append("brep_fallback_triggered")
             remeshed_brep = _remesh_product_geometry(product, high_detail_settings, use_brep=True)
             if remeshed_brep is not None:
                 brep_geom = getattr(remeshed_brep, "geometry", remeshed_brep)
@@ -1079,9 +1187,19 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 if brep_mesh is not None:
                     geom = brep_geom
                     mesh_dict = brep_mesh
+                    mesh_stats = _mesh_stats(brep_mesh)
                     settings_fp_current = settings_fp_brep
                     materials = list(getattr(remeshed_brep, "materials", materials) or materials)
                     material_ids = list(getattr(remeshed_brep, "material_ids", material_ids) or material_ids)
+                    detail_mode = "brep"
+                else:
+                    detail_reasons.append("brep_fallback_empty_geometry")
+                    mesh_dict = mesh_dict_base
+                    mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+            else:
+                detail_reasons.append("brep_fallback_failed")
+                mesh_dict = mesh_dict_base
+                mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
 
         if mesh_dict is None:
             if not iterator.next(): break
@@ -1092,6 +1210,30 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         except Exception:
             if not iterator.next(): break
             continue
+
+        if enable_high_detail:
+            guid_for_log = getattr(product, "GlobalId", None)
+            if detail_mode in ("high", "brep"):
+                dims = mesh_stats.get("dims") if mesh_stats else None
+                faces_logged = mesh_stats.get("face_count") if mesh_stats else None
+                log.info(
+                    "High-detail tessellation (%s) applied to %s step=%s guid=%s reasons=%s dims=%s faces=%s",
+                    detail_mode,
+                    product_class_upper or product_class or "<unknown>",
+                    shape.id,
+                    guid_for_log,
+                    ", ".join(detail_reasons) if detail_reasons else "unspecified",
+                    f"({dims[0]:.3f},{dims[1]:.3f},{dims[2]:.3f})" if dims else "n/a",
+                    faces_logged,
+                )
+            elif needs_high_detail and detail_mode == "base":
+                log.debug(
+                    "High-detail tessellation requested but fell back to iterator mesh for %s step=%s guid=%s; reasons=%s",
+                    product_class_upper or product_class or "<unknown>",
+                    shape.id,
+                    guid_for_log,
+                    ", ".join(detail_reasons) if detail_reasons else "unspecified",
+                )
 
         # World transform
         xf_tuple = resolve_absolute_matrix(shape, product)

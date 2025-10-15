@@ -57,6 +57,7 @@ OPTIONS = ConversionOptions(
     enable_instancing=True,
     enable_hash_dedup=False,
     convert_metadata=True,
+    enable_high_detail_remesh=True,
 )
 DEFAULT_MASTER_STAGE = "Federated Model.usda"
 DEFAULT_USD_FORMAT = "usdc"
