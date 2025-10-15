@@ -548,6 +548,48 @@ def _material_signature(props: _MaterialProperties) -> Tuple[Any, ...]:
     )
 
 
+def _material_display_color(stage: Usd.Stage, material_path: Sdf.Path) -> Optional[Gf.Vec3f]:
+    """Resolve a material's authored display/diffuse colour."""
+    mat_prim = stage.GetPrimAtPath(material_path)
+    if not mat_prim:
+        return None
+    material = UsdShade.Material(mat_prim)
+    if not material:
+        return None
+    display_attr = mat_prim.GetAttribute("displayColor")
+    if display_attr and display_attr.HasAuthoredValue():
+        try:
+            value = display_attr.Get()
+            if isinstance(value, Gf.Vec3f):
+                return value
+            return Gf.Vec3f(float(value[0]), float(value[1]), float(value[2]))
+        except Exception:
+            pass
+    surface = material.GetSurfaceOutput()
+    if surface:
+        source = surface.GetConnectedSource()
+        if source:
+            shader = source[0]
+            if shader:
+                diffuse = shader.GetInput("diffuseColor")
+                if diffuse and diffuse.HasAuthoredValue():
+                    try:
+                        value = diffuse.Get()
+                        if isinstance(value, Gf.Vec3f):
+                            return value
+                        return Gf.Vec3f(float(value[0]), float(value[1]), float(value[2]))
+                    except Exception:
+                        pass
+    return None
+
+
+def _apply_display_color_to_prim(prim: Usd.Prim, color: Optional[Gf.Vec3f]) -> None:
+    if color is None or prim is None:
+        return
+    attr = prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True)
+    attr.Set(color)
+
+
 def author_material_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
@@ -660,28 +702,16 @@ def bind_materials_to_prototypes(
             materials = material_paths.get(key)
             if not materials:
                 continue
-            mat_prim = stage.GetPrimAtPath(materials[0])
-            if not mat_prim:
+            material = UsdShade.Material(stage.GetPrimAtPath(materials[0]))
+            if not material:
                 continue
-            UsdShade.MaterialBindingAPI(proto_prim).Bind(UsdShade.Material(mat_prim))
-            display_attr = mat_prim.GetAttribute("displayColor")
-            if display_attr and display_attr.HasAuthoredValue():
-                try:
-                    color_value = display_attr.Get()
-                except Exception:
-                    color_value = None
-                if color_value is not None:
-                    if isinstance(color_value, Gf.Vec3f):
-                        color_vec = color_value
-                    else:
-                        try:
-                            color_vec = Gf.Vec3f(float(color_value[0]), float(color_value[1]), float(color_value[2]))
-                        except Exception:
-                            color_vec = None
-                    if color_vec is not None:
-                        mesh_geom = UsdGeom.Mesh(mesh_prim)
-                        mesh_display_attr = mesh_geom.GetDisplayColorAttr()
-                        mesh_display_attr.Set(Vt.Vec3fArray([color_vec]))
+            UsdShade.MaterialBindingAPI(proto_prim).Bind(material)
+            color_vec = _material_display_color(stage, materials[0])
+            if color_vec is not None:
+                mesh_geom = UsdGeom.Mesh(mesh_prim)
+                mesh_display_attr = mesh_geom.GetDisplayColorAttr()
+                mesh_display_attr.Set(Vt.Vec3fArray([color_vec]))
+                _apply_display_color_to_prim(proto_prim, color_vec)
 
 
 # ---------------- Instance authoring ----------------
@@ -690,6 +720,7 @@ def author_instance_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
     proto_paths: Dict[PrototypeKey, Sdf.Path],
+    prototype_material_paths: Dict[PrototypeKey, List[Sdf.Path]],
     layer_path: PathLike,
     base_name: str,
     options: ConversionOptions,
@@ -704,6 +735,7 @@ def author_instance_layer(
     :param stage: The USD stage to author the layer in.
     :param caches: The cached prototype meshes.
     :param proto_paths: A mapping from prototype key to USD path.
+    :param prototype_material_paths: Mapping of prototype key to authored material paths.
     :param layer_path: The path to the layer to be created.
     :param base_name: The base name of the layer.
     :param options: Optional conversion options.
@@ -808,6 +840,14 @@ def author_instance_layer(
                         material_ids=list(record.material_ids or []),
                         stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
                     )
+                    color = None
+                    if record.materials:
+                        props = _extract_material_properties(
+                            record.materials[0], prototype_label=record.name, index=0
+                        )
+                        if props:
+                            color = Gf.Vec3f(*props.display_color)
+                    _apply_display_color_to_prim(inst_prim, color)
                 continue
 
             # Prototype reference
@@ -833,6 +873,18 @@ def author_instance_layer(
 
             # Ensure the referenced payload renders even if prototype purpose is 'guide'
             UsdGeom.Imageable(ref_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
+
+            color = None
+            proto_materials = prototype_material_paths.get(record.prototype) if prototype_material_paths else None
+            if proto_materials:
+                color = _material_display_color(stage, proto_materials[0])
+            if color is None and record.materials:
+                props = _extract_material_properties(
+                    record.materials[0], prototype_label=record.name, index=0
+                )
+                if props:
+                    color = Gf.Vec3f(*props.display_color)
+            _apply_display_color_to_prim(inst_prim, color)
 
     return inst_layer
 
