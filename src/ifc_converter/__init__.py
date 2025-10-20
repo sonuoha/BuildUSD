@@ -7,7 +7,7 @@ if str(_SRC_PARENT) not in sys.path:
     sys.path.insert(0, str(_SRC_PARENT))
 
 from .config.manifest import ConversionManifest
-from .main import ConversionResult, ConversionOptions, convert
+from .main import ConversionCancelledError, ConversionResult, ConversionOptions, convert
 from .process_ifc import CurveWidthRule
 
 __all__ = [
@@ -16,4 +16,5 @@ __all__ = [
     "ConversionResult",
     "ConversionManifest",
     "CurveWidthRule",
+    "ConversionCancelledError",
 ]

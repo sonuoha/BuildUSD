@@ -40,6 +40,7 @@ from .process_usd import (
 )
 from .usd_context import initialize_usd, shutdown_usd_context
 __all__ = [
+    "ConversionCancelledError",
     "ConversionResult",
     "convert",
     "parse_args",
@@ -71,6 +72,27 @@ DEFAULT_BASE_POINT = BasePointConfig(
     unit="m",
 )
 PathLike = Union[str, Path]
+
+
+class ConversionCancelledError(Exception):
+    """Raised when a conversion is cancelled by the caller."""
+
+
+def _is_cancelled(cancel_event: Any | None) -> bool:
+    if cancel_event is None:
+        return False
+    is_set = getattr(cancel_event, "is_set", None)
+    if callable(is_set):
+        try:
+            return bool(is_set())
+        except Exception:
+            return False
+    return bool(cancel_event)
+
+
+def _ensure_not_cancelled(cancel_event: Any | None, *, message: str | None = None) -> None:
+    if _is_cancelled(cancel_event):
+        raise ConversionCancelledError(message or "Conversion cancelled.")
 @dataclass(slots=True)
 class ConversionResult:
     """Artifacts produced for a single converted IFC file."""
@@ -341,9 +363,11 @@ def convert(
     logger: logging.Logger | None = None,
     checkpoint: bool = False,
     offline: bool = False,
+    cancel_event: Any | None = None,
 ) -> list[ConversionResult]:
     """Programmatic API for running the converter inside another application."""
     log = logger or LOG
+    _ensure_not_cancelled(cancel_event)
     if manifest_path and manifest is not None:
         raise ValueError("Provide either manifest or manifest_path, not both.")
     exclude = normalize_exclusions(exclude_names)
@@ -392,12 +416,14 @@ def convert(
         exclude=exclude,
         log=log,
     )
+    _ensure_not_cancelled(cancel_event)
     if not targets:
         log.info("Connected to %s but found no IFC files to convert.", input_path)
         return []
     log.info("Discovered %d IFC file(s) under %s", len(targets), input_path)
     results: list[ConversionResult] = []
     for target in targets:
+        _ensure_not_cancelled(cancel_event)
         log.info("Starting conversion for %s", target.source)
         plan = None
         if manifest_obj is not None:
@@ -422,7 +448,10 @@ def convert(
                 checkpoint=checkpoint,
                 usd_format=usd_format_normalized,
                 usd_auto_binary_threshold_mb=auto_binary_threshold,
+                cancel_event=cancel_event,
             )
+        except ConversionCancelledError:
+            raise
         except Exception as exc:
             log.error(
                 "Conversion failed for %s: %s",
@@ -989,6 +1018,7 @@ def _process_single_ifc(
     plan: ResolvedFilePlan | None,
     logger: logging.Logger,
     checkpoint: bool,
+    cancel_event: Any | None = None,
     usd_format: str = DEFAULT_USD_FORMAT,
     usd_auto_binary_threshold_mb: float | None = DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB,
     default_base_point: BasePointConfig = DEFAULT_BASE_POINT,
@@ -996,6 +1026,8 @@ def _process_single_ifc(
     default_master_stage: str = DEFAULT_MASTER_STAGE,
 ) -> ConversionResult:
     import ifcopenshell  # Local import
+
+    _ensure_not_cancelled(cancel_event)
     base_name = path_stem(ifc_path)
     revision_note = plan.revision if plan and plan.revision else None
     checkpoint_note: Optional[str] = None
@@ -1003,7 +1035,9 @@ def _process_single_ifc(
     if checkpoint:
         checkpoint_note, checkpoint_tags = _make_checkpoint_metadata(revision_note, base_name)
     def _execute(local_ifc: Path) -> ConversionResult:
+        _ensure_not_cancelled(cancel_event)
         ifc = ifcopenshell.open(local_ifc.as_posix())
+        _ensure_not_cancelled(cancel_event)
         caches = build_prototypes(ifc, options)
         logger.info(
             "IFC %s → %d type prototypes, %d hashed prototypes, %d instances",
@@ -1020,13 +1054,18 @@ def _process_single_ifc(
         layout = _build_output_layout(output_root, base_name, authoring_format)
         stage = create_usd_stage(layout.stage)
         proto_layer, proto_paths = author_prototype_layer(stage, caches, layout.prototypes, base_name, options)
+        _ensure_not_cancelled(cancel_event)
         mat_layer, material_paths = author_material_layer(
             stage, caches, proto_paths, layer_path=layout.materials, base_name=base_name, proto_layer=proto_layer, options=options,
         )
+        _ensure_not_cancelled(cancel_event)
         bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
         inst_layer = author_instance_layer(stage, caches, proto_paths, layer_path=layout.instances, base_name=base_name, options=options)
+        _ensure_not_cancelled(cancel_event)
         geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name, options)
+        _ensure_not_cancelled(cancel_event)
         persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths)
+        _ensure_not_cancelled(cancel_event)
         effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
         if effective_base_point is None:
             raise ValueError(
@@ -1039,6 +1078,7 @@ def _process_single_ifc(
             )
         geodetic_crs = plan.geodetic_crs if plan and plan.geodetic_crs else default_geodetic_crs
         lonlat_override = plan.lonlat if plan else None
+        _ensure_not_cancelled(cancel_event)
         apply_stage_anchor_transform(
             stage, caches, base_point=effective_base_point, projected_crs=projected_crs, align_axes_to_map=True, lonlat=lonlat_override,
         )
@@ -1064,6 +1104,7 @@ def _process_single_ifc(
                 threshold_mb=usd_auto_binary_threshold_mb,
                 logger=logger,
             )
+            _ensure_not_cancelled(cancel_event)
         if checkpoint and checkpoint_note is not None:
             _checkpoint_path(layout.stage, checkpoint_note, checkpoint_tags, logger, f"{base_name} stage")
             _checkpoint_path(layout.prototypes, checkpoint_note, checkpoint_tags, logger, f"{base_name} prototypes layer")
@@ -1106,6 +1147,7 @@ def _process_single_ifc(
                     identifier = getattr(layer_handle, "identifier", "<anonymous>")
                     logger.debug("layer.Close() failed for %s: %s", identifier, exc)
         _cleanup_paths(paths_to_cleanup, logger)
+        _ensure_not_cancelled(cancel_event)
         return ConversionResult(
             ifc_path=ifc_path,
             stage_path=layout.stage,
@@ -1123,8 +1165,10 @@ def _process_single_ifc(
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir) / path_name(ifc_path)
             tmp_path.write_bytes(read_bytes(ifc_path))
+            _ensure_not_cancelled(cancel_event)
             return _execute(tmp_path)
     local_ifc = ifc_path if isinstance(ifc_path, Path) else Path(ifc_path)
+    _ensure_not_cancelled(cancel_event)
     return _execute(local_ifc)
 # ------------- entrypoint -------------
 def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
