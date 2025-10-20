@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Sequence, Union
 
-from .config.manifest import BasePointConfig, ConversionManifest, ResolvedFilePlan
+from .config.manifest import BasePointConfig, ConversionManifest, MasterConfig, ResolvedFilePlan
 from .io_utils import (
     ensure_directory,
     ensure_parent_directory,
@@ -61,17 +61,72 @@ OPTIONS = ConversionOptions(
     convert_metadata=True,
     enable_high_detail_remesh=True,
 )
-DEFAULT_MASTER_STAGE = "Federated Model.usda"
-DEFAULT_USD_FORMAT = "usdc"
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
+DEFAULT_USD_FORMAT = "usdc"
 DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB = 50.0
-DEFAULT_GEODETIC_CRS = "EPSG:4326"
-DEFAULT_BASE_POINT = BasePointConfig(
+_FALLBACK_MASTER_STAGE = "Federated Model.usda"
+_FALLBACK_GEODETIC_CRS = "EPSG:4326"
+_FALLBACK_BASE_POINT = BasePointConfig(
     easting=333800.4900,
     northing=5809101.4680,
     height=0.0,
     unit="m",
+    epsg="EPSG:7855",
 )
+
+
+def _load_manifest_backed_defaults() -> tuple[BasePointConfig, str, str, BasePointConfig]:
+    """Fetch project defaults from the local manifest when present."""
+
+    base_point = _FALLBACK_BASE_POINT
+    geodetic_crs = _FALLBACK_GEODETIC_CRS
+    master_stage = _FALLBACK_MASTER_STAGE
+    shared_site = _FALLBACK_BASE_POINT
+
+    config_dir = Path(__file__).resolve().parent / "config"
+    manifest_obj: ConversionManifest | None = None
+    manifest_path: Path | None = None
+    for candidate in ("manifest.yaml", "manifest.yml", "manifest.json"):
+        path = config_dir / candidate
+        if path.exists():
+            manifest_path = path
+            break
+
+    if manifest_path is not None:
+        try:
+            manifest_obj = ConversionManifest.from_file(manifest_path)
+        except Exception as exc:
+            LOG.debug("Failed to load manifest defaults from %s: %s", manifest_path, exc)
+            manifest_obj = None
+
+    if manifest_obj is not None:
+        defaults = manifest_obj.defaults
+        if defaults.base_point is not None:
+            base_point = defaults.base_point
+        if defaults.geodetic_crs:
+            geodetic_crs = defaults.geodetic_crs
+        if defaults.shared_site_base_point is not None:
+            shared_site = defaults.shared_site_base_point
+        elif defaults.base_point is not None:
+            shared_site = defaults.base_point
+        master_candidate: Optional[MasterConfig] = None
+        if defaults.master_id:
+            master_candidate = manifest_obj.masters.get(defaults.master_id)
+            if master_candidate is None:
+                LOG.debug(
+                    "Defaults reference master id '%s' but it was not defined in %s",
+                    defaults.master_id,
+                    manifest_path,
+                )
+        if master_candidate is None and defaults.master_name:
+            master_candidate = MasterConfig(id="__defaults__", name=defaults.master_name)
+        if master_candidate is not None:
+            master_stage = master_candidate.resolved_name()
+
+    return base_point, geodetic_crs, master_stage, shared_site
+
+
+DEFAULT_BASE_POINT, DEFAULT_GEODETIC_CRS, DEFAULT_MASTER_STAGE, DEFAULT_SHARED_BASE_POINT = _load_manifest_backed_defaults()
 PathLike = Union[str, Path]
 
 
