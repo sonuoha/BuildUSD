@@ -48,6 +48,7 @@ class BasePointConfig:
     northing: float
     height: float = 0.0
     unit: str = "m"
+    epsg: Optional[str] = None
 
     @classmethod
     def from_mapping(cls, data: Optional[Dict[str, Any]], fallback: Optional["BasePointConfig"] = None) -> Optional["BasePointConfig"]:
@@ -62,7 +63,15 @@ class BasePointConfig:
             raise ValueError(f"Invalid base point values: {data}") from exc
         height = float(data.get("height", fallback.height if fallback else 0.0))
         unit = str(data.get("unit", fallback.unit if fallback else "m"))
-        return cls(easting=easting, northing=northing, height=height, unit=unit)
+        epsg_value = data.get("epsg")
+        if epsg_value is None and fallback is not None:
+            epsg_value = fallback.epsg
+        epsg = None
+        if epsg_value is not None:
+            text = str(epsg_value).strip()
+            if text:
+                epsg = text
+        return cls(easting=easting, northing=northing, height=height, unit=unit, epsg=epsg)
 
     def with_fallback(self, fallback: Optional["BasePointConfig"]) -> "BasePointConfig":
         if fallback is None:
@@ -72,6 +81,7 @@ class BasePointConfig:
             northing=self.northing if self.northing is not None else fallback.northing,
             height=self.height if self.height is not None else fallback.height,
             unit=self.unit or fallback.unit,
+            epsg=self.epsg or fallback.epsg,
         )
 
 
@@ -104,6 +114,7 @@ class ManifestDefaults:
     projected_crs: Optional[str] = None
     geodetic_crs: Optional[str] = None
     base_point: Optional[BasePointConfig] = None
+    shared_site_base_point: Optional[BasePointConfig] = None
     revision: Optional[str] = None
 
 
@@ -194,6 +205,7 @@ class ConversionManifest:
             projected_crs=defaults_data.get("projected_crs"),
             geodetic_crs=defaults_data.get("geodetic_crs"),
             base_point=BasePointConfig.from_mapping(defaults_data.get("base_point")),
+            shared_site_base_point=BasePointConfig.from_mapping(defaults_data.get("shared_site_base_point")),
             revision=_extract_revision(defaults_data),
         )
 
