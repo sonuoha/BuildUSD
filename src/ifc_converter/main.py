@@ -1061,20 +1061,8 @@ def _process_single_ifc(
         )
         _ensure_not_cancelled(cancel_event)
         bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
-<<<<<<< HEAD
-        inst_layer = author_instance_layer(
-            stage,
-            caches,
-            proto_paths,
-            material_paths,
-            layer_path=layout.instances,
-            base_name=base_name,
-            options=options,
-        )
-=======
-        inst_layer = author_instance_layer(stage, caches, proto_paths, layer_path=layout.instances, base_name=base_name, options=options)
+        inst_layer = author_instance_layer(stage, caches, proto_paths, material_paths, layer_path=layout.instances, base_name=base_name, options=options)
         _ensure_not_cancelled(cancel_event)
->>>>>>> feature/native-engine-updates
         geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name, options)
         _ensure_not_cancelled(cancel_event)
         persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths)
