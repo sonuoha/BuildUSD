@@ -4,7 +4,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Optional, Sequence
 
 from .config.manifest import BasePointConfig, ConversionManifest, ResolvedFilePlan
 from .io_utils import (
@@ -21,6 +21,7 @@ from .main import (
     DEFAULT_GEODETIC_CRS,
     DEFAULT_MASTER_STAGE,
     DEFAULT_OUTPUT_ROOT,
+    DEFAULT_SHARED_BASE_POINT,
     ROOT,
 )
 from .process_usd import update_federated_view
@@ -33,6 +34,19 @@ def _load_manifest(path: Path) -> ConversionManifest:
     text = read_text(path)
     suffix = path_suffix(path)
     return ConversionManifest.from_text(text, suffix=suffix or ".json")
+
+
+def _normalize_anchor_mode(value: Optional[str]) -> str:
+    if value is None:
+        return "local"
+    normalized = value.strip().lower()
+    alias_map = {
+        "local": "local",
+        "site": "site",
+        "basepoint": "local",
+        "shared_site": "site",
+    }
+    return alias_map.get(normalized, "local")
 
 
 def _normalise_stage_root(path: str | None) -> Path:
@@ -86,6 +100,7 @@ def _resolve_plan_for_stage(
     fallback_geodetic_crs: str,
     fallback_base_point: BasePointConfig,
     fallback_master_name: str,
+    fallback_shared_site_base_point: BasePointConfig,
 ) -> ResolvedFilePlan:
     fake_ifc_path = stage_path.with_suffix(".ifc")
     return manifest.resolve_for_path(
@@ -94,6 +109,7 @@ def _resolve_plan_for_stage(
         fallback_projected_crs=fallback_projected_crs,
         fallback_geodetic_crs=fallback_geodetic_crs,
         fallback_base_point=fallback_base_point,
+        fallback_shared_site_base_point=fallback_shared_site_base_point,
     )
 
 
@@ -101,6 +117,7 @@ def _resolve_plan_for_stage(
 class FederationTask:
     stage_path: Path
     plan: ResolvedFilePlan
+    anchor_mode: Literal["local", "site"] = "local"
 
 
 def _plan_federation(
@@ -111,8 +128,11 @@ def _plan_federation(
     fallback_geodetic_crs: str,
     fallback_base_point: BasePointConfig,
     fallback_master_name: str,
+    fallback_shared_site_base_point: BasePointConfig,
+    anchor_mode: str,
 ) -> list[FederationTask]:
     tasks: list[FederationTask] = []
+    resolved_anchor_mode = _normalize_anchor_mode(anchor_mode)
     for stage_path in stage_paths:
         try:
             plan = _resolve_plan_for_stage(
@@ -122,11 +142,12 @@ def _plan_federation(
                 fallback_geodetic_crs=fallback_geodetic_crs,
                 fallback_base_point=fallback_base_point,
                 fallback_master_name=fallback_master_name,
+                fallback_shared_site_base_point=fallback_shared_site_base_point,
             )
         except Exception as exc:
             LOG.error("Failed to resolve manifest entry for %s: %s", stage_path, exc)
             continue
-        tasks.append(FederationTask(stage_path=stage_path, plan=plan))
+        tasks.append(FederationTask(stage_path=stage_path, plan=plan, anchor_mode=resolved_anchor_mode))
     return tasks
 
 
@@ -144,10 +165,11 @@ def _apply_federation(
             ensure_parent_directory(master_stage_path)
         payload_name = path_stem(stage_path)
         LOG.info(
-            "Federating %s → %s (prim=%s)",
+            "Federating %s -> %s (prim=%s, anchor=%s)",
             path_name(stage_path),
             path_name(master_stage_path),
             payload_name,
+            task.anchor_mode,
         )
         update_federated_view(
             master_stage_path,
@@ -197,6 +219,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Fallback CRS used when manifest entries omit projected_crs (default: %(default)s).",
     )
     parser.add_argument(
+        "--anchor-mode",
+        dest="anchor_mode",
+        choices=("local", "site"),
+        default="local",
+        help="Match federation alignment to stages anchored via the local base point or the shared site base point (default: %(default)s).",
+    )
+    parser.add_argument(
         "--offline",
         dest="offline",
         action="store_true",
@@ -216,6 +245,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not stage_paths:
         LOG.warning("No stage files discovered under %s", stage_root)
         return
+    cli_anchor_mode = _normalize_anchor_mode(args.anchor_mode)
     tasks = _plan_federation(
         manifest,
         stage_paths,
@@ -223,6 +253,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
         fallback_base_point=DEFAULT_BASE_POINT,
         fallback_master_name=DEFAULT_MASTER_STAGE,
+        fallback_shared_site_base_point=DEFAULT_SHARED_BASE_POINT,
+        anchor_mode=cli_anchor_mode,
     )
     if not tasks:
         LOG.warning("No federation tasks were created; nothing to do.")
