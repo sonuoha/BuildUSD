@@ -9,7 +9,7 @@ import tempfile
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Literal, Optional, Sequence, Union
 
 from .config.manifest import BasePointConfig, ConversionManifest, MasterConfig, ResolvedFilePlan
 from .io_utils import (
@@ -60,6 +60,7 @@ OPTIONS = ConversionOptions(
     enable_hash_dedup=False,
     convert_metadata=True,
     enable_high_detail_remesh=True,
+    anchor_mode="local",
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
 DEFAULT_USD_FORMAT = "usdc"
@@ -128,6 +129,22 @@ def _load_manifest_backed_defaults() -> tuple[BasePointConfig, str, str, BasePoi
 
 DEFAULT_BASE_POINT, DEFAULT_GEODETIC_CRS, DEFAULT_MASTER_STAGE, DEFAULT_SHARED_BASE_POINT = _load_manifest_backed_defaults()
 PathLike = Union[str, Path]
+
+
+def _normalize_anchor_mode(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    alias_map = {
+        "local": "local",
+        "site": "site",
+        "basepoint": "local",
+        "shared_site": "site",
+    }
+    result = alias_map.get(normalized)
+    if result is None:
+        LOG.debug("Unknown anchor mode '%s'; ignoring", value)
+    return result
 
 
 class ConversionCancelledError(Exception):
@@ -281,6 +298,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Path to a JSON or YAML file defining annotation curve width rules (may be provided multiple times).",
     )
     parser.add_argument(
+        "--anchor-mode",
+        dest="anchor_mode",
+        choices=("local", "site"),
+        default="local",
+        help="Choose whether stages anchor to the file-local base point or the shared site base point (default: %(default)s).",
+    )
+    parser.add_argument(
         "--usd-format",
         dest="usd_format",
         choices=USD_FORMAT_CHOICES,
@@ -420,6 +444,7 @@ def convert(
     checkpoint: bool = False,
     offline: bool = False,
     cancel_event: Any | None = None,
+    anchor_mode: Optional[str] = None,
 ) -> list[ConversionResult]:
     """Programmatic API for running the converter inside another application."""
     log = logger or LOG
@@ -464,7 +489,10 @@ def convert(
             manifest_obj = ConversionManifest.from_file(manifest_fp)
             log.info("Loaded manifest from %s", manifest_fp)
     opts = options or OPTIONS
+    normalized_anchor_mode = _normalize_anchor_mode(anchor_mode)
     run_options = replace(opts, manifest=manifest_obj)
+    if normalized_anchor_mode is not None and getattr(run_options, "anchor_mode", None) != normalized_anchor_mode:
+        run_options = replace(run_options, anchor_mode=normalized_anchor_mode)
     targets = _collect_ifc_paths(
         input_path,
         ifc_names=tuple(ifc_names) if ifc_names else None,
@@ -490,6 +518,7 @@ def convert(
                     fallback_projected_crs=map_coordinate_system,
                     fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
                     fallback_base_point=DEFAULT_BASE_POINT,
+                    fallback_shared_site_base_point=DEFAULT_SHARED_BASE_POINT,
                 )
             except Exception as exc:
                 log.warning("Manifest resolution failed for %s: %s", path_name(target.source), exc)
@@ -1135,8 +1164,19 @@ def _process_single_ifc(
         geodetic_crs = plan.geodetic_crs if plan and plan.geodetic_crs else default_geodetic_crs
         lonlat_override = plan.lonlat if plan else None
         _ensure_not_cancelled(cancel_event)
+        shared_site_point = (
+            plan.shared_site_base_point if plan and getattr(plan, "shared_site_base_point", None) else DEFAULT_SHARED_BASE_POINT
+        )
+        anchor_mode = _normalize_anchor_mode(getattr(options, "anchor_mode", "local")) or "local"
         apply_stage_anchor_transform(
-            stage, caches, base_point=effective_base_point, projected_crs=projected_crs, align_axes_to_map=True, lonlat=lonlat_override,
+            stage,
+            caches,
+            base_point=effective_base_point,
+            shared_site_base_point=shared_site_point,
+            anchor_mode=anchor_mode,
+            projected_crs=projected_crs,
+            align_axes_to_map=True,
+            lonlat=lonlat_override,
         )
         logger.info("Assigning world geolocation using %s → %s", projected_crs, geodetic_crs)
         geodetic_result = assign_world_geolocation(
@@ -1241,7 +1281,12 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         LOG.info("Loaded %d annotation width rule(s).", len(width_rules))
         for idx, rule in enumerate(width_rules, start=1):
             LOG.debug("Annotation width rule %d: %s", idx, rule)
-    options_override = replace(OPTIONS, curve_width_rules=width_rules) if width_rules else OPTIONS
+    cli_anchor_mode = _normalize_anchor_mode(getattr(args, "anchor_mode", None))
+    options_override = OPTIONS
+    if width_rules:
+        options_override = replace(options_override, curve_width_rules=width_rules)
+    if cli_anchor_mode is not None and getattr(options_override, "anchor_mode", None) != cli_anchor_mode:
+        options_override = replace(options_override, anchor_mode=cli_anchor_mode)
     try:
         results = convert(
             args.input_path,
@@ -1256,6 +1301,7 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             options=options_override,
             usd_format=args.usd_format,
             usd_auto_binary_threshold_mb=args.usd_auto_binary_threshold_mb,
+            anchor_mode=cli_anchor_mode,
         )
     finally:
         shutdown_usd_context()
