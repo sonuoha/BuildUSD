@@ -4,7 +4,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal, Optional, Sequence
+from typing import Iterable, Literal, Optional, Sequence, Union
 
 from .config.manifest import BasePointConfig, ConversionManifest, ResolvedFilePlan
 from .io_utils import (
@@ -28,6 +28,8 @@ from .process_usd import update_federated_view
 from .usd_context import initialize_usd, shutdown_usd_context
 
 LOG = logging.getLogger(__name__)
+
+PathLike = Union[str, Path]
 
 
 def _load_manifest(path: Path) -> ConversionManifest:
@@ -177,6 +179,62 @@ def _apply_federation(
             payload_prim_name=payload_name,
             parent_prim_path=parent_prim,
         )
+
+
+def federate_stages(
+    stage_paths: Sequence[PathLike],
+    *,
+    manifest: ConversionManifest,
+    masters_root: PathLike,
+    parent_prim: str = "/World",
+    map_coordinate_system: str = "EPSG:7855",
+    fallback_base_point: BasePointConfig = DEFAULT_BASE_POINT,
+    fallback_shared_site_base_point: BasePointConfig = DEFAULT_SHARED_BASE_POINT,
+    fallback_master_stage: str = DEFAULT_MASTER_STAGE,
+    fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
+    anchor_mode: str = "local",
+    offline: bool = False,
+) -> Sequence[FederationTask]:
+    """Federate the supplied stage files according to the provided manifest."""
+
+    if not stage_paths:
+        return []
+
+    normalized_stage_paths: list[Path] = []
+    for raw in stage_paths:
+        if isinstance(raw, Path):
+            normalized_stage_paths.append(raw)
+            continue
+        text = str(raw)
+        if is_omniverse_path(text):
+            normalized_stage_paths.append(Path(text))
+        else:
+            normalized_stage_paths.append(Path(text).resolve())
+
+    if isinstance(masters_root, Path):
+        masters_root_input = masters_root.as_posix()
+    else:
+        masters_root_input = str(masters_root)
+    masters_root_path = _normalise_stage_root(masters_root_input)
+    tasks = _plan_federation(
+        manifest,
+        normalized_stage_paths,
+        fallback_projected_crs=map_coordinate_system,
+        fallback_geodetic_crs=fallback_geodetic_crs,
+        fallback_base_point=fallback_base_point,
+        fallback_master_name=fallback_master_stage,
+        fallback_shared_site_base_point=fallback_shared_site_base_point,
+        anchor_mode=anchor_mode,
+    )
+    if not tasks:
+        return []
+
+    initialize_usd(offline=offline)
+    try:
+        _apply_federation(tasks, masters_root=masters_root_path, parent_prim=parent_prim)
+    finally:
+        shutdown_usd_context()
+    return tasks
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
