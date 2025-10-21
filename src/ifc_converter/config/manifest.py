@@ -281,7 +281,17 @@ class ConversionManifest:
 
         projected_crs = self.defaults.projected_crs or fallback_projected_crs
         geodetic_crs = self.defaults.geodetic_crs or fallback_geodetic_crs
-        base_point = self.defaults.base_point or fallback_base_point
+
+        defaults_base_point = self.defaults.base_point
+        base_point: Optional[BasePointConfig] = None
+        base_point_source = "fallback"
+        if defaults_base_point is not None:
+            base_point = defaults_base_point
+            base_point_source = "defaults"
+        elif fallback_base_point is not None:
+            base_point = fallback_base_point
+            base_point_source = "fallback"
+
         shared_site_base_point: Optional[BasePointConfig] = None
         lonlat: Optional[GeodeticCoordinate] = None
         revision = self.defaults.revision
@@ -298,6 +308,7 @@ class ConversionManifest:
                 geodetic_crs = rule.geodetic_crs
             if rule.base_point:
                 base_point = rule.base_point
+                base_point_source = "rule"
             if rule.shared_site_base_point:
                 shared_site_base_point = rule.shared_site_base_point
             if rule.master:
@@ -321,9 +332,21 @@ class ConversionManifest:
             geodetic_crs = master.geodetic_crs or fallback_geodetic_crs
 
         if base_point is None:
-            base_point = master.base_point or self.defaults.base_point or fallback_base_point
+            if master.base_point is not None:
+                base_point = master.base_point
+                base_point_source = "master"
+            elif defaults_base_point is not None:
+                base_point = defaults_base_point
+                base_point_source = "defaults"
+            elif fallback_base_point is not None:
+                base_point = fallback_base_point
+                base_point_source = "fallback"
         if base_point is None:
             raise ValueError(f"No base point defined for IFC '{name}' in manifest or fallbacks")
+        elif base_point_source in {"defaults", "fallback"} and master.base_point is not None:
+            # Prefer the master's base point when the value currently stems from defaults/fallbacks.
+            base_point = master.base_point
+            base_point_source = "master"
 
         if shared_site_base_point is None and master.shared_site_base_point is not None:
             shared_site_base_point = master.shared_site_base_point

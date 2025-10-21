@@ -9,6 +9,8 @@ if str(_SRC_PARENT) not in sys.path:
 from .config.manifest import ConversionManifest
 from .main import ConversionCancelledError, ConversionResult, ConversionOptions, convert
 from .process_ifc import CurveWidthRule
+from .process_usd import apply_stage_anchor_transform
+from .federate import federate_stages
 
 __all__ = [
     "convert",
@@ -17,4 +19,6 @@ __all__ = [
     "ConversionManifest",
     "CurveWidthRule",
     "ConversionCancelledError",
+    "apply_stage_anchor_transform",
+    "federate_stages",
 ]

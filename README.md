@@ -154,6 +154,13 @@ Units and Geospatial
   - cesium:georeferenceOrigin:longitude, cesium:georeferenceOrigin:latitude, cesium:georeferenceOrigin:height
 - Federated masters created via `ifc_converter.federate` are authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
 
+Geo Anchoring
+- Conversion and federation now expose `--anchor-mode` controlling how /World is aligned. `local` (default) anchors to the per-file base point; `site` aligns to the shared site base point stored in the manifest.
+- The manifest can define `defaults.shared_site_base_point` and per-master/per-file overrides via `shared_site_base_point`. When `--anchor-mode site` is used, resolution falls back through file → master → defaults → repo fallback → (0,0,0).
+- When `local` anchoring is requested but a file lacks its own base point, the pipeline automatically falls back to `site` so stages always receive a valid anchor.
+- Geodetic metadata is derived from the anchor point (using `pyproj` when available) and written to `/World` alongside the traditional `ifc:` attributes.
+- Example invocations: `python -m ifc_converter --anchor-mode site ...` for conversion, and `python -m ifc_converter.federate --anchor-mode site ...` to keep the federated masters aligned in the same frame.
+
 IFC Metadata as USD Attributes
 - IFC psets/qtos are authored as attributes (not customData) using:
   - BIMData:Psets:<PsetName>:<PropName>
@@ -166,6 +173,7 @@ Federated Stage Behavior (via `ifc_converter.federate`)
 - The payload targets the stage's default prim so additional `/World` nesting is avoided when possible.
 
 Programmatic Use
+- `from ifc_converter import convert, federate_stages, apply_stage_anchor_transform` provides the core programmatic hooks. `convert(...)` matches the CLI options, `federate_stages(...)` mirrors the federation CLI, and `apply_stage_anchor_transform(...)` can be reused when composing custom USD pipelines.
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
 Manifest Schema
 - defaults: Global fallback for master name, projected/geodetic CRS, base point, and optional `file_revision` used for checkpoint notes/tags.
