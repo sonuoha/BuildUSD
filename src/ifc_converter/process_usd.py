@@ -17,7 +17,7 @@ import re
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 from .pxr_utils import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
@@ -44,6 +44,52 @@ _UNIT_FACTORS = {
 }
 
 PathLike = Union[str, Path]
+LOG = logging.getLogger(__name__)
+
+try:
+    from pyproj import CRS, Transformer
+    _HAVE_PYPROJ = True
+    _TRANSFORMER_CACHE: Dict[Tuple[str, str], Transformer] = {}
+except Exception:  # pragma: no cover - optional dependency
+    _HAVE_PYPROJ = False
+    _TRANSFORMER_CACHE: Dict[Tuple[str, str], Any] = {}
+
+
+def _unit_factor(unit: Optional[str]) -> float:
+    if not unit:
+        return 1.0
+    return _UNIT_FACTORS.get(str(unit).strip().lower(), 1.0)
+
+
+def _base_point_components_in_meters(bp: BasePointConfig) -> Tuple[float, float, float, str]:
+    unit = bp.unit or "m"
+    factor = _unit_factor(unit)
+    easting = float(bp.easting) * factor
+    northing = float(bp.northing) * factor
+    height = float(bp.height) * factor
+    return easting, northing, height, unit
+
+
+def _derive_lonlat_from_base_point(bp: BasePointConfig, projected_crs: Optional[str]) -> Optional[GeodeticCoordinate]:
+    if not _HAVE_PYPROJ:
+        return None
+    source_crs = bp.epsg or projected_crs
+    if not source_crs:
+        return None
+    try:
+        key = (source_crs, "EPSG:4326")
+        transformer = _TRANSFORMER_CACHE.get(key)
+        if transformer is None:
+            src = CRS.from_user_input(source_crs)
+            dst = CRS.from_epsg(4326)
+            transformer = Transformer.from_crs(src, dst, always_xy=True)
+            _TRANSFORMER_CACHE[key] = transformer
+        easting_m, northing_m, height_m, _ = _base_point_components_in_meters(bp)
+        longitude, latitude = transformer.transform(easting_m, northing_m)
+        return GeodeticCoordinate(longitude=float(longitude), latitude=float(latitude), height=float(height_m))
+    except Exception as exc:  # pragma: no cover - logging only
+        LOG.debug("Unable to derive lon/lat for CRS %s: %s", source_crs, exc)
+        return None
 
 # ---------------- Name helpers ----------------
 
@@ -1282,22 +1328,15 @@ def apply_stage_anchor_transform(
     caches: PrototypeCaches,
     base_point: Optional[BasePointConfig] = None,
     *,
+    shared_site_base_point: Optional[BasePointConfig] = None,
+    anchor_mode: Literal["local", "site", "basepoint", "shared_site"] = "local",
     align_axes_to_map: bool = False,
     enable_geo_anchor: bool = True,  # kept for signature compatibility (unused)
     projected_crs: Optional[str] = None,
     lonlat: Optional[GeodeticCoordinate] = None,
     **_unused,
 ) -> None:
-    """Anchor the USD stage to the survey/base-point reference frame.
-
-    - Translates /World so the requested base-point (map coordinates) sits at the origin
-      in stage space. Units are respected (base-point unit → meters → stage units).
-    - When `align_axes_to_map` and an IfcMapConversion are present, rotates /World so the
-      local XY axes honour the published map azimuth.
-    - Persists the chosen anchor (translation/rotation) as prim custom data for debugging.
-    - If geodetic lon/lat is supplied, writes them as authored attributes on /World so any
-      downstream consumer can recover survey metadata.
-    """
+    """Anchor /World using the requested base-point context (local or shared site)."""
 
     world_prim = stage.GetPrimAtPath("/World")
     if not world_prim:
@@ -1309,21 +1348,30 @@ def apply_stage_anchor_transform(
     stage_meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
     if stage_meters_per_unit <= 0.0:
         stage_meters_per_unit = 1.0
-    def _unit_to_meters(value: float, unit: Optional[str]) -> float:
-        if unit is None:
-            return float(value)
-        factor = _UNIT_FACTORS.get(unit.strip().lower(), None)
-        if factor is None:
-            return float(value)
-        return float(value) * factor
 
-    bp_unit = None
-    bp_easting_m = bp_northing_m = bp_height_m = 0.0
-    if base_point is not None:
-        bp_unit = base_point.unit or "m"
-        bp_easting_m = _unit_to_meters(base_point.easting, bp_unit)
-        bp_northing_m = _unit_to_meters(base_point.northing, bp_unit)
-        bp_height_m = _unit_to_meters(base_point.height, bp_unit)
+    zero_base_point = BasePointConfig(easting=0.0, northing=0.0, height=0.0, unit="m")
+    shared_site_resolved = shared_site_base_point.with_fallback(zero_base_point) if shared_site_base_point else zero_base_point
+    base_point_resolved = base_point.with_fallback(shared_site_resolved) if base_point else shared_site_resolved
+
+    mode_key = (anchor_mode or "local").strip().lower()
+    alias_map = {
+        "local": "local",
+        "site": "site",
+        "basepoint": "local",
+        "shared_site": "site",
+    }
+    mode_normalised = alias_map.get(mode_key)
+    if mode_normalised is None:
+        LOG.debug("Unknown anchor_mode '%s'; defaulting to 'local'", anchor_mode)
+        mode_normalised = "local"
+    effective_mode = mode_normalised
+    if effective_mode == "local" and base_point is None:
+        effective_mode = "site"
+    anchor_bp = shared_site_resolved if effective_mode == "site" else base_point_resolved
+
+    anchor_easting_m, anchor_northing_m, anchor_height_m, anchor_unit = _base_point_components_in_meters(anchor_bp)
+    shared_easting_m, shared_northing_m, shared_height_m, shared_unit = _base_point_components_in_meters(shared_site_resolved)
+    model_bp_easting_m, model_bp_northing_m, model_bp_height_m, model_bp_unit = _base_point_components_in_meters(base_point_resolved)
 
     map_conv = getattr(caches, "map_conversion", None)
     translation_stage = Gf.Vec3d(0.0, 0.0, 0.0)
@@ -1334,28 +1382,27 @@ def apply_stage_anchor_transform(
         eastings_m = float(getattr(map_conv, "eastings", 0.0) or 0.0) * scale
         northings_m = float(getattr(map_conv, "northings", 0.0) or 0.0) * scale
         ortho_height_m = float(getattr(map_conv, "orthogonal_height", 0.0) or 0.0) * scale
-        if base_point is not None:
-            d_e = bp_easting_m - eastings_m
-            d_n = bp_northing_m - northings_m
-            ax, ay = map_conv.normalized_axes()
-            local_x = ax * d_e + ay * d_n
-            local_y = -ay * d_e + ax * d_n
-            local_z = bp_height_m - ortho_height_m
-            translation_stage = Gf.Vec3d(
-                -local_x / stage_meters_per_unit,
-                -local_y / stage_meters_per_unit,
-                -local_z / stage_meters_per_unit,
-            )
+        d_e = anchor_easting_m - eastings_m
+        d_n = anchor_northing_m - northings_m
+        ax, ay = map_conv.normalized_axes()
+        local_x = ax * d_e + ay * d_n
+        local_y = -ay * d_e + ax * d_n
+        local_z = anchor_height_m - ortho_height_m
+        translation_stage = Gf.Vec3d(
+            -local_x / stage_meters_per_unit,
+            -local_y / stage_meters_per_unit,
+            -local_z / stage_meters_per_unit,
+        )
         if align_axes_to_map:
             try:
                 rotation_deg = float(map_conv.rotation_degrees())
-            except Exception:
+            except Exception:  # pragma: no cover - defensive
                 rotation_deg = 0.0
-    elif base_point is not None:
+    else:
         translation_stage = Gf.Vec3d(
-            -bp_easting_m / stage_meters_per_unit,
-            -bp_northing_m / stage_meters_per_unit,
-            -bp_height_m / stage_meters_per_unit,
+            -anchor_easting_m / stage_meters_per_unit,
+            -anchor_northing_m / stage_meters_per_unit,
+            -anchor_height_m / stage_meters_per_unit,
         )
 
     anchor_matrix = Gf.Matrix4d(1.0)
@@ -1364,41 +1411,42 @@ def apply_stage_anchor_transform(
     anchor_matrix.SetTranslateOnly(translation_stage)
     world_xf.AddTransformOp().Set(anchor_matrix)
 
+    world_prim.CreateAttribute("ifc:stageAnchorMode", Sdf.ValueTypeNames.String).Set(effective_mode)
     translation_attr = world_prim.CreateAttribute("ifc:stageAnchorTranslation", Sdf.ValueTypeNames.Double3)
     translation_attr.Set(tuple(float(translation_stage[i]) for i in range(3)))
     rotation_attr = world_prim.CreateAttribute("ifc:stageAnchorRotationDegrees", Sdf.ValueTypeNames.Double)
     rotation_attr.Set(float(rotation_deg))
     bp_attr = world_prim.CreateAttribute("ifc:stageAnchorBasePointMeters", Sdf.ValueTypeNames.Double3)
-    bp_attr.Set((float(bp_easting_m), float(bp_northing_m), float(bp_height_m)))
+    bp_attr.Set((float(anchor_easting_m), float(anchor_northing_m), float(anchor_height_m)))
     unit_attr = world_prim.CreateAttribute("ifc:stageAnchorBasePointUnit", Sdf.ValueTypeNames.String)
-    unit_attr.Set(bp_unit or "")
+    unit_attr.Set(anchor_unit or "")
+    model_bp_attr = world_prim.CreateAttribute("ifc:stageAnchorModelBasePointMeters", Sdf.ValueTypeNames.Double3)
+    model_bp_attr.Set((float(model_bp_easting_m), float(model_bp_northing_m), float(model_bp_height_m)))
+    model_unit_attr = world_prim.CreateAttribute("ifc:stageAnchorModelBasePointUnit", Sdf.ValueTypeNames.String)
+    model_unit_attr.Set(model_bp_unit or "")
+    shared_attr = world_prim.CreateAttribute("ifc:stageAnchorSharedSiteMeters", Sdf.ValueTypeNames.Double3)
+    shared_attr.Set((float(shared_easting_m), float(shared_northing_m), float(shared_height_m)))
+    shared_unit_attr = world_prim.CreateAttribute("ifc:stageAnchorSharedSiteUnit", Sdf.ValueTypeNames.String)
+    shared_unit_attr.Set(shared_unit or "")
     crs_attr = world_prim.CreateAttribute("ifc:stageAnchorProjectedCRS", Sdf.ValueTypeNames.String)
     crs_attr.Set(projected_crs or "")
     if map_conv is not None:
         scale_attr = world_prim.CreateAttribute("ifc:stageAnchorMapScale", Sdf.ValueTypeNames.Double)
         scale_attr.Set(float(getattr(map_conv, "scale", 1.0) or 1.0))
 
-    if lonlat is not None:
-        longitude = float(lonlat.longitude)
-        latitude = float(lonlat.latitude)
-        height_val = float(lonlat.height) if lonlat.height is not None else None
-        for attr_name, value in (
-            ("ifc:longitude", longitude),
-            ("ifc:latitude", latitude),
-        ):
-            attr = world_prim.CreateAttribute(attr_name, Sdf.ValueTypeNames.Double)
-            attr.Set(value)
+    geodetic = lonlat or _derive_lonlat_from_base_point(anchor_bp, projected_crs)
+    if geodetic is not None:
+        longitude = float(geodetic.longitude)
+        latitude = float(geodetic.latitude)
+        height_val = float(geodetic.height) if geodetic.height is not None else None
+        world_prim.CreateAttribute("ifc:longitude", Sdf.ValueTypeNames.Double).Set(longitude)
+        world_prim.CreateAttribute("ifc:latitude", Sdf.ValueTypeNames.Double).Set(latitude)
         if height_val is not None:
-            attr = world_prim.CreateAttribute("ifc:ellipsoidalHeight", Sdf.ValueTypeNames.Double)
-            attr.Set(height_val)
-        cesium_lon = world_prim.CreateAttribute("CesiumLongitude", Sdf.ValueTypeNames.Double)
-        cesium_lon.Set(longitude)
-        cesium_lat = world_prim.CreateAttribute("CesiumLatitude", Sdf.ValueTypeNames.Double)
-        cesium_lat.Set(latitude)
+            world_prim.CreateAttribute("ifc:ellipsoidalHeight", Sdf.ValueTypeNames.Double).Set(height_val)
+        world_prim.CreateAttribute("CesiumLongitude", Sdf.ValueTypeNames.Double).Set(longitude)
+        world_prim.CreateAttribute("CesiumLatitude", Sdf.ValueTypeNames.Double).Set(latitude)
         if height_val is not None:
-            cesium_h = world_prim.CreateAttribute("CesiumHeight", Sdf.ValueTypeNames.Double)
-            cesium_h.Set(height_val)
-
+            world_prim.CreateAttribute("CesiumHeight", Sdf.ValueTypeNames.Double).Set(height_val)
 
 # ---------------- Federated master view — stub (retain signature) ----------------
 

@@ -125,6 +125,7 @@ class MasterConfig:
     projected_crs: Optional[str] = None
     geodetic_crs: Optional[str] = None
     base_point: Optional[BasePointConfig] = None
+    shared_site_base_point: Optional[BasePointConfig] = None
     lonlat: Optional[GeodeticCoordinate] = None
     revision: Optional[str] = None
 
@@ -149,6 +150,7 @@ class FileRule:
     projected_crs: Optional[str] = None
     geodetic_crs: Optional[str] = None
     base_point: Optional[BasePointConfig] = None
+    shared_site_base_point: Optional[BasePointConfig] = None
     lonlat: Optional[GeodeticCoordinate] = None
     revision: Optional[str] = None
 
@@ -173,6 +175,7 @@ class ResolvedFilePlan:
     projected_crs: str
     geodetic_crs: str
     base_point: BasePointConfig
+    shared_site_base_point: BasePointConfig
     lonlat: Optional[GeodeticCoordinate] = None
     applied_rules: List[FileRule] = field(default_factory=list)
     revision: Optional[str] = None
@@ -219,6 +222,7 @@ class ConversionManifest:
             projected = entry.get("projected_crs")
             geodetic = entry.get("geodetic_crs")
             base_point = BasePointConfig.from_mapping(entry.get("base_point"))
+            shared_site_base_point = BasePointConfig.from_mapping(entry.get("shared_site_base_point"), defaults.shared_site_base_point)
             lonlat = GeodeticCoordinate.from_mapping(entry.get("lonlat"))
             masters[mid] = MasterConfig(
                 id=mid,
@@ -226,6 +230,7 @@ class ConversionManifest:
                 projected_crs=projected,
                 geodetic_crs=geodetic,
                 base_point=base_point,
+                shared_site_base_point=shared_site_base_point,
                 lonlat=lonlat,
                 revision=_extract_revision(entry),
             )
@@ -233,6 +238,7 @@ class ConversionManifest:
         file_rules: List[FileRule] = []
         for entry in data.get("files", []) or []:
             base_point = BasePointConfig.from_mapping(entry.get("base_point"))
+            shared_site_base_point = BasePointConfig.from_mapping(entry.get("shared_site_base_point"), defaults.shared_site_base_point)
             lonlat = GeodeticCoordinate.from_mapping(entry.get("lonlat"))
             file_rules.append(
                 FileRule(
@@ -242,6 +248,7 @@ class ConversionManifest:
                     projected_crs=entry.get("projected_crs"),
                     geodetic_crs=entry.get("geodetic_crs"),
                     base_point=base_point,
+                    shared_site_base_point=shared_site_base_point,
                     lonlat=lonlat,
                     revision=_extract_revision(entry),
                 )
@@ -268,12 +275,14 @@ class ConversionManifest:
         fallback_projected_crs: Optional[str] = None,
         fallback_geodetic_crs: str = _DEFAULT_GEODETIC_CRS,
         fallback_base_point: Optional[BasePointConfig] = None,
+        fallback_shared_site_base_point: Optional[BasePointConfig] = None,
     ) -> ResolvedFilePlan:
         name = ifc_path.name
 
         projected_crs = self.defaults.projected_crs or fallback_projected_crs
         geodetic_crs = self.defaults.geodetic_crs or fallback_geodetic_crs
         base_point = self.defaults.base_point or fallback_base_point
+        shared_site_base_point: Optional[BasePointConfig] = None
         lonlat: Optional[GeodeticCoordinate] = None
         revision = self.defaults.revision
 
@@ -289,6 +298,8 @@ class ConversionManifest:
                 geodetic_crs = rule.geodetic_crs
             if rule.base_point:
                 base_point = rule.base_point
+            if rule.shared_site_base_point:
+                shared_site_base_point = rule.shared_site_base_point
             if rule.master:
                 master_id = rule.master
                 master_name = None
@@ -314,6 +325,15 @@ class ConversionManifest:
         if base_point is None:
             raise ValueError(f"No base point defined for IFC '{name}' in manifest or fallbacks")
 
+        if shared_site_base_point is None and master.shared_site_base_point is not None:
+            shared_site_base_point = master.shared_site_base_point
+        if shared_site_base_point is None and self.defaults.shared_site_base_point is not None:
+            shared_site_base_point = self.defaults.shared_site_base_point
+        if shared_site_base_point is None and fallback_shared_site_base_point is not None:
+            shared_site_base_point = fallback_shared_site_base_point
+        if shared_site_base_point is None:
+            shared_site_base_point = BasePointConfig(easting=0.0, northing=0.0, height=0.0, unit="m")
+
         if projected_crs is None:
             raise ValueError(f"No projected CRS defined for IFC '{name}' in manifest or fallbacks")
         if geodetic_crs is None:
@@ -330,6 +350,7 @@ class ConversionManifest:
             projected_crs=projected_crs,
             geodetic_crs=geodetic_crs,
             base_point=base_point,
+            shared_site_base_point=shared_site_base_point,
             lonlat=lonlat,
             applied_rules=applied,
             revision=revision,
