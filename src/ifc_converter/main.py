@@ -60,7 +60,7 @@ OPTIONS = ConversionOptions(
     enable_hash_dedup=False,
     convert_metadata=True,
     enable_high_detail_remesh=True,
-    anchor_mode="local",
+    anchor_mode=None,
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
 DEFAULT_USD_FORMAT = "usdc"
@@ -135,16 +135,18 @@ def _normalize_anchor_mode(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     normalized = value.strip().lower()
-    alias_map = {
+    alias_map: dict[str, Optional[str]] = {
         "local": "local",
         "site": "site",
         "basepoint": "local",
         "shared_site": "site",
+        "none": None,
+        "": None,
     }
-    result = alias_map.get(normalized)
-    if result is None:
+    if normalized not in alias_map:
         LOG.debug("Unknown anchor mode '%s'; ignoring", value)
-    return result
+        return None
+    return alias_map[normalized]
 
 
 class ConversionCancelledError(Exception):
@@ -300,9 +302,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--anchor-mode",
         dest="anchor_mode",
-        choices=("local", "site"),
-        default="local",
-        help="Choose whether stages anchor to the file-local base point or the shared site base point (default: %(default)s).",
+        choices=("local", "site", "none"),
+        default="none",
+        help="Choose whether stages anchor to the file-local base point, shared site base point, or skip anchoring entirely (default: %(default)s).",
     )
     parser.add_argument(
         "--usd-format",
@@ -1167,17 +1169,18 @@ def _process_single_ifc(
         shared_site_point = (
             plan.shared_site_base_point if plan and getattr(plan, "shared_site_base_point", None) else DEFAULT_SHARED_BASE_POINT
         )
-        anchor_mode = _normalize_anchor_mode(getattr(options, "anchor_mode", "local")) or "local"
-        apply_stage_anchor_transform(
-            stage,
-            caches,
-            base_point=effective_base_point,
-            shared_site_base_point=shared_site_point,
-            anchor_mode=anchor_mode,
-            projected_crs=projected_crs,
-            align_axes_to_map=True,
-            lonlat=lonlat_override,
-        )
+        anchor_mode = _normalize_anchor_mode(getattr(options, "anchor_mode", None))
+        if anchor_mode is not None:
+            apply_stage_anchor_transform(
+                stage,
+                caches,
+                base_point=effective_base_point,
+                shared_site_base_point=shared_site_point,
+                anchor_mode=anchor_mode,
+                projected_crs=projected_crs,
+                align_axes_to_map=True,
+                lonlat=lonlat_override,
+            )
         logger.info("Assigning world geolocation using %s → %s", projected_crs, geodetic_crs)
         geodetic_result = assign_world_geolocation(
             stage, base_point=effective_base_point, projected_crs=projected_crs, geodetic_crs=geodetic_crs, unit_hint=effective_base_point.unit, lonlat_override=lonlat_override,
