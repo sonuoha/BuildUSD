@@ -310,7 +310,7 @@ class ConversionOptions:
     enable_high_detail_remesh: bool = True
     manifest: Optional['ConversionManifest'] = None
     curve_width_rules: Tuple[CurveWidthRule, ...] = tuple()
-    anchor_mode: Literal["local", "site"] = "local"
+    anchor_mode: Optional[Literal["local", "site"]] = None
 
 @dataclass(frozen=True)
 class PrototypeKey:
