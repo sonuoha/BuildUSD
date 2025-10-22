@@ -38,17 +38,18 @@ def _load_manifest(path: Path) -> ConversionManifest:
     return ConversionManifest.from_text(text, suffix=suffix or ".json")
 
 
-def _normalize_anchor_mode(value: Optional[str]) -> str:
+def _normalize_anchor_mode(value: Optional[str]) -> Optional[str]:
     if value is None:
-        return "local"
+        return None
     normalized = value.strip().lower()
-    alias_map = {
-        "local": "local",
-        "site": "site",
-        "basepoint": "local",
-        "shared_site": "site",
-    }
-    return alias_map.get(normalized, "local")
+    if normalized in ("local", "basepoint"):
+        return "local"
+    if normalized in ("site", "shared_site"):
+        return "site"
+    if normalized in ("none", ""):
+        return None
+    LOG.debug("Unknown anchor_mode '%s'; defaulting to None", value)
+    return None
 
 
 def _normalise_stage_root(path: str | None) -> Path:
@@ -119,7 +120,7 @@ def _resolve_plan_for_stage(
 class FederationTask:
     stage_path: Path
     plan: ResolvedFilePlan
-    anchor_mode: Literal["local", "site"] = "local"
+    anchor_mode: Optional[str] = None
 
 
 def _plan_federation(
@@ -131,7 +132,7 @@ def _plan_federation(
     fallback_base_point: BasePointConfig,
     fallback_master_name: str,
     fallback_shared_site_base_point: BasePointConfig,
-    anchor_mode: str,
+    anchor_mode: Optional[str],
 ) -> list[FederationTask]:
     tasks: list[FederationTask] = []
     resolved_anchor_mode = _normalize_anchor_mode(anchor_mode)
@@ -171,7 +172,7 @@ def _apply_federation(
             path_name(stage_path),
             path_name(master_stage_path),
             payload_name,
-            task.anchor_mode,
+            task.anchor_mode or "none",
         )
         update_federated_view(
             master_stage_path,
@@ -192,7 +193,7 @@ def federate_stages(
     fallback_shared_site_base_point: BasePointConfig = DEFAULT_SHARED_BASE_POINT,
     fallback_master_stage: str = DEFAULT_MASTER_STAGE,
     fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
-    anchor_mode: str = "local",
+    anchor_mode: Optional[str] = None,
     offline: bool = False,
 ) -> Sequence[FederationTask]:
     """Federate the supplied stage files according to the provided manifest."""
@@ -216,6 +217,7 @@ def federate_stages(
     else:
         masters_root_input = str(masters_root)
     masters_root_path = _normalise_stage_root(masters_root_input)
+    resolved_anchor_mode = _normalize_anchor_mode(anchor_mode)
     tasks = _plan_federation(
         manifest,
         normalized_stage_paths,
@@ -224,7 +226,7 @@ def federate_stages(
         fallback_base_point=fallback_base_point,
         fallback_master_name=fallback_master_stage,
         fallback_shared_site_base_point=fallback_shared_site_base_point,
-        anchor_mode=anchor_mode,
+        anchor_mode=resolved_anchor_mode,
     )
     if not tasks:
         return []
@@ -279,9 +281,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--anchor-mode",
         dest="anchor_mode",
-        choices=("local", "site"),
-        default="local",
-        help="Match federation alignment to stages anchored via the local base point or the shared site base point (default: %(default)s).",
+        choices=("local", "site", "none"),
+        default="none",
+        help="Match federation alignment to stages anchored via the local base point, shared site base point, or skip anchoring (default: %(default)s).",
     )
     parser.add_argument(
         "--offline",

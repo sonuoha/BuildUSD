@@ -6,19 +6,44 @@ _SRC_PARENT = Path(__file__).resolve().parents[1]
 if str(_SRC_PARENT) not in sys.path:
     sys.path.insert(0, str(_SRC_PARENT))
 
+from . import api
+from .api import (
+    AnchorMode,
+    AnchorModeSetting,
+    ConversionDefaults,
+    ConversionSettings,
+    FederationDefaults,
+    FederationSettings,
+    apply_stage_anchor_transform,
+    convert,
+    federate_stages,
+    CONVERSION_DEFAULTS,
+    FEDERATION_DEFAULTS,
+    DEFAULT_CONVERSION_OPTIONS,
+)
 from .config.manifest import ConversionManifest
-from .main import ConversionCancelledError, ConversionResult, ConversionOptions, convert
+from .federate import FederationTask
+from .main import ConversionCancelledError, ConversionOptions, ConversionResult
 from .process_ifc import CurveWidthRule
-from .process_usd import apply_stage_anchor_transform
-from .federate import federate_stages
 
 __all__ = [
+    "api",
     "convert",
+    "federate_stages",
+    "apply_stage_anchor_transform",
+    "ConversionDefaults",
+    "ConversionSettings",
+    "FederationDefaults",
+    "FederationSettings",
+    "CONVERSION_DEFAULTS",
+    "FEDERATION_DEFAULTS",
+    "DEFAULT_CONVERSION_OPTIONS",
+    "AnchorMode",
+    "AnchorModeSetting",
     "ConversionOptions",
     "ConversionResult",
     "ConversionManifest",
     "CurveWidthRule",
     "ConversionCancelledError",
-    "apply_stage_anchor_transform",
-    "federate_stages",
+    "FederationTask",
 ]

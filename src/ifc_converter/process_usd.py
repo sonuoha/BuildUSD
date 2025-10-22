@@ -1329,7 +1329,7 @@ def apply_stage_anchor_transform(
     base_point: Optional[BasePointConfig] = None,
     *,
     shared_site_base_point: Optional[BasePointConfig] = None,
-    anchor_mode: Literal["local", "site", "basepoint", "shared_site"] = "local",
+    anchor_mode: Optional[Literal["local", "site", "basepoint", "shared_site"]] = None,
     align_axes_to_map: bool = False,
     enable_geo_anchor: bool = True,  # kept for signature compatibility (unused)
     projected_crs: Optional[str] = None,
@@ -1337,6 +1337,9 @@ def apply_stage_anchor_transform(
     **_unused,
 ) -> None:
     """Anchor /World using the requested base-point context (local or shared site)."""
+
+    if anchor_mode is None:
+        return
 
     world_prim = stage.GetPrimAtPath("/World")
     if not world_prim:
@@ -1353,17 +1356,18 @@ def apply_stage_anchor_transform(
     shared_site_resolved = shared_site_base_point.with_fallback(zero_base_point) if shared_site_base_point else zero_base_point
     base_point_resolved = base_point.with_fallback(shared_site_resolved) if base_point else shared_site_resolved
 
-    mode_key = (anchor_mode or "local").strip().lower()
+    mode_key = anchor_mode.strip().lower()
     alias_map = {
         "local": "local",
         "site": "site",
         "basepoint": "local",
         "shared_site": "site",
+        "none": None,
     }
     mode_normalised = alias_map.get(mode_key)
     if mode_normalised is None:
-        LOG.debug("Unknown anchor_mode '%s'; defaulting to 'local'", anchor_mode)
-        mode_normalised = "local"
+        LOG.debug("Unknown anchor_mode '%s'; skipping stage anchoring", anchor_mode)
+        return
     effective_mode = mode_normalised
     if effective_mode == "local" and base_point is None:
         effective_mode = "site"
