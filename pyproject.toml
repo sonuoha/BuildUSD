@@ -1,18 +1,19 @@
 [project]
-name = "usdx"
+name = "buildusd"
 version = "0.1.0"
 description = ""
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10,<3.12"
 
 dependencies = [
     "ifcopenshell>=0.8.3",
     "polars",
     "numpy",
     "shapely",
-    "pytest",
-]
-optional-dependencies = { kit = ["omniverse-kit>=108.0", "usd-core>=25.8"] }
+    ]
+[project.optional-dependencies]
+kit = ["omniverse-kit>=108.1", "usd-core>=25.8"]
+test = ["pytest"]
 
 
 [project.scripts]
