@@ -1,4 +1,4 @@
-"""USD authoring helpers for the ifc_converter pipeline.
+"""USD authoring helpers for the buildusd pipeline.
 
 The functions below consume the prototype/instance caches produced by
 ``process_ifc`` and emit the various USD layers (prototypes, materials,
