@@ -51,7 +51,7 @@ __all__ = [
 ]
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_INPUT_ROOT = Path(r"C:\Users\samue\_dev\datasets\ifc\tvc").resolve()
+DEFAULT_INPUT_ROOT = Path.cwd()
 DEFAULT_OUTPUT_ROOT = ROOT / "data" / "output"
 
 # ---------------- constants ----------------
