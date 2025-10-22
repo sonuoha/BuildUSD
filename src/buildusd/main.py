@@ -1338,6 +1338,7 @@ def _print_summary(results: Sequence[ConversionResult]) -> None:
             f"totalElements={total_elements}, revision={revision}{coord_info}"
         )
     print(
-        "\nUse `python -m ifc_converter.federate --stage-root <output_dir> --manifest <manifest>` "
-        "to assemble or refresh federated master stages without rerunning conversion."
+        "\nUse `python -m buildusd.federate --stage-root <output_dir> --manifest <manifest>` "
+        "(or the legacy `python -m ifc_converter.federate`) to assemble or refresh "
+        "federated master stages without rerunning conversion."
     )

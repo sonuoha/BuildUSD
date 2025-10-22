@@ -17,7 +17,8 @@ test = ["pytest"]
 
 
 [project.scripts]
-ifc-convert = "ifc_converter.main:main"
+buildusd = "buildusd.main:main"
+ifc-convert = "buildusd.main:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

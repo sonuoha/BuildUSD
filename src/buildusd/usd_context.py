@@ -18,7 +18,7 @@ def get_mode() -> Optional[str]:
     global _MODE
     return _MODE
 
-# ifc_converter/usd_context.py  (replace initialize_usd with this)
+# buildusd/usd_context.py  (replace initialize_usd with this)
 def initialize_usd(*, offline: Optional[bool] = None) -> str:
     """Prepare USD bindings.
 

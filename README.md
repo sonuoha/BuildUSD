@@ -3,7 +3,7 @@ IFC → USD Converter (Federated)
 Overview
 - Converts IFC files to USD with prototypes, materials, and instances.
 - Adds WGS84 geolocation attributes to /World.
-- Provides a separate federation CLI (`python -m ifc_converter.federate`) that assembles per-file stages into project master files without touching conversion outputs.
+- Provides a separate federation CLI (`python -m buildusd.federate`) that assembles per-file stages into project master files without touching conversion outputs.
 - Authors IFC properties/quantities as USD attributes under a BIMData namespace.
 
 Requirements
@@ -28,7 +28,8 @@ Install
   - The converter auto-starts a headless Kit session whenever an `omniverse://` path is encountered.
 - **Offline mode**
   - Install ``usd-core`` (or another pxr build) alongside ifcopenshell.
-- Run ``python -m ifc_converter ...`` from the repo root, or ``pip install -e .`` for a global CLI.
+- Run ``python -m buildusd ...`` from the repo root, or ``pip install -e .`` for a global CLI.
+- Legacy invocations like ``python -m ifc_converter`` continue to work via a compatibility shim.
 - INFO logs show which directory or Nucleus path is scanned and each IFC file as it starts processing (`PYTHONUNBUFFERED=1` for unbuffered output).
 
 Mode selection & environment variables
@@ -48,39 +49,39 @@ Mode selection & environment variables
 
 Usage (CLI)
 - Single IFC file:
-  - python -m ifc_converter --input C:\\path\\to\\file.ifc
+  - python -m buildusd --input C:\\path\\to\\file.ifc
 - Directory, specific names:
-  - python -m ifc_converter --input C:\\path\\to\\dir --ifc-names A.ifc B.ifc
+  - python -m buildusd --input C:\\path\\to\\dir --ifc-names A.ifc B.ifc
 - Directory, all files:
-  - python -m ifc_converter --input C:\\path\\to\\dir --all
+  - python -m buildusd --input C:\\path\\to\\dir --all
 - Offline conversion (local-only, no Kit):
-  - python -m ifc_converter --offline --input C:\\path\\to\\dir --all
+  - python -m buildusd --offline --input C:\\path\\to\\dir --all
 - Directory, all files excluding drafts:
-  - python -m ifc_converter --input C:\\path\\to\\dir --all --exclude DraftModel TempIFC
+  - python -m buildusd --input C:\\path\\to\\dir --all --exclude DraftModel TempIFC
 - Checkpoint authored layers on Nucleus:
-  - python -m ifc_converter --input omniverse://server/Projects/IFC --all --checkpoint
+  - python -m buildusd --input omniverse://server/Projects/IFC --all --checkpoint
 - Custom CRS (default EPSG:7855):
-  - python -m ifc_converter --input C:\\path\\to\\dir --all --map-coordinate-system EPSG:XXXX
+  - python -m buildusd --input C:\\path\\to\\dir --all --map-coordinate-system EPSG:XXXX
 - Manifest-driven base points / federated routing:
-  - python -m ifc_converter --input C:\\path\\to\\dir --all --manifest src/ifc_converter/config/sample_manifest.json
-  - python -m ifc_converter --input C:\\path\\to\\dir --all --manifest src/ifc_converter/config/sample_manifest.yaml
+  - python -m buildusd --input C:\\path\\to\\dir --all --manifest src/buildusd/config/sample_manifest.json
+  - python -m buildusd --input C:\\path\\to\\dir --all --manifest src/buildusd/config/sample_manifest.yaml
 - Assemble masters after conversion:
-  - python -m ifc_converter.federate --stage-root data/output --manifest src/ifc_converter/config/sample_manifest.json
-  - python -m ifc_converter.federate --stage-root data/output --manifest src/ifc_converter/config/sample_manifest.yaml --masters-root data/federated
+  - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.json
+  - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.yaml --masters-root data/federated
 - Nucleus (omniverse://) paths work for files or directories:
-  - python -m ifc_converter --input omniverse://server/Projects/IFC --all
+  - python -m buildusd --input omniverse://server/Projects/IFC --all
 - Annotation curve widths:
-  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-default 15mm
-  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-rule width=0.02,layer=Survey*,curve=*Centerline*
-  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-config src/ifc_converter/config/sample_annotation_widths.json
-  - python -m ifc_converter --input C:\\path\\to\\dir --annotation-width-config src/ifc_converter/config/sample_annotation_widths.yaml
+  - python -m buildusd --input C:\\path\\to\\dir --annotation-width-default 15mm
+  - python -m buildusd --input C:\\path\\to\\dir --annotation-width-rule width=0.02,layer=Survey*,curve=*Centerline*
+  - python -m buildusd --input C:\\path\\to\\dir --annotation-width-config src/buildusd/config/sample_annotation_widths.json
+  - python -m buildusd --input C:\\path\\to\\dir --annotation-width-config src/buildusd/config/sample_annotation_widths.yaml
 
 Usage (VS Code)
 - Press F5 and pick one of the provided launch configurations in .vscode/launch.json.
 - Modify args there to suit your inputs.
 
 Usage (Python)
-- from ifc_converter import convert
+- from buildusd import convert
 - results = convert("path/to/file.ifc", output_dir="data/output")  # returns List[ConversionResult]
 - convert("omniverse://server/Projects/file.ifc", output_dir="omniverse://server/USD/output")
 - convert("path/to/file.ifc", output_dir="data/output", checkpoint=True)  # omniverse:// required for checkpoints
@@ -93,9 +94,9 @@ Outputs
   - instances/<name>_instances.usda
   - geometry2d/<name>_geometry2d.usda (when present; captured 2D alignment/annotation curves)
     - /World/<file>_Instances preserves the IFC spatial hierarchy (Project/Site/Storey/Class).
-    - Optional grouping variants (see src/ifc_converter/process_usd.py:author_instance_grouping_variant) can reorganize instances on demand without losing the canonical hierarchy.
+    - Optional grouping variants (see src/buildusd/process_usd.py:author_instance_grouping_variant) can reorganize instances on demand without losing the canonical hierarchy.
   - caches/<name>.json stores serialized instance metadata for later regrouping sessions.
-- Optional federated masters (run `python -m ifc_converter.federate --manifest ...` after conversion):
+- Optional federated masters (run `python -m buildusd.federate --manifest ...` after conversion):
   - Creates master stage(s) defined in the manifest without overwriting per-file outputs.
   - Each converted stage is referenced beneath `/World/<stage_name>` (inactive by default) so you can compose projects on demand.
 
@@ -104,7 +105,7 @@ Annotation Curve Width Overrides
 - Widths accept numeric values in stage units (`0.015`) or include a unit suffix (`12mm`, `1.5cm`, `0.01m`). A separate `unit` key is also accepted in configuration mappings.
 - Rule filters support `layer` (matches the IFC stem used for the geometry2d layer), `curve` (annotation name), `hierarchy` (any label or `/`-joined path in the spatial hierarchy), and `step_id`. Glob-style (`fnmatch`) patterns are applied case-insensitively.
 - Rules are evaluated in order: configuration files are loaded first, then the CLI default, followed by any CLI rule expressions. Later matches override earlier ones.
-- Example JSON configuration (see `src/ifc_converter/config/sample_annotation_widths.json`):
+- Example JSON configuration (see `src/buildusd/config/sample_annotation_widths.json`):
 
 ```json
 {
@@ -127,7 +128,7 @@ Annotation Curve Width Overrides
 }
 ```
 
-- Example YAML configuration (see `src/ifc_converter/config/sample_annotation_widths.yaml`):
+- Example YAML configuration (see `src/buildusd/config/sample_annotation_widths.yaml`):
 
 ```yaml
 default: 0.015
@@ -152,14 +153,14 @@ hierarchies:
 Units and Geospatial
 - Per-file stages author metersPerUnit as needed; WGS84 (lon/lat/height) are authored on /World as Double attributes:
   - cesium:georeferenceOrigin:longitude, cesium:georeferenceOrigin:latitude, cesium:georeferenceOrigin:height
-- Federated masters created via `ifc_converter.federate` are authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
+- Federated masters created via `buildusd.federate` are authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
 
 Geo Anchoring
 - Conversion and federation now expose `--anchor-mode` controlling how /World is aligned. `local` anchors to the per-file base point, `site` aligns to the shared site base point, and `none` leaves /World unchanged (the default).
 - The manifest can define `defaults.shared_site_base_point` and per-master/per-file overrides via `shared_site_base_point`. When `--anchor-mode site` is used, resolution falls back through file → master → defaults → repo fallback → (0,0,0).
 - When `local` anchoring is requested but a file lacks its own base point, the pipeline automatically falls back to `site` so stages always receive a valid anchor.
 - Geodetic metadata is derived from the anchor point (using `pyproj` when available) and written to `/World` alongside the traditional `ifc:` attributes.
-- Example invocations: `python -m ifc_converter --anchor-mode site ...` for conversion, `python -m ifc_converter --anchor-mode none ...` to leave stages unanchored, and `python -m ifc_converter.federate --anchor-mode site ...` to keep federated masters aligned in the same frame.
+- Example invocations: `python -m buildusd --anchor-mode site ...` for conversion, `python -m buildusd --anchor-mode none ...` to leave stages unanchored, and `python -m buildusd.federate --anchor-mode site ...` to keep federated masters aligned in the same frame.
 
 IFC Metadata as USD Attributes
 - IFC psets/qtos are authored as attributes (not customData) using:
@@ -167,13 +168,13 @@ IFC Metadata as USD Attributes
   - BIMData:QTO:<QtoName>:<PropName>
 - Types are inferred (Bool/Int/Double and arrays; fallback String).
 
-Federated Stage Behavior (via `ifc_converter.federate`)
+Federated Stage Behavior (via `buildusd.federate`)
 - Each converted USD stage is referenced as a payload under `/World/<file_stem>` in the manifest-selected master stage.
 - Payload prims are authored inactive (unloaded by default). Activate to load content.
 - The payload targets the stage's default prim so additional `/World` nesting is avoided when possible.
 
 Programmatic Use
-- `from ifc_converter import api` exposes structured helpers. `api.ConversionSettings` and `api.convert()` mirror the CLI; `api.FederationSettings` and `api.federate_stages()` do the same for master assembly; `api.apply_stage_anchor_transform()` anchors custom USD stages consistently.
+- `from buildusd import api` exposes structured helpers. `api.ConversionSettings` and `api.convert()` mirror the CLI; `api.FederationSettings` and `api.federate_stages()` do the same for master assembly; `api.apply_stage_anchor_transform()` anchors custom USD stages consistently.
 - `api.CONVERSION_DEFAULTS` / `api.FEDERATION_DEFAULTS` expose the packaged defaults, and `api.DEFAULT_CONVERSION_OPTIONS` offers a ready-to-clone baseline for geometry harvesting.
 - Anchor modes accept `"local"`, `"site"`, or `None`/`"none"`; the latter skips writing a transform on `/World`.
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
@@ -185,9 +186,9 @@ Manifest Schema
 Notes
 - JSON manifests work immediately; YAML manifests require installing PyYAML.
 - Sample manifest templates live at:
-  - src/ifc_converter/config/sample_manifest.json (JSON with `_comment` helper fields)
-  - src/ifc_converter/config/sample_manifest.yaml (YAML with inline comments)
-  Copy one of them locally (e.g. to src/ifc_converter/config/manifest.yaml) when preparing project-specific settings. The real manifest remains untracked by design and can be loaded from local paths or omniverse:// URIs.
+  - src/buildusd/config/sample_manifest.json (JSON with `_comment` helper fields)
+  - src/buildusd/config/sample_manifest.yaml (YAML with inline comments)
+  Copy one of them locally (e.g. to src/buildusd/config/manifest.yaml) when preparing project-specific settings. The real manifest remains untracked by design and can be loaded from local paths or omniverse:// URIs.
 - 2D annotation contexts (e.g. alignment strings in IfcAnnotation) are preserved. If the ifcopenshell geometry iterator rejects an annotation context, the pipeline emits a warning and falls back to manual curve extraction so the data still lands in the 2D geometry layer.
 
 
