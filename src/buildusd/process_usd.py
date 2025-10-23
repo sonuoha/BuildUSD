@@ -224,7 +224,17 @@ def create_usd_stage(usd_path, meters_per_unit=1.0):
         identifier = usd_path.resolve().as_posix()
     else:
         identifier = str(usd_path)
-    stage = Usd.Stage.CreateNew(identifier)
+
+    existing_layer = Sdf.Layer.Find(identifier)
+    if existing_layer is not None:
+        stage = Usd.Stage.Open(existing_layer)
+        if stage is None:
+            stage = Usd.Stage.CreateNew(identifier)
+        else:
+            stage.GetRootLayer().Clear()
+    else:
+        stage = Usd.Stage.CreateNew(identifier)
+
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
     stage.SetMetadata("metersPerUnit", float(meters_per_unit))
     world = UsdGeom.Xform.Define(stage, "/World")
@@ -307,6 +317,19 @@ def _layer_identifier(path: PathLike) -> str:
     return str(path).replace("\\", "/")
 
 
+def _prepare_writable_layer(layer_path: PathLike) -> Sdf.Layer:
+    """
+    Return a cleared, editable layer matching ``layer_path`` without tripping
+    Sdf's unique-identifier constraint when rerunning inside the same process.
+    """
+    identifier = _layer_identifier(layer_path)
+    existing = Sdf.Layer.Find(identifier)
+    if existing is not None:
+        existing.Clear()
+        return existing
+    return Sdf.Layer.CreateNew(identifier)
+
+
 def _sublayer_identifier(parent_layer: Sdf.Layer, child_path: PathLike) -> str:
     """
     Compute a stable asset path to author into `parent_layer.subLayerPaths`.
@@ -362,7 +385,7 @@ def author_prototype_layer(
     - Prototype Xform is marked purpose=guide (so it won't render by itself).
     - Prototype Xform is NOT instanceable (instances are instanceable instead).
     """
-    proto_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
+    proto_layer = _prepare_writable_layer(layer_path)
 
     root_layer = stage.GetRootLayer()
     root_sub_path = _sublayer_identifier(root_layer, layer_path)
@@ -650,7 +673,7 @@ def author_material_layer(
     This is a minimal binding scaffold; you can restore richer bindings without
     changing any public signatures.
     """
-    material_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
+    material_layer = _prepare_writable_layer(layer_path)
     log = logging.getLogger(__name__)
 
     root_layer = stage.GetRootLayer()
@@ -787,7 +810,7 @@ def author_instance_layer(
     :param options: Optional conversion options.
     :return: The authored layer.
     """
-    inst_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
+    inst_layer = _prepare_writable_layer(layer_path)
 
     root_layer = stage.GetRootLayer()
     root_sub_path = _sublayer_identifier(root_layer, layer_path)
@@ -1068,7 +1091,7 @@ def author_geometry2d_layer(
     if not getattr(caches, "annotations", None):
         return None
 
-    geom_layer = Sdf.Layer.CreateNew(_layer_identifier(layer_path))
+    geom_layer = _prepare_writable_layer(layer_path)
 
     root_layer = stage.GetRootLayer()
     root_sub_path = _sublayer_identifier(root_layer, layer_path)

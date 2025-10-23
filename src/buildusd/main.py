@@ -210,6 +210,16 @@ class _OutputLayout:
     instances: PathLike
     geometry2d: PathLike
     cache_dir: PathLike
+
+
+class _JoinPathAction(argparse.Action):
+    """Join successive CLI tokens into a single path string (handles spaces gracefully)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        joined = " ".join(values).strip()
+        setattr(namespace, self.dest, joined or None)
+
+
 # ---------------- CLI ----------------
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the standalone converter."""
@@ -224,21 +234,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--input",
         dest="input_path",
-        type=str,
+        nargs="+",
+        action=_JoinPathAction,
         default=str(DEFAULT_INPUT_ROOT),
         help="Path to an IFC file or a directory containing IFC files",
     )
     parser.add_argument(
         "--output",
         dest="output_dir",
-        type=str,
+        nargs="+",
+        action=_JoinPathAction,
         default=None,
         help="Directory for USD artifacts (default: data/output under repo root)",
     )
     parser.add_argument(
         "--manifest",
         dest="manifest_path",
-        type=str,
+        nargs="+",
+        action=_JoinPathAction,
         default=None,
         help="Path to a manifest (YAML or JSON) describing base points and masters",
     )
