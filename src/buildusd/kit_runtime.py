@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable, Sequence
 
 _KIT_APP = None
+_KIT_APP_OWNED = False
 _ENABLED_EXTENSIONS: set[str] = set()
 
 _BASE_ARGS: list[str] = ["--no-window"]
@@ -15,26 +16,49 @@ def _normalize_extensions(extensions: Iterable[str] | None) -> Sequence[str]:
     return tuple(dict.fromkeys([ext for ext in extensions if ext]))
 
 
+def _get_running_kit_app():
+    """Return an already-running Kit app if executing inside Kit."""
+    try:
+        from omni.kit.app import get_app  # type: ignore
+    except ModuleNotFoundError:
+        return None
+
+    try:
+        existing = get_app()
+    except Exception:
+        return None
+
+    return existing
+
+
 def ensure_kit(extensions: Iterable[str] | None = None):
     """Start Kit (if needed) with the requested extensions enabled.
 
     Returns the shared KitApp instance so callers can retrieve omni.client, pxr, etc.
     """
 
-    global _KIT_APP, _ENABLED_EXTENSIONS
+    global _KIT_APP, _KIT_APP_OWNED, _ENABLED_EXTENSIONS
 
     required = _normalize_extensions(extensions)
 
-    try:
-        from omni.kit_app import KitApp  # type: ignore
-    except ModuleNotFoundError as exc:  # pragma: no cover - runtime dependency
-        raise RuntimeError(
-            "omni.kit_app is unavailable. Install Omniverse Kit (pip install --extra-index-url "
-            "https://pypi.nvidia.com omniverse-kit) or run within an Omniverse Python runtime."
-        ) from exc
-
     if _KIT_APP is None:
+        # Detect whether we're already inside a Kit runtime (e.g., extension template).
+        existing = _get_running_kit_app()
+        if existing is not None:
+            _KIT_APP = existing
+            _KIT_APP_OWNED = False
+            return _KIT_APP
+
+        try:
+            from omni.kit_app import KitApp  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - runtime dependency
+            raise RuntimeError(
+                "omni.kit_app is unavailable. Install Omniverse Kit (pip install --extra-index-url "
+                "https://pypi.nvidia.com omniverse-kit) or run within an Omniverse Python runtime."
+            ) from exc
+
         _KIT_APP = KitApp()
+        _KIT_APP_OWNED = True
         args: list[str] = list(_BASE_ARGS)
         all_exts = _normalize_extensions(tuple(dict.fromkeys(list(required) + list(_DEFAULT_EXTENSIONS))))
         for ext in all_exts:
@@ -48,13 +72,16 @@ def ensure_kit(extensions: Iterable[str] | None = None):
 def shutdown_kit():
     """Shutdown the shared Kit application if it was started via ensure_kit."""
 
-    global _KIT_APP, _ENABLED_EXTENSIONS
+    global _KIT_APP, _KIT_APP_OWNED, _ENABLED_EXTENSIONS
     if _KIT_APP is None:
         return
-    try:
-        _KIT_APP.shutdown()
-    except Exception:
-        pass
-    finally:
-        _KIT_APP = None
-        _ENABLED_EXTENSIONS.clear()
+
+    if _KIT_APP_OWNED:
+        try:
+            _KIT_APP.shutdown()
+        except Exception:
+            pass
+
+    _KIT_APP = None
+    _KIT_APP_OWNED = False
+    _ENABLED_EXTENSIONS.clear()

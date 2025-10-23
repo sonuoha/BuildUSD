@@ -9,7 +9,12 @@ from .kit_runtime import ensure_kit, shutdown_kit
 
 _MODE: Optional[str] = None  # "kit" or "offline"
 _PXR_CACHE: Dict[str, object] = {}
-_DEFAULT_MODE = os.environ.get("IFC_CONVERTER_DEFAULT_USD_MODE", "kit").strip().lower()
+_DEFAULT_ENV = (
+    os.environ.get("BUILDUSD_DEFAULT_USD_MODE")
+    or os.environ.get("IFC_CONVERTER_DEFAULT_USD_MODE")
+    or "kit"
+)
+_DEFAULT_MODE = _DEFAULT_ENV.strip().lower()
 if _DEFAULT_MODE not in {"kit", "offline"}:
     _DEFAULT_MODE = "kit"
 

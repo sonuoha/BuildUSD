@@ -34,15 +34,15 @@ Install
 
 Mode selection & environment variables
 - The converter can author USD via two bindings:
-  - **Kit mode** (default). Used whenever any supplied path is `omniverse://` _or_ when `IFC_CONVERTER_DEFAULT_USD_MODE` resolves to `kit`. Requires Omniverse Kit (`omni.client`), automatically boots Kit in headless mode, and enables Nucleus features such as checkpoints.
-  - **Offline mode**. Activated by providing `--offline` on the CLI, `offline=True` in the Python API, or setting `IFC_CONVERTER_DEFAULT_USD_MODE=offline`. All paths must be local filesystem locations. Nucleus checkpoint requests are ignored and `omniverse://` inputs raise a `ValueError`.
+  - **Kit mode** (default). Used whenever any supplied path is `omniverse://` _or_ when `BUILDUSD_DEFAULT_USD_MODE` (legacy `IFC_CONVERTER_DEFAULT_USD_MODE`) resolves to `kit`. Requires Omniverse Kit (`omni.client`), automatically boots Kit in headless mode, and enables Nucleus features such as checkpoints.
+  - **Offline mode**. Activated by providing `--offline` on the CLI, `offline=True` in the Python API, or setting `BUILDUSD_DEFAULT_USD_MODE=offline` (legacy `IFC_CONVERTER_DEFAULT_USD_MODE=offline`). All paths must be local filesystem locations. Nucleus checkpoint requests are ignored and `omniverse://` inputs raise a `ValueError`.
 - Mode-precedence rules:
   1. Explicit CLI/programmatic `offline=True` wins.
   2. Otherwise, if any input/output/manifest path starts with `omniverse://`, Kit mode is chosen.
-  3. Otherwise, the environment variable `IFC_CONVERTER_DEFAULT_USD_MODE` (`kit` by default) decides the binding.
+  3. Otherwise, the environment variable `BUILDUSD_DEFAULT_USD_MODE` (`kit` by default, falls back to `IFC_CONVERTER_DEFAULT_USD_MODE`) decides the binding.
 - Exclusion handling honours the mode: `--exclude` takes bare stems or names with `.ifc` and skips them case-insensitively during directory scans (local paths or Nucleus directories).
 - Relevant environment variables:
-  - `IFC_CONVERTER_DEFAULT_USD_MODE` – `kit` (default) or `offline`; establishes the initial USD binding when the process starts.
+  - `BUILDUSD_DEFAULT_USD_MODE` / `IFC_CONVERTER_DEFAULT_USD_MODE` - `kit` (default) or `offline`; establishes the initial USD binding when the process starts.
   - `OMNI_KIT_ACCEPT_EULA` – set to `yes` to suppress Kit's interactive EULA prompt during headless launches.
   - `PYTHONUNBUFFERED` – optional; keep at `1` to stream logs without buffering during long conversions.
   - `USD_FORCE_MODULE_NAME` – honoured by pxr when present; useful if your USD distribution installs under a different module alias.
