@@ -1,4 +1,4 @@
-"""USD authoring helpers for the buildusd pipeline.
+﻿"""USD authoring helpers for the buildusd pipeline.
 
 The functions below consume the prototype/instance caches produced by
 ``process_ifc`` and emit the various USD layers (prototypes, materials,
@@ -20,12 +20,19 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
+import numpy as np
+
 from .pxr_utils import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
 from .config.manifest import BasePointConfig, GeodeticCoordinate
 from .io_utils import join_path, path_stem, write_text, is_omniverse_path, stat_entry
 from .process_ifc import ConversionOptions, CurveWidthRule, InstanceRecord, PrototypeCaches, PrototypeKey
 from .utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
+
+try:
+    from .ifc_visuals import PBRMaterial
+except Exception:  # pragma: no cover - optional dependency safety
+    PBRMaterial = None  # type: ignore
 
 # ---------------- Constants / Units ----------------
 
@@ -245,52 +252,292 @@ def create_usd_stage(usd_path, meters_per_unit=1.0):
 
 # ---------------- Mesh helpers ----------------
 
-def write_usd_mesh(stage, parent_path, mesh_name, verts, faces, abs_mat=None,
+Vec3 = Tuple[float, float, float]
+Vec2 = Tuple[float, float]
+
+
+def _reindex_for_uv_seams(
+    points: List[Vec3],
+    normals: Optional[List[Vec3]],
+    face_vertex_indices: List[int],
+    uv_per_corner: List[Vec2],
+) -> Tuple[List[Vec3], Optional[List[Vec3]], List[int], List[Vec2]]:
+    """Duplicate vertices at UV seams so st can use vertex interpolation."""
+    assert len(face_vertex_indices) == len(uv_per_corner), "UV corners must match vertex index count."
+    key_to_new_index: Dict[Tuple[int, float, float], int] = {}
+    new_points: List[Vec3] = []
+    new_normals: Optional[List[Vec3]] = [] if normals is not None else None
+    new_indices: List[int] = []
+    new_uvs: List[Vec2] = []
+
+    for corner_idx, original_index in enumerate(face_vertex_indices):
+        uv = uv_per_corner[corner_idx]
+        key = (int(original_index), float(uv[0]), float(uv[1]))
+        existing = key_to_new_index.get(key)
+        if existing is None:
+            new_index = len(new_points)
+            key_to_new_index[key] = new_index
+            new_points.append(points[original_index])
+            if new_normals is not None and normals is not None:
+                new_normals.append(normals[original_index])
+            new_uvs.append((float(uv[0]), float(uv[1])))
+        else:
+            new_index = existing
+        new_indices.append(new_index)
+
+    return new_points, new_normals, new_indices, new_uvs
+
+
+def _subset_token_for_material(material_index: int) -> str:
+    return _sanitize_identifier(f"Material_{material_index}", fallback=f"Material_{material_index}")
+
+
+def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not mesh_data:
+        return None
+
+    try:
+        verts_np = np.asarray(mesh_data.get("vertices"), dtype=np.float32)
+        faces_np = np.asarray(mesh_data.get("faces"), dtype=np.int64)
+    except Exception as exc:
+        LOG.debug("Mesh payload missing vertices/faces: %s", exc)
+        return None
+
+    if verts_np.size == 0 or faces_np.size == 0:
+        return None
+
+    try:
+        verts_np = verts_np.reshape(-1, 3)
+    except ValueError:
+        LOG.debug("Mesh vertices could not be reshaped to Nx3; skipping mesh.")
+        return None
+
+    if faces_np.ndim == 1:
+        if len(faces_np) % 3 != 0:
+            LOG.debug("Face index array is not divisible by 3; skipping mesh.")
+            return None
+        faces_np = faces_np.reshape(-1, 3)
+    elif faces_np.ndim != 2 or faces_np.shape[1] < 3:
+        LOG.debug("Unsupported face array shape %s; skipping mesh.", faces_np.shape)
+        return None
+
+    face_vertex_counts = [faces_np.shape[1]] * faces_np.shape[0]
+    face_vertex_indices = faces_np.reshape(-1).astype(int).tolist()
+    points = [tuple(map(float, row)) for row in verts_np.tolist()]
+
+    normals_interp: Optional[str] = None
+    normals_values: Optional[List[Vec3]] = None
+    normals_src = mesh_data.get("normals")
+    if normals_src is not None:
+        try:
+            normals_np = np.asarray(normals_src, dtype=np.float32).reshape(-1, 3)
+            if normals_np.shape[0] == verts_np.shape[0]:
+                normals_values = [tuple(map(float, row)) for row in normals_np.tolist()]
+                normals_interp = UsdGeom.Tokens.vertex
+        except Exception:
+            LOG.debug("Unable to process normals; continuing without them.", exc_info=True)
+
+    def _first_available(*names: str) -> Optional[Any]:
+        for name in names:
+            if name in mesh_data and mesh_data[name] is not None:
+                return mesh_data[name]
+        return None
+
+    uv_values = _first_available("uvs", "uv_coords", "uvcoordinates", "uv", "texcoords")
+    uv_indices = _first_available("uv_indices", "uv_index", "uvs_indices", "uvfaces", "uv_faces")
+    st_values: Optional[List[Vec2]] = None
+    st_interp: Optional[str] = None
+
+    if uv_values is not None:
+        try:
+            uv_np = np.asarray(uv_values, dtype=np.float32)
+            if uv_np.ndim == 1:
+                if uv_np.size % 2 != 0:
+                    raise ValueError("Flattened UV array length must be even.")
+                uv_np = uv_np.reshape(-1, 2)
+            elif uv_np.ndim >= 2:
+                uv_np = uv_np.reshape(-1, uv_np.shape[-1])[:, :2]
+            uv_per_corner: Optional[List[Vec2]] = None
+            if uv_indices is not None:
+                uv_idx_np = np.asarray(uv_indices, dtype=np.int64).flatten()
+                if uv_idx_np.size == len(face_vertex_indices):
+                    uv_per_corner = [tuple(map(float, uv_np[idx])) for idx in uv_idx_np]
+            else:
+                if uv_np.shape[0] == len(face_vertex_indices):
+                    uv_per_corner = [tuple(map(float, row)) for row in uv_np]
+                elif uv_np.shape[0] == verts_np.shape[0]:
+                    st_values = [tuple(map(float, row)) for row in uv_np]
+                    st_interp = UsdGeom.Tokens.vertex
+
+            if uv_per_corner is not None:
+                normals_for_reindex = normals_values if normals_interp == UsdGeom.Tokens.vertex else None
+                new_points, new_normals, new_indices, new_st = _reindex_for_uv_seams(
+                    points, normals_for_reindex, face_vertex_indices, uv_per_corner
+                )
+                points = new_points
+                face_vertex_indices = new_indices
+                face_vertex_counts = [3] * (len(face_vertex_indices) // 3)
+                st_values = new_st
+                st_interp = UsdGeom.Tokens.vertex
+                if new_normals is not None:
+                    normals_values = new_normals
+                    normals_interp = UsdGeom.Tokens.vertex
+        except Exception:
+            LOG.debug("Unable to process UV data; continuing without primvars:st.", exc_info=True)
+
+    return {
+        "points": points,
+        "face_vertex_indices": face_vertex_indices,
+        "face_vertex_counts": face_vertex_counts,
+        "normals": normals_values,
+        "normals_interpolation": normals_interp,
+        "st": st_values,
+        "st_interpolation": st_interp,
+    }
+
+
+def _ensure_material_subsets(mesh: UsdGeom.Mesh, material_ids: Optional[List[int]], face_count: int) -> None:
+    prim = mesh.GetPrim()
+    stage = prim.GetStage()
+    imageable = UsdGeom.Imageable(prim)
+    family_name = "materialBind"
+    element_token = UsdGeom.Tokens.face
+
+    def _collect_existing() -> List[UsdGeom.Subset]:
+        try:
+            subsets = UsdGeom.Subset.GetAllGeomSubsets(imageable)
+        except Exception:
+            return []
+        result: List[UsdGeom.Subset] = []
+        for subset in subsets:
+            try:
+                fam_attr = subset.GetFamilyNameAttr()
+                if not fam_attr:
+                    continue
+                value = fam_attr.Get()
+                if value is not None and str(value) == family_name:
+                    result.append(subset)
+            except Exception:
+                continue
+        return result
+
+    existing = _collect_existing()
+
+    if not material_ids:
+        for subset in existing:
+            stage.RemovePrim(subset.GetPrim().GetPath())
+        return
+    if len(material_ids) != face_count:
+        LOG.debug(
+            "Material ids length (%d) did not match face count (%d); skipping subset authoring for %s.",
+            len(material_ids),
+            face_count,
+            mesh.GetPath(),
+        )
+        return
+
+    for subset in existing:
+        stage.RemovePrim(subset.GetPrim().GetPath())
+    try:
+        UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
+    except Exception:
+        pass
+
+    indices_by_material: Dict[int, List[int]] = defaultdict(list)
+    for face_index, material_index in enumerate(material_ids):
+        indices_by_material[int(material_index)].append(int(face_index))
+    if not indices_by_material:
+        return
+
+    for material_index, face_indices in sorted(indices_by_material.items()):
+        subset_token = _subset_token_for_material(material_index)
+        subset_path = mesh.GetPath().AppendChild(subset_token)
+        subset = UsdGeom.Subset.Define(stage, subset_path)
+        try:
+            UsdGeom.Subset.SetElementType(subset, element_token)
+        except Exception:
+            try:
+                subset.CreateElementTypeAttr().Set(element_token)
+            except AttributeError:
+                subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+        subset.CreateIndicesAttr(Vt.IntArray(face_indices))
+        try:
+            UsdGeom.Subset.SetFamilyName(subset, family_name, element_token)
+        except Exception:
+            try:
+                subset.CreateFamilyNameAttr().Set(family_name)
+            except AttributeError:
+                subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+
+
+def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
                    material_ids=None, stage_meters_per_unit=1.0,
                    scale_matrix_translation=False):
     """Author a Mesh prim beneath ``parent_path`` with the supplied data."""
     mesh_path = Sdf.Path(parent_path).AppendChild(mesh_name)
     mesh = UsdGeom.Mesh.Define(stage, mesh_path)
 
-    if verts:
-        n = len(verts) // 3
-        pts = Vt.Vec3fArray(n)
-        for i in range(n):
-            x, y, z = verts[3*i:3*i+3]
-            pts[i] = Gf.Vec3f(float(x), float(y), float(z))
-        mesh.CreatePointsAttr(pts)
+    if isinstance(mesh_data, tuple) and len(mesh_data) >= 2:
+        verts, faces = mesh_data[:2]
+        mesh_dict: Dict[str, Any] = {
+            "vertices": np.asarray(verts, dtype=np.float32),
+            "faces": np.asarray(faces, dtype=np.int64),
+        }
+    elif isinstance(mesh_data, dict):
+        mesh_dict = mesh_data
+    else:
+        mesh_dict = {}
 
-    if faces:
-        mesh.CreateFaceVertexIndicesAttr(Vt.IntArray([int(i) for i in faces]))
-        mesh.CreateFaceVertexCountsAttr(Vt.IntArray([3] * (len(faces)//3)))
+    payload = _prepare_mesh_payload(mesh_dict)
+    if payload is None:
+        return mesh
+
+    points_attr = Vt.Vec3fArray(len(payload["points"]))
+    for i, (x, y, z) in enumerate(payload["points"]):
+        points_attr[i] = Gf.Vec3f(float(x), float(y), float(z))
+    mesh.CreatePointsAttr(points_attr)
+
+    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray([int(i) for i in payload["face_vertex_indices"]]))
+    mesh.CreateFaceVertexCountsAttr(Vt.IntArray([int(c) for c in payload["face_vertex_counts"]]))
+
+    normals_values = payload.get("normals")
+    if normals_values:
+        normals_attr = Vt.Vec3fArray(len(normals_values))
+        for i, (nx, ny, nz) in enumerate(normals_values):
+            normals_attr[i] = Gf.Vec3f(float(nx), float(ny), float(nz))
+        mesh.CreateNormalsAttr(normals_attr)
+        normals_interp = payload.get("normals_interpolation")
+        if normals_interp:
+            mesh.SetNormalsInterpolation(normals_interp)
+
+    st_values = payload.get("st")
+    st_interp = payload.get("st_interpolation")
+    if st_values and st_interp:
+        st_attr = Vt.TexCoord2fArray(len(st_values))
+        for i, (u, v) in enumerate(st_values):
+            st_attr[i] = (float(u), float(v))
+        primvars_api = UsdGeom.PrimvarsAPI(mesh)
+        st_primvar = primvars_api.CreatePrimvar("st", st_interp, Sdf.ValueTypeNames.TexCoord2fArray)
+        st_primvar.Set(st_attr)
 
     if abs_mat is not None:
         gf = np_to_gf_matrix(abs_mat)
         if scale_matrix_translation and stage_meters_per_unit != 1.0:
-            gf = scale_matrix_translation_only(gf, 1.0/float(stage_meters_per_unit))
+            gf = scale_matrix_translation_only(gf, 1.0 / float(stage_meters_per_unit))
         xf = UsdGeom.Xformable(mesh)
         xf.ClearXformOpOrder()
         xf.AddTransformOp().Set(gf)
 
+    mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+
     if material_ids:
-        mesh.GetPrim().CreateAttribute("ifc:materialIds", Sdf.ValueTypeNames.IntArray)\
-            .Set(Vt.IntArray([int(i) for i in material_ids]))
+        mat_attr = Vt.IntArray([int(i) for i in material_ids])
+        mesh.GetPrim().CreateAttribute("ifc:materialIds", Sdf.ValueTypeNames.IntArray).Set(mat_attr)
+        _ensure_material_subsets(mesh, list(mat_attr), len(payload["face_vertex_counts"]))
+    else:
+        _ensure_material_subsets(mesh, [], len(payload["face_vertex_counts"]))
+
     return mesh
-
-
-def _flatten_mesh_arrays(mesh: Dict[str, Any]) -> Optional[Tuple[List[float], List[int]]]:
-    """Return flattened vertex/face arrays from a mesh dict, or None if missing."""
-    if not mesh:
-        return None
-    verts = mesh.get("vertices")
-    faces = mesh.get("faces")
-    if verts is None or faces is None:
-        return None
-    verts_list = verts.flatten().tolist() if hasattr(verts, "flatten") else list(verts)
-    faces_list = faces.flatten().tolist() if hasattr(faces, "flatten") else list(faces)
-    if not verts_list or not faces_list:
-        return None
-    return verts_list, faces_list
 
 
 # ---------------- Prototype authoring ----------------
@@ -407,10 +654,9 @@ def author_prototype_layer(
         UsdGeom.Scope.Define(stage, proto_root)
 
         for key, proto in _iter_prototypes(caches):
-            mesh_data = _flatten_mesh_arrays(getattr(proto, "mesh", None))
-            if not mesh_data:
+            mesh_payload = getattr(proto, "mesh", None)
+            if not mesh_payload:
                 continue
-            verts, faces = mesh_data
 
             # Name the prototype Xform
             if key.kind == "repmap":
@@ -434,8 +680,7 @@ def author_prototype_layer(
                 stage,
                 proto_path,
                 "Geom",
-                verts,
-                faces,
+                mesh_payload,
                 abs_mat=None,
                 material_ids=list(getattr(proto, "material_ids", []) or []),
                 stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
@@ -447,14 +692,31 @@ def author_prototype_layer(
 
 # ---------------- Materials (kept minimal; wiring points preserved) ----------------
 
-def _prototype_materials(caches: PrototypeCaches, key: PrototypeKey) -> List[Any]:
+def _prototype_materials(caches: PrototypeCaches, key: PrototypeKey) -> Any:
     if key.kind == "repmap":
         proto = caches.repmaps.get(int(key.identifier))
     else:
         proto = caches.hashes.get(str(key.identifier))
     if not proto:
+        return {}
+    materials = getattr(proto, "materials", None)
+    if isinstance(materials, dict):
+        return materials
+    if isinstance(materials, (list, tuple)):
+        return list(materials)
+    if materials is None:
+        return {}
+    return materials
+
+
+def _iter_material_entries(materials: Any) -> Iterable[Tuple[Any, Any]]:
+    if isinstance(materials, dict):
+        return materials.items()
+    if isinstance(materials, (list, tuple)):
+        return enumerate(materials)
+    if materials is None:
         return []
-    return list(getattr(proto, "materials", []) or [])
+    return [("__value__", materials)]
 
 
 @dataclass(frozen=True)
@@ -463,6 +725,11 @@ class _MaterialProperties:
     display_color: Tuple[float, float, float]
     opacity: float
     emissive_color: Optional[Tuple[float, float, float]] = None
+
+
+@dataclass
+class MaterialLibrary:
+    signature_to_path: Dict[Tuple[Any, ...], Sdf.Path]
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -518,6 +785,35 @@ def _resolve_color_value(obj: Any) -> Optional[Tuple[float, float, float]]:
     return None
 
 
+def _material_properties_from_pbr(
+    material: Any,
+    fallback_name: str,
+) -> Optional[_MaterialProperties]:
+    if PBRMaterial is not None and isinstance(material, PBRMaterial):
+        base_color = _normalize_color(tuple(float(c) for c in material.base_color[:3]))
+        opacity = max(0.0, min(1.0, float(material.opacity)))
+        emissive = None
+        if material.emissive and max(material.emissive) > 0.0:
+            emissive = _normalize_color(tuple(float(c) for c in material.emissive[:3]))
+        name = material.name or fallback_name
+        return _MaterialProperties(name=name, display_color=base_color, opacity=opacity, emissive_color=emissive)
+    if isinstance(material, dict):
+        base = material.get("base_color")
+        if base is not None:
+            try:
+                base_color = _normalize_color(tuple(float(c) for c in base[:3]))
+                opacity = max(0.0, min(1.0, float(material.get("opacity", 1.0))))
+                emissive_value = material.get("emissive")
+                emissive = None
+                if emissive_value is not None:
+                    emissive = _normalize_color(tuple(float(c) for c in emissive_value[:3]))
+                name = str(material.get("name", fallback_name))
+                return _MaterialProperties(name=name, display_color=base_color, opacity=opacity, emissive_color=emissive)
+            except Exception:
+                pass
+    return None
+
+
 def _extract_material_properties(
     material: Any,
     *,
@@ -525,6 +821,11 @@ def _extract_material_properties(
     index: int,
 ) -> Optional[_MaterialProperties]:
     """Derive a usable material definition from an ifcopenshell geometry material."""
+    fallback_name = f"{prototype_label}_Material_{index + 1}"
+    pbr_props = _material_properties_from_pbr(material, fallback_name)
+    if pbr_props is not None:
+        return pbr_props
+
     def _get_value(obj: Any, *names: str) -> Any:
         for name in names:
             if isinstance(obj, dict) and name in obj:
@@ -541,7 +842,7 @@ def _extract_material_properties(
     if isinstance(name_value, str):
         name_value = name_value.strip()
     if not name_value:
-        name_value = f"{prototype_label}_Material_{index + 1}"
+        name_value = fallback_name
 
     color_source = _get_value(
         material,
@@ -618,39 +919,23 @@ def _material_signature(props: _MaterialProperties) -> Tuple[Any, ...]:
     )
 
 
-def _material_display_color(stage: Usd.Stage, material_path: Sdf.Path) -> Optional[Gf.Vec3f]:
-    """Resolve a material's authored display/diffuse colour."""
-    mat_prim = stage.GetPrimAtPath(material_path)
-    if not mat_prim:
-        return None
-    material = UsdShade.Material(mat_prim)
-    if not material:
-        return None
-    display_attr = mat_prim.GetAttribute("displayColor")
-    if display_attr and display_attr.HasAuthoredValue():
-        try:
-            value = display_attr.Get()
-            if isinstance(value, Gf.Vec3f):
-                return value
-            return Gf.Vec3f(float(value[0]), float(value[1]), float(value[2]))
-        except Exception:
-            pass
-    surface = material.GetSurfaceOutput()
-    if surface:
-        source = surface.GetConnectedSource()
-        if source:
-            shader = source[0]
-            if shader:
-                diffuse = shader.GetInput("diffuseColor")
-                if diffuse and diffuse.HasAuthoredValue():
-                    try:
-                        value = diffuse.Get()
-                        if isinstance(value, Gf.Vec3f):
-                            return value
-                        return Gf.Vec3f(float(value[0]), float(value[1]), float(value[2]))
-                    except Exception:
-                        pass
-    return None
+def _author_preview_surface(stage: Usd.Stage, material_path: Sdf.Path, props: _MaterialProperties) -> UsdShade.Material:
+    material = UsdShade.Material.Define(stage, material_path)
+    shader = UsdShade.Shader.Define(stage, material_path.AppendChild("PreviewSurface"))
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.display_color))
+    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(props.opacity))
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.5)
+    if props.emissive_color:
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.emissive_color))
+    shader_surface_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+    material_surface_output = material.CreateSurfaceOutput()
+    material_surface_output.ConnectToSource(shader_surface_output)
+    prim = material.GetPrim()
+    prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(Gf.Vec3f(*props.display_color))
+    prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(float(props.opacity))
+    return material
 
 
 def _apply_display_color_to_prim(prim: Usd.Prim, color: Optional[Gf.Vec3f]) -> None:
@@ -658,6 +943,91 @@ def _apply_display_color_to_prim(prim: Usd.Prim, color: Optional[Gf.Vec3f]) -> N
         return
     attr = prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True)
     attr.Set(color)
+
+
+def _resolve_instance_materials(
+    record: InstanceRecord,
+    caches: PrototypeCaches,
+    proto_paths: Dict[PrototypeKey, Sdf.Path],
+    material_library: Optional[MaterialLibrary],
+) -> Tuple[Dict[Any, Sdf.Path], Optional[Gf.Vec3f]]:
+    materials_container: Any = record.materials if getattr(record, "materials", None) else None
+    label = sanitize_name(record.name, fallback=f"Ifc_{record.step_id}")
+    if not materials_container and record.prototype is not None:
+        materials_container = _prototype_materials(caches, record.prototype)
+        proto_path = proto_paths.get(record.prototype) if proto_paths else None
+        if proto_path:
+            label = sanitize_name(proto_path.name, fallback=label)
+    resolved_paths: Dict[Any, Sdf.Path] = {}
+    display_color: Optional[Gf.Vec3f] = None
+
+    def _apply_style(style_obj: Any, source: str) -> None:
+        nonlocal display_color
+        if style_obj is None:
+            return
+        props = _material_properties_from_pbr(style_obj, label)
+        if props is None:
+            return
+        if display_color is None:
+            display_color = Gf.Vec3f(*props.display_color)
+        if material_library is None:
+            return
+        signature = _material_signature(props)
+        material_path = material_library.signature_to_path.get(signature)
+        if material_path:
+            resolved_paths.setdefault(f"__style__{source}", material_path)
+        if "ARX" in label.upper() or "PROP" in label.upper():
+            LOG.info(
+                "IFC style material applied for %s (%s): %s",
+                label,
+                source,
+                props,
+            )
+
+    _apply_style(getattr(record, "style_material", None), "instance")
+    if record.prototype is not None:
+        _apply_style(_prototype_style_material(caches, record.prototype), "prototype")
+
+    for entry_index, (material_key, material_value) in enumerate(_iter_material_entries(materials_container)):
+        props = _extract_material_properties(material_value, prototype_label=label, index=entry_index)
+        if props is not None and display_color is None:
+            display_color = Gf.Vec3f(*props.display_color)
+        if "ARX" in label.upper() or "PROP" in label.upper():
+            try:
+                LOG.info(
+                    "IFC material debug for %s idx=%d raw=%s props=%s",
+                    label,
+                    material_key,
+                    material_value,
+                    props,
+                )
+            except Exception:
+                LOG.info("IFC material debug for %s idx=%s (unprintable material)", label, material_key)
+        if material_library is None or props is None:
+            continue
+        signature = _material_signature(props)
+        material_path = material_library.signature_to_path.get(signature)
+        if material_path:
+            resolved_paths[material_key] = material_path
+
+    return resolved_paths, display_color
+
+
+def _apply_material_bindings_to_prim(
+    stage: Usd.Stage,
+    prim: Usd.Prim,
+    resolved_materials: Dict[Any, Sdf.Path],
+) -> Optional[Sdf.Path]:
+    if not resolved_materials:
+        return None
+    material_path = next(iter(resolved_materials.values()), None)
+    if material_path is None:
+        return None
+    material = UsdShade.Material.Get(stage, material_path)
+    if not material:
+        return None
+    UsdShade.MaterialBindingAPI(prim).Bind(material)
+    return material_path
 
 
 def author_material_layer(
@@ -671,8 +1041,8 @@ def author_material_layer(
 ) -> Tuple[Sdf.Layer, Dict[PrototypeKey, List[Sdf.Path]]]:
     """Author a material layer and return mapping from prototype key to materials.
 
-    This is a minimal binding scaffold; you can restore richer bindings without
-    changing any public signatures.
+    Materials are authored once per unique signature and returned as a lookup
+    table so instances can bind the appropriate previews at author time.
     """
     material_layer = _prepare_writable_layer(layer_path)
     log = logging.getLogger(__name__)
@@ -686,102 +1056,50 @@ def author_material_layer(
     if proto_sub_path not in proto_layer.subLayerPaths:
         proto_layer.subLayerPaths.append(proto_sub_path)
 
-    material_root = Sdf.Path("/World/__Materials")
-    material_paths: Dict[PrototypeKey, List[Sdf.Path]] = {}
+    material_root = Sdf.Path("/World/Materials")
+    signature_to_path: Dict[Tuple[Any, ...], Sdf.Path] = {}
     used_names: Dict[str, int] = {}
-    authored_signatures: Dict[Tuple[Any, ...], Sdf.Path] = {}
+
+    def _material_sources() -> Iterable[Tuple[str, Any]]:
+        for record in caches.instances.values():
+            label = sanitize_name(record.name, fallback="Instance")
+            materials = record.materials if getattr(record, "materials", None) else None
+            if materials:
+                yield label, materials
+            style = getattr(record, "style_material", None)
+            if style is not None:
+                yield f"{label}_style", {"style": style}
+        for key, proto in _iter_prototypes(caches):
+            materials = _prototype_materials(caches, key)
+            proto_path = proto_paths.get(key) if proto_paths else None
+            label_source = proto_path.name if proto_path else getattr(proto, "type_name", None) or getattr(proto, "name", None)
+            label = sanitize_name(label_source, fallback="Prototype")
+            if materials:
+                yield label, materials
+            style_candidate = getattr(proto, "style_material", None)
+            if style_candidate is not None:
+                yield f"{label}_style", {"style": style_candidate}
 
     with Usd.EditContext(stage, material_layer):
         UsdGeom.Scope.Define(stage, material_root)
 
-        for key, proto in _iter_prototypes(caches):
-            proto_path = proto_paths.get(key)
-            if proto_path is None:
-                continue
-            materials = _prototype_materials(caches, key)
-            if not materials:
-                continue
-
-            proto_label = sanitize_name(proto_path.name, fallback="Prototype")
-            material_prims: List[Sdf.Path] = []
-
-            for idx, material in enumerate(materials):
-                props = _extract_material_properties(material, prototype_label=proto_label, index=idx)
+        for label, materials in _material_sources():
+            for entry_index, (material_key, material_value) in enumerate(_iter_material_entries(materials)):
+                props = _extract_material_properties(material_value, prototype_label=label, index=entry_index)
                 if props is None:
                     continue
                 signature = _material_signature(props)
-                material_prim_path = authored_signatures.get(signature)
-                if material_prim_path is None:
-                    base_name = sanitize_name(props.name, fallback=f"{proto_label}_Material")
-                    count = used_names.get(base_name, 0)
-                    used_names[base_name] = count + 1
-                    if count:
-                        token = f"{base_name}_{count}"
-                    else:
-                        token = base_name
-                    material_prim_path = material_root.AppendChild(token)
-                    authored_signatures[signature] = material_prim_path
+                if signature in signature_to_path:
+                    continue
+                base_name = sanitize_name(props.name, fallback=f"{label}_Material")
+                token = _unique_name(base_name, used_names)
+                material_prim_path = material_root.AppendChild(token)
+                _author_preview_surface(stage, material_prim_path, props)
+                signature_to_path[signature] = material_prim_path
+                log.debug("Authored material %s for signature %s", material_prim_path, signature)
 
-                    material_prim = UsdShade.Material.Define(stage, material_prim_path)
-                    shader_path = material_prim_path.AppendChild("PreviewSurface")
-                    shader = UsdShade.Shader.Define(stage, shader_path)
-                    shader.CreateIdAttr("UsdPreviewSurface")
-                    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.display_color))
-                    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-                    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.5)
-                    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(props.opacity))
-                    if props.emissive_color:
-                        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.emissive_color))
-                    surface_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
-                    material_prim.CreateSurfaceOutput().ConnectToSource(surface_output)
-                    material_usd_prim = material_prim.GetPrim()
-                    material_usd_prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(
-                        Gf.Vec3f(*props.display_color)
-                    )
-                    material_usd_prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(
-                        float(props.opacity)
-                    )
-
-                material_prims.append(material_prim_path)
-
-            if material_prims:
-                material_paths[key] = material_prims
-
-    return material_layer, material_paths
-
-
-def bind_materials_to_prototypes(
-    stage: Usd.Stage,
-    proto_layer: Sdf.Layer,
-    proto_paths: Dict[PrototypeKey, Sdf.Path],
-    material_paths: Dict[PrototypeKey, List[Sdf.Path]],
-) -> None:
-    """Bind first available material to each prototype mesh if present."""
-    if not material_paths:
-        return
-
-    with Usd.EditContext(stage, proto_layer):
-        for key, proto_path in proto_paths.items():
-            mesh_path = proto_path.AppendChild("Geom")
-            mesh_prim = stage.GetPrimAtPath(mesh_path)
-            if not mesh_prim:
-                continue
-            proto_prim = stage.GetPrimAtPath(proto_path)
-            if not proto_prim:
-                continue
-            materials = material_paths.get(key)
-            if not materials:
-                continue
-            material = UsdShade.Material(stage.GetPrimAtPath(materials[0]))
-            if not material:
-                continue
-            UsdShade.MaterialBindingAPI(proto_prim).Bind(material)
-            color_vec = _material_display_color(stage, materials[0])
-            if color_vec is not None:
-                mesh_geom = UsdGeom.Mesh(mesh_prim)
-                mesh_display_attr = mesh_geom.GetDisplayColorAttr()
-                mesh_display_attr.Set(Vt.Vec3fArray([color_vec]))
-                _apply_display_color_to_prim(proto_prim, color_vec)
+    library = MaterialLibrary(signature_to_path)
+    return material_layer, library
 
 
 # ---------------- Instance authoring ----------------
@@ -790,7 +1108,7 @@ def author_instance_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
     proto_paths: Dict[PrototypeKey, Sdf.Path],
-    prototype_material_paths: Dict[PrototypeKey, List[Sdf.Path]],
+    material_library: Optional[MaterialLibrary],
     layer_path: PathLike,
     base_name: str,
     options: ConversionOptions,
@@ -805,7 +1123,7 @@ def author_instance_layer(
     :param stage: The USD stage to author the layer in.
     :param caches: The cached prototype meshes.
     :param proto_paths: A mapping from prototype key to USD path.
-    :param prototype_material_paths: Mapping of prototype key to authored material paths.
+    :param material_library: Lookup of resolved materials authored on the material layer.
     :param layer_path: The path to the layer to be created.
     :param base_name: The base name of the layer.
     :param options: Optional conversion options.
@@ -897,36 +1215,37 @@ def author_instance_layer(
             if getattr(options, "convert_metadata", True) and getattr(record, "attributes", None):
                 _author_instance_attributes(inst_prim, record.attributes)
 
+            resolved_materials, resolved_color = _resolve_instance_materials(
+                record, caches, proto_paths, material_library
+            )
+            material_ids = list(record.material_ids or [])
+
             # Per-instance mesh fallback (non-instanced geometry)
             if record.mesh:
-                mesh_data = _flatten_mesh_arrays(record.mesh)
-                if mesh_data:
-                    verts, faces = mesh_data
-                    write_usd_mesh(
-                        stage,
-                        inst_path,
-                        "Geom",
-                        verts,
-                        faces,
-                        abs_mat=None,
-                        material_ids=list(record.material_ids or []),
-                        stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
-                    )
-                    color = None
-                    if record.materials:
-                        props = _extract_material_properties(
-                            record.materials[0], prototype_label=record.name, index=0
-                        )
-                        if props:
-                            color = Gf.Vec3f(*props.display_color)
-                    _apply_display_color_to_prim(inst_prim, color)
+                mesh_geom = write_usd_mesh(
+                    stage,
+                    inst_path,
+                    "Geom",
+                    record.mesh,
+                    abs_mat=None,
+                    material_ids=material_ids,
+                    stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
+                )
+                if resolved_materials:
+                    _apply_material_bindings_to_prim(stage, inst_prim, resolved_materials)
+                if resolved_color is not None:
+                    _apply_display_color_to_prim(inst_prim, resolved_color)
                 continue
 
             # Prototype reference
             if record.prototype is None:
+                if resolved_color is not None:
+                    _apply_display_color_to_prim(inst_prim, resolved_color)
                 continue
             proto_path = proto_paths.get(record.prototype)
             if proto_path is None:
+                if resolved_color is not None:
+                    _apply_display_color_to_prim(inst_prim, resolved_color)
                 continue
 
             ref_path = inst_path.AppendChild("Prototype")
@@ -946,17 +1265,10 @@ def author_instance_layer(
             # Ensure the referenced payload renders even if prototype purpose is 'guide'
             UsdGeom.Imageable(ref_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
 
-            color = None
-            proto_materials = prototype_material_paths.get(record.prototype) if prototype_material_paths else None
-            if proto_materials:
-                color = _material_display_color(stage, proto_materials[0])
-            if color is None and record.materials:
-                props = _extract_material_properties(
-                    record.materials[0], prototype_label=record.name, index=0
-                )
-                if props:
-                    color = Gf.Vec3f(*props.display_color)
-            _apply_display_color_to_prim(inst_prim, color)
+            if resolved_materials:
+                _apply_material_bindings_to_prim(stage, inst_prim, resolved_materials)
+            if resolved_color is not None:
+                _apply_display_color_to_prim(inst_prim, resolved_color)
 
     return inst_layer
 
