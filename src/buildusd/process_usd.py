@@ -405,6 +405,18 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 
 def _collect_material_subsets(imageable: UsdGeom.Imageable, family_name: str) -> List[UsdGeom.Subset]:
+    # Prefer the filtered API when available (USD 24/25)
+    try:
+        subsets = UsdGeom.Subset.GetGeomSubsets(
+            imageable,
+            elementType=UsdGeom.Tokens.face,
+            familyName=family_name,
+        )
+        if subsets:
+            return list(subsets)
+    except Exception:
+        pass
+
     try:
         subsets = UsdGeom.Subset.GetAllGeomSubsets(imageable)
     except Exception:
@@ -576,6 +588,33 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
         _ensure_material_subsets(mesh, list(mat_attr), face_count, style_groups=style_groups)
     else:
         _ensure_material_subsets(mesh, [], face_count, style_groups=style_groups)
+
+    # If a single style group covers the entire mesh, author displayColor for quick previews
+    try:
+        if style_groups:
+            for entry in style_groups.values():
+                faces = entry.get("faces") or []
+                material = entry.get("material")
+                if not faces or len(faces) != face_count:
+                    continue
+                display = getattr(material, "base_color", None) or getattr(material, "display_color", None)
+                if not display and isinstance(material, dict):
+                    display = (
+                        material.get("diffuseColor")
+                        or material.get("DiffuseColor")
+                        or material.get("diffuse_color")
+                        or material.get("Color")
+                        or material.get("colour")
+                    )
+                if not display:
+                    continue
+                display_values = display[:3] if hasattr(display, "__getitem__") else (display, display, display)
+                display_tuple = tuple(float(c) for c in display_values)
+                color = Vt.Vec3fArray([Gf.Vec3f(*_normalize_color(display_tuple))])
+                UsdGeom.Gprim(mesh.GetPrim()).CreateDisplayColorAttr().Set(color)
+                break
+    except Exception:
+        pass
 
     return mesh
 
@@ -1351,19 +1390,18 @@ def author_instance_layer(
                     )
                 if resolved_color is not None:
                     _apply_display_color_to_prim(inst_prim, resolved_color)
-                    gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
-                    gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
+                    try:
+                        mesh_gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
+                        mesh_gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
+                    except Exception:
+                        pass
                 continue
 
             # Prototype reference
             if record.prototype is None:
-                if resolved_color is not None:
-                    _apply_display_color_to_prim(inst_prim, resolved_color)
                 continue
             proto_path = proto_paths.get(record.prototype)
             if proto_path is None:
-                if resolved_color is not None:
-                    _apply_display_color_to_prim(inst_prim, resolved_color)
                 continue
 
             ref_path = inst_path.AppendChild("Prototype")
@@ -1382,6 +1420,9 @@ def author_instance_layer(
 
             # Ensure the referenced payload renders even if prototype purpose is 'guide'
             UsdGeom.Imageable(ref_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
+            mesh_child_path = ref_path.AppendChild("Geom")
+            mesh_child_override = stage.OverridePrim(mesh_child_path)
+            UsdGeom.Imageable(mesh_child_override).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
 
             if resolved_materials:
                 proto_mesh_path = proto_path.AppendChild("Geom")
@@ -1394,6 +1435,12 @@ def author_instance_layer(
                 )
             if resolved_color is not None:
                 _apply_display_color_to_prim(inst_prim, resolved_color)
+                try:
+                    mesh_child_override.CreateAttribute(
+                        "displayColor", Sdf.ValueTypeNames.Color3f, custom=True
+                    ).Set(resolved_color)
+                except Exception:
+                    pass
 
     return inst_layer
 
@@ -2053,6 +2100,12 @@ def update_federated_view(
     refs.ClearReferences()
     refs.AddReference(_layer_identifier(payload_stage_path))
     UsdGeom.Imageable(payload_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
+    try:
+        mesh_child_path = target_path.AppendChild("Geom")
+        mesh_override = stage.OverridePrim(mesh_child_path)
+        UsdGeom.Imageable(mesh_override).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
+    except Exception:
+        pass
     stage.GetRootLayer().Save()
     return stage.GetRootLayer()
 
