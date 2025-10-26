@@ -19,7 +19,7 @@ import re
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -452,8 +452,35 @@ def _ensure_material_subsets(
     for subset in existing:
         stage.RemovePrim(subset.GetPrim().GetPath())
 
+    use_style_groups = False
     if style_groups:
-        created = False
+        seen_faces: Set[int] = set()
+        valid = True
+        for entry in style_groups.values():
+            faces = entry.get("faces") or []
+            for face_index in faces:
+                try:
+                    face_int = int(face_index)
+                except Exception:
+                    valid = False
+                    break
+                if face_int < 0 or face_int >= face_count:
+                    valid = False
+                    break
+                seen_faces.add(face_int)
+            if not valid:
+                break
+        if valid and len(seen_faces) == face_count:
+            use_style_groups = True
+        else:
+            LOG.debug(
+                "Style groups did not cover the entire mesh (%d/%d faces); falling back to material_ids for %s.",
+                len(seen_faces),
+                face_count,
+                mesh.GetPath(),
+            )
+
+    if use_style_groups:
         for key, entry in style_groups.items():
             faces = entry.get("faces") or []
             if not faces:
@@ -473,12 +500,10 @@ def _ensure_material_subsets(
                 subset.CreateFamilyNameAttr().Set(family_name)
             except Exception:
                 subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
-            created = True
-        if created:
-            try:
-                UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
-            except Exception:
-                pass
+        try:
+            UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
+        except Exception:
+            pass
         return
 
     if not material_ids:
