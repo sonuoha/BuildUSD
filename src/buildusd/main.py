@@ -34,7 +34,6 @@ from .process_usd import (
     author_instance_layer,
     author_material_layer,
     author_prototype_layer,
-    bind_materials_to_prototypes,
     author_geometry2d_layer,
     create_usd_stage,
     persist_instance_cache,
@@ -1155,12 +1154,19 @@ def _process_single_ifc(
         stage = create_usd_stage(layout.stage)
         proto_layer, proto_paths = author_prototype_layer(stage, caches, layout.prototypes, base_name, options)
         _ensure_not_cancelled(cancel_event)
-        mat_layer, material_paths = author_material_layer(
+        mat_layer, material_library = author_material_layer(
             stage, caches, proto_paths, layer_path=layout.materials, base_name=base_name, proto_layer=proto_layer, options=options,
         )
         _ensure_not_cancelled(cancel_event)
-        bind_materials_to_prototypes(stage, proto_layer, proto_paths, material_paths)
-        inst_layer = author_instance_layer(stage, caches, proto_paths, material_paths, layer_path=layout.instances, base_name=base_name, options=options)
+        inst_layer = author_instance_layer(
+            stage,
+            caches,
+            proto_paths,
+            material_library,
+            layer_path=layout.instances,
+            base_name=base_name,
+            options=options,
+        )
         _ensure_not_cancelled(cancel_event)
         geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name, options)
         _ensure_not_cancelled(cancel_event)
