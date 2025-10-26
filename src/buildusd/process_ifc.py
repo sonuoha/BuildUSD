@@ -21,6 +21,13 @@ import numpy as np
 import ifcopenshell
 import os
 import math
+import re
+from typing import Dict, Optional, Union, Literal, List, Tuple, Any, TYPE_CHECKING, Iterable
+from dataclasses import dataclass, field
+import hashlib
+
+from .ifc_visuals import PBRMaterial, build_material_for_product, extract_face_style_groups
+
 
 def _clone_materials(source):
     if source is None:
@@ -39,10 +46,17 @@ def _clone_materials(source):
     if isinstance(source, (list, tuple)):
         return [value for value in source]
     return source
-import re
-from typing import Dict, Optional, Union, Literal, List, Tuple, Any, TYPE_CHECKING, Iterable
-from dataclasses import dataclass, field
-import hashlib
+
+
+def _clone_style_groups(groups):
+    if not groups:
+        return {}
+    cloned: Dict[str, Dict[str, Any]] = {}
+    for key, entry in groups.items():
+        material = entry.get("material")
+        faces = [int(idx) for idx in entry.get("faces", [])]
+        cloned[key] = {"material": material, "faces": faces}
+    return cloned
 
 # USD-lite vector/matrix shim for placement helpers
 try:
@@ -99,7 +113,7 @@ _BASE_GEOM_SETTINGS: Dict[str, Any] = {
     "use-world-coords": False,
     "weld-vertices": True,
     "disable-opening-subtractions": False,
-    "apply-default-materials": False,
+    "apply-default-materials": True,
     "mesher-linear-deflection": 0.005,
     "mesher-angular-deflection": 0.5,
 }
@@ -286,6 +300,7 @@ class MeshProto:
     settings_fp: Optional[str] = None
     materials: List[Any] = field(default_factory=list)
     material_ids: List[int] = field(default_factory=list)
+    style_face_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     count: int = 0
     style_material: Optional[PBRMaterial] = None
 
@@ -302,6 +317,7 @@ class HashProto:
     material_ids: List[int] = field(default_factory=list)
     signature: Optional[Tuple[Any, ...]] = None
     canonical_frame: Optional[Tuple[float, ...]] = None
+    style_face_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     settings_fp: Optional[str] = None
     count: int = 0
     style_material: Optional[PBRMaterial] = None
@@ -377,6 +393,7 @@ class InstanceRecord:
     mesh: Optional[Dict[str, Any]] = None
     guid: Optional[str] = None
     style_material: Optional[PBRMaterial] = None
+    style_face_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 @dataclass
 class AnnotationCurve:
@@ -1163,6 +1180,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             style_material = build_material_for_product(product)
         except Exception:
             style_material = None
+        face_style_groups = extract_face_style_groups(product) or {}
         settings_fp_current = settings_fp_base
 
         product_class = product.is_a() if hasattr(product, "is_a") else None
@@ -1185,13 +1203,14 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         if face_count and material_ids and len(material_ids) != face_count:
             geom_attrs = [name for name in dir(geom) if name.startswith("material") or name.endswith("counts")]
             log.debug(
-                "Material mismatch for %s (%s): faces=%d material_ids=%d geom_attrs=%s style=%s",
+                "Material mismatch for %s (%s): faces=%d material_ids=%d geom_attrs=%s style=%s styledFaces=%d",
                 getattr(product, "GlobalId", None),
                 product.is_a() if hasattr(product, "is_a") else "IfcProduct",
                 face_count,
                 len(material_ids),
                 geom_attrs,
                 getattr(style_material, "name", None),
+                sum(len(entry.get("faces", [])) for entry in face_style_groups.values()),
             )
         detail_reasons: List[str] = []
         detail_mode = "base"
@@ -1326,6 +1345,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     type_guid=type_guid,
                     repmap_index=None,
                     style_material=style_material,
+                    style_face_groups=_clone_style_groups(face_style_groups),
                 )
                 repmaps[type_id] = info
             else:
@@ -1334,11 +1354,15 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 if info.type_guid is None and type_guid is not None: info.type_guid = type_guid
                 if info.style_material is None and style_material is not None:
                     info.style_material = style_material
+                if not info.style_face_groups and face_style_groups:
+                    info.style_face_groups = _clone_style_groups(face_style_groups)
 
             if info.mesh is None and mesh_hash is not None:
                 info.mesh = mesh_dict; info.mesh_hash = mesh_hash; info.settings_fp = settings_fp_current
                 if not info.materials and materials: info.materials = _clone_materials(materials)
                 if not info.material_ids and material_ids: info.material_ids = list(material_ids)
+                if not info.style_face_groups and face_style_groups:
+                    info.style_face_groups = _clone_style_groups(face_style_groups)
                 info.count = 0
 
             if info.mesh is not None and info.mesh_hash == mesh_hash and info.settings_fp == settings_fp_current:
@@ -1362,14 +1386,19 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                         settings_fp=settings_fp_current,
                         count=0,
                         style_material=style_material,
+                        style_face_groups=_clone_style_groups(face_style_groups),
                     )
                     hashes[digest] = bucket
                 bucket.count += 1
                 if not bucket.materials and materials: bucket.materials = _clone_materials(materials)
                 if not bucket.material_ids and material_ids: bucket.material_ids = list(material_ids)
                 if bucket.mesh is None: bucket.mesh = mesh_dict
+                if not bucket.style_face_groups and face_style_groups:
+                    bucket.style_face_groups = _clone_style_groups(face_style_groups)
                 if bucket.style_material is None and style_material is not None:
                     bucket.style_material = style_material
+                if not bucket.style_face_groups and face_style_groups:
+                    bucket.style_face_groups = _clone_style_groups(face_style_groups)
                 if bucket.canonical_frame is None and xf_tuple is not None and _is_affine_invertible_tuple(xf_tuple):
                     bucket.canonical_frame = xf_tuple
                 primary_key = PrototypeKey(kind="hash", identifier=digest)
@@ -1448,6 +1477,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             mesh=instance_mesh,
             guid=guid,
             style_material=style_material,
+            style_face_groups=_clone_style_groups(face_style_groups),
         )
 
         if not iterator.next(): break

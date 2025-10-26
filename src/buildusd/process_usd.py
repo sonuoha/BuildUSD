@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 from textwrap import dedent
 from contextlib import nullcontext
 import fnmatch
+import hashlib
 import json
 import re
 import logging
@@ -288,8 +289,15 @@ def _reindex_for_uv_seams(
     return new_points, new_normals, new_indices, new_uvs
 
 
-def _subset_token_for_material(material_index: int) -> str:
-    return _sanitize_identifier(f"Material_{material_index}", fallback=f"Material_{material_index}")
+def _subset_token_for_material(material_index: Any) -> str:
+    if isinstance(material_index, int):
+        base = f"Material_{material_index}"
+        return _sanitize_identifier(base, fallback=base)
+    text = str(material_index)
+    sanitized = sanitize_name(text, fallback="Style")
+    if not sanitized:
+        sanitized = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:8]
+    return sanitized
 
 
 def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -396,36 +404,72 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
     }
 
 
-def _ensure_material_subsets(mesh: UsdGeom.Mesh, material_ids: Optional[List[int]], face_count: int) -> None:
+def _collect_material_subsets(imageable: UsdGeom.Imageable, family_name: str) -> List[UsdGeom.Subset]:
+    try:
+        subsets = UsdGeom.Subset.GetAllGeomSubsets(imageable)
+    except Exception:
+        return []
+    result: List[UsdGeom.Subset] = []
+    for subset in subsets:
+        try:
+            fam_attr = subset.GetFamilyNameAttr()
+            if not fam_attr:
+                continue
+            value = fam_attr.Get()
+            if value is not None and str(value) == family_name:
+                result.append(subset)
+        except Exception:
+            continue
+    return result
+
+
+def _ensure_material_subsets(
+    mesh: UsdGeom.Mesh,
+    material_ids: Optional[List[int]],
+    face_count: int,
+    *,
+    style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> None:
     prim = mesh.GetPrim()
     stage = prim.GetStage()
     imageable = UsdGeom.Imageable(prim)
     family_name = "materialBind"
     element_token = UsdGeom.Tokens.face
 
-    def _collect_existing() -> List[UsdGeom.Subset]:
-        try:
-            subsets = UsdGeom.Subset.GetAllGeomSubsets(imageable)
-        except Exception:
-            return []
-        result: List[UsdGeom.Subset] = []
-        for subset in subsets:
-            try:
-                fam_attr = subset.GetFamilyNameAttr()
-                if not fam_attr:
-                    continue
-                value = fam_attr.Get()
-                if value is not None and str(value) == family_name:
-                    result.append(subset)
-            except Exception:
-                continue
-        return result
+    existing = _collect_material_subsets(imageable, family_name)
+    for subset in existing:
+        stage.RemovePrim(subset.GetPrim().GetPath())
 
-    existing = _collect_existing()
+    if style_groups:
+        created = False
+        for key, entry in style_groups.items():
+            faces = entry.get("faces") or []
+            if not faces:
+                continue
+            subset_token = _subset_token_for_material(key)
+            subset_path = mesh.GetPath().AppendChild(subset_token)
+            subset = UsdGeom.Subset.Define(stage, subset_path)
+            try:
+                UsdGeom.Subset.SetElementType(subset, element_token)
+            except Exception:
+                try:
+                    subset.CreateElementTypeAttr().Set(element_token)
+                except AttributeError:
+                    subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+            subset.CreateIndicesAttr(Vt.IntArray([int(i) for i in faces]))
+            try:
+                subset.CreateFamilyNameAttr().Set(family_name)
+            except Exception:
+                subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+            created = True
+        if created:
+            try:
+                UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
+            except Exception:
+                pass
+        return
 
     if not material_ids:
-        for subset in existing:
-            stage.RemovePrim(subset.GetPrim().GetPath())
         return
     if len(material_ids) != face_count:
         LOG.debug(
@@ -436,8 +480,6 @@ def _ensure_material_subsets(mesh: UsdGeom.Mesh, material_ids: Optional[List[int
         )
         return
 
-    for subset in existing:
-        stage.RemovePrim(subset.GetPrim().GetPath())
     try:
         UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
     except Exception:
@@ -462,16 +504,13 @@ def _ensure_material_subsets(mesh: UsdGeom.Mesh, material_ids: Optional[List[int
                 subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
         subset.CreateIndicesAttr(Vt.IntArray(face_indices))
         try:
-            UsdGeom.Subset.SetFamilyName(subset, family_name, element_token)
+            subset.CreateFamilyNameAttr().Set(family_name)
         except Exception:
-            try:
-                subset.CreateFamilyNameAttr().Set(family_name)
-            except AttributeError:
-                subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+            subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
 
 
 def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
-                   material_ids=None, stage_meters_per_unit=1.0,
+                   material_ids=None, style_groups=None, stage_meters_per_unit=1.0,
                    scale_matrix_translation=False):
     """Author a Mesh prim beneath ``parent_path`` with the supplied data."""
     mesh_path = Sdf.Path(parent_path).AppendChild(mesh_name)
@@ -530,12 +569,13 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
 
     mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
 
+    face_count = len(payload["face_vertex_counts"])
     if material_ids:
         mat_attr = Vt.IntArray([int(i) for i in material_ids])
         mesh.GetPrim().CreateAttribute("ifc:materialIds", Sdf.ValueTypeNames.IntArray).Set(mat_attr)
-        _ensure_material_subsets(mesh, list(mat_attr), len(payload["face_vertex_counts"]))
+        _ensure_material_subsets(mesh, list(mat_attr), face_count, style_groups=style_groups)
     else:
-        _ensure_material_subsets(mesh, [], len(payload["face_vertex_counts"]))
+        _ensure_material_subsets(mesh, [], face_count, style_groups=style_groups)
 
     return mesh
 
@@ -683,6 +723,7 @@ def author_prototype_layer(
                 mesh_payload,
                 abs_mat=None,
                 material_ids=list(getattr(proto, "material_ids", []) or []),
+                style_groups=getattr(proto, "style_face_groups", None),
                 stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
             )
 
@@ -709,6 +750,19 @@ def _prototype_materials(caches: PrototypeCaches, key: PrototypeKey) -> Any:
     return materials
 
 
+
+def _prototype_style_groups(caches: PrototypeCaches, key: PrototypeKey) -> Dict[str, Dict[str, Any]]:
+    if key.kind == "repmap":
+        proto = caches.repmaps.get(int(key.identifier))
+    else:
+        proto = caches.hashes.get(str(key.identifier))
+
+    if not proto:
+        return {}
+    groups = getattr(proto, "style_face_groups", None)
+    if not groups:
+        return {}
+    return groups
 def _iter_material_entries(materials: Any) -> Iterable[Tuple[Any, Any]]:
     if isinstance(materials, dict):
         return materials.items()
@@ -950,7 +1004,7 @@ def _resolve_instance_materials(
     caches: PrototypeCaches,
     proto_paths: Dict[PrototypeKey, Sdf.Path],
     material_library: Optional[MaterialLibrary],
-) -> Tuple[Dict[Any, Sdf.Path], Optional[Gf.Vec3f]]:
+) -> Tuple[Dict[Any, Sdf.Path], Optional[Gf.Vec3f], Dict[str, Dict[str, Any]]]:
     materials_container: Any = record.materials if getattr(record, "materials", None) else None
     label = sanitize_name(record.name, fallback=f"Ifc_{record.step_id}")
     if not materials_container and record.prototype is not None:
@@ -960,6 +1014,7 @@ def _resolve_instance_materials(
             label = sanitize_name(proto_path.name, fallback=label)
     resolved_paths: Dict[Any, Sdf.Path] = {}
     display_color: Optional[Gf.Vec3f] = None
+    style_groups: Dict[str, Dict[str, Any]] = {}
 
     def _apply_style(style_obj: Any, source: str) -> None:
         nonlocal display_color
@@ -976,17 +1031,24 @@ def _resolve_instance_materials(
         material_path = material_library.signature_to_path.get(signature)
         if material_path:
             resolved_paths.setdefault(f"__style__{source}", material_path)
-        if "ARX" in label.upper() or "PROP" in label.upper():
-            LOG.info(
-                "IFC style material applied for %s (%s): %s",
-                label,
-                source,
-                props,
-            )
+            if "ARX" in label.upper() or "PROP" in label.upper():
+                LOG.info(
+                    "IFC style material applied for %s (%s): %s",
+                    label,
+                    source,
+                    props,
+                )
 
     _apply_style(getattr(record, "style_material", None), "instance")
     if record.prototype is not None:
-        _apply_style(_prototype_style_material(caches, record.prototype), "prototype")
+        _apply_style(_prototype_materials(caches, record.prototype), "prototype")
+
+    if record.style_face_groups:
+        style_groups = record.style_face_groups
+    elif record.prototype is not None:
+        style_groups = _prototype_style_groups(caches, record.prototype)
+    else:
+        style_groups = {}
 
     for entry_index, (material_key, material_value) in enumerate(_iter_material_entries(materials_container)):
         props = _extract_material_properties(material_value, prototype_label=label, index=entry_index)
@@ -1010,13 +1072,31 @@ def _resolve_instance_materials(
         if material_path:
             resolved_paths[material_key] = material_path
 
-    return resolved_paths, display_color
+    if style_groups and material_library is not None:
+        for key, entry in style_groups.items():
+            material_obj = entry.get("material")
+            if material_obj is None:
+                continue
+            props = _material_properties_from_pbr(material_obj, label)
+            if props is None:
+                continue
+            signature = _material_signature(props)
+            material_path = material_library.signature_to_path.get(signature)
+            if material_path:
+                resolved_paths.setdefault(key, material_path)
+                if display_color is None:
+                    display_color = Gf.Vec3f(*props.display_color)
+
+    return resolved_paths, display_color, style_groups
 
 
 def _apply_material_bindings_to_prim(
     stage: Usd.Stage,
     prim: Usd.Prim,
     resolved_materials: Dict[Any, Sdf.Path],
+    *,
+    style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
+    mesh_path: Optional[Sdf.Path] = None,
 ) -> Optional[Sdf.Path]:
     if not resolved_materials:
         return None
@@ -1027,6 +1107,18 @@ def _apply_material_bindings_to_prim(
     if not material:
         return None
     UsdShade.MaterialBindingAPI(prim).Bind(material)
+    if style_groups and mesh_path is not None:
+        for key, entry in style_groups.items():
+            material_path = resolved_materials.get(key)
+            if material_path is None:
+                continue
+            subset_token = _subset_token_for_material(key)
+            subset_path = mesh_path.AppendChild(subset_token)
+            subset_material = UsdShade.Material.Get(stage, material_path)
+            if not subset_material:
+                continue
+            subset_prim = stage.OverridePrim(subset_path)
+            UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
     return material_path
 
 
@@ -1066,6 +1158,15 @@ def author_material_layer(
             materials = record.materials if getattr(record, "materials", None) else None
             if materials:
                 yield label, materials
+            style_groups = getattr(record, "style_face_groups", None) or {}
+            if style_groups:
+                group_materials = {
+                    key: entry.get("material")
+                    for key, entry in style_groups.items()
+                    if entry.get("material") is not None
+                }
+                if group_materials:
+                    yield f"{label}_styles", group_materials
             style = getattr(record, "style_material", None)
             if style is not None:
                 yield f"{label}_style", {"style": style}
@@ -1076,6 +1177,15 @@ def author_material_layer(
             label = sanitize_name(label_source, fallback="Prototype")
             if materials:
                 yield label, materials
+            style_groups = _prototype_style_groups(caches, key)
+            if style_groups:
+                group_materials = {
+                    key_name: entry.get("material")
+                    for key_name, entry in style_groups.items()
+                    if entry.get("material") is not None
+                }
+                if group_materials:
+                    yield f"{label}_styles", group_materials
             style_candidate = getattr(proto, "style_material", None)
             if style_candidate is not None:
                 yield f"{label}_style", {"style": style_candidate}
@@ -1215,7 +1325,7 @@ def author_instance_layer(
             if getattr(options, "convert_metadata", True) and getattr(record, "attributes", None):
                 _author_instance_attributes(inst_prim, record.attributes)
 
-            resolved_materials, resolved_color = _resolve_instance_materials(
+            resolved_materials, resolved_color, style_groups = _resolve_instance_materials(
                 record, caches, proto_paths, material_library
             )
             material_ids = list(record.material_ids or [])
@@ -1232,9 +1342,17 @@ def author_instance_layer(
                     stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
                 )
                 if resolved_materials:
-                    _apply_material_bindings_to_prim(stage, inst_prim, resolved_materials)
+                    _apply_material_bindings_to_prim(
+                        stage,
+                        inst_prim,
+                        resolved_materials,
+                        style_groups=style_groups,
+                        mesh_path=mesh_geom.GetPath(),
+                    )
                 if resolved_color is not None:
                     _apply_display_color_to_prim(inst_prim, resolved_color)
+                    gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
+                    gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
                 continue
 
             # Prototype reference
@@ -1266,7 +1384,14 @@ def author_instance_layer(
             UsdGeom.Imageable(ref_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
 
             if resolved_materials:
-                _apply_material_bindings_to_prim(stage, inst_prim, resolved_materials)
+                proto_mesh_path = proto_path.AppendChild("Geom")
+                _apply_material_bindings_to_prim(
+                    stage,
+                    inst_prim,
+                    resolved_materials,
+                    style_groups=style_groups,
+                    mesh_path=proto_mesh_path,
+                )
             if resolved_color is not None:
                 _apply_display_color_to_prim(inst_prim, resolved_color)
 
