@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 from textwrap import dedent
+from contextlib import nullcontext
 import fnmatch
 import json
 import re
@@ -819,6 +820,8 @@ def author_instance_layer(
 
     inst_root_name = _sanitize_identifier(f"{base_name}_Instances", fallback="Instances")
     inst_root = Sdf.Path(f"/World/{inst_root_name}")
+    setattr(caches, "instance_layer", inst_layer)
+    setattr(caches, "instance_root_path", inst_root)
 
     from collections import defaultdict
     name_counters: Dict[Sdf.Path, Dict[str, int]] = defaultdict(dict)
@@ -1364,6 +1367,22 @@ def apply_stage_anchor_transform(
     if anchor_mode is None:
         return
 
+    mode_key = anchor_mode.strip().lower() if isinstance(anchor_mode, str) else str(anchor_mode).strip().lower()
+    if not mode_key:
+        return
+
+    alias_map = {
+        "local": "local",
+        "site": "site",
+        "basepoint": "local",
+        "shared_site": "site",
+        "none": None,
+    }
+    mode_normalised = alias_map.get(mode_key)
+    if mode_normalised is None:
+        LOG.debug("Unknown anchor_mode '%s'; skipping stage anchoring", anchor_mode)
+        return
+
     world_prim = stage.GetPrimAtPath("/World")
     if not world_prim:
         world_xf = UsdGeom.Xform.Define(stage, "/World")
@@ -1379,18 +1398,6 @@ def apply_stage_anchor_transform(
     shared_site_resolved = shared_site_base_point.with_fallback(zero_base_point) if shared_site_base_point else zero_base_point
     base_point_resolved = base_point.with_fallback(shared_site_resolved) if base_point else shared_site_resolved
 
-    mode_key = anchor_mode.strip().lower()
-    alias_map = {
-        "local": "local",
-        "site": "site",
-        "basepoint": "local",
-        "shared_site": "site",
-        "none": None,
-    }
-    mode_normalised = alias_map.get(mode_key)
-    if mode_normalised is None:
-        LOG.debug("Unknown anchor_mode '%s'; skipping stage anchoring", anchor_mode)
-        return
     effective_mode = mode_normalised
     if effective_mode == "local" and base_point is None:
         effective_mode = "site"
@@ -1436,46 +1443,147 @@ def apply_stage_anchor_transform(
     if rotation_deg:
         anchor_matrix.SetRotate(Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), rotation_deg))
     anchor_matrix.SetTranslateOnly(translation_stage)
-    world_xf.AddTransformOp().Set(anchor_matrix)
 
-    world_prim.CreateAttribute("ifc:stageAnchorMode", Sdf.ValueTypeNames.String).Set(effective_mode)
-    translation_attr = world_prim.CreateAttribute("ifc:stageAnchorTranslation", Sdf.ValueTypeNames.Double3)
-    translation_attr.Set(tuple(float(translation_stage[i]) for i in range(3)))
-    rotation_attr = world_prim.CreateAttribute("ifc:stageAnchorRotationDegrees", Sdf.ValueTypeNames.Double)
-    rotation_attr.Set(float(rotation_deg))
-    bp_attr = world_prim.CreateAttribute("ifc:stageAnchorBasePointMeters", Sdf.ValueTypeNames.Double3)
-    bp_attr.Set((float(anchor_easting_m), float(anchor_northing_m), float(anchor_height_m)))
-    unit_attr = world_prim.CreateAttribute("ifc:stageAnchorBasePointUnit", Sdf.ValueTypeNames.String)
-    unit_attr.Set(anchor_unit or "")
-    model_bp_attr = world_prim.CreateAttribute("ifc:stageAnchorModelBasePointMeters", Sdf.ValueTypeNames.Double3)
-    model_bp_attr.Set((float(model_bp_easting_m), float(model_bp_northing_m), float(model_bp_height_m)))
-    model_unit_attr = world_prim.CreateAttribute("ifc:stageAnchorModelBasePointUnit", Sdf.ValueTypeNames.String)
-    model_unit_attr.Set(model_bp_unit or "")
-    shared_attr = world_prim.CreateAttribute("ifc:stageAnchorSharedSiteMeters", Sdf.ValueTypeNames.Double3)
-    shared_attr.Set((float(shared_easting_m), float(shared_northing_m), float(shared_height_m)))
-    shared_unit_attr = world_prim.CreateAttribute("ifc:stageAnchorSharedSiteUnit", Sdf.ValueTypeNames.String)
-    shared_unit_attr.Set(shared_unit or "")
-    crs_attr = world_prim.CreateAttribute("ifc:stageAnchorProjectedCRS", Sdf.ValueTypeNames.String)
-    crs_attr.Set(projected_crs or "")
+    base_geodetic = _derive_lonlat_from_base_point(base_point_resolved, projected_crs)
+    site_geodetic = _derive_lonlat_from_base_point(shared_site_resolved, projected_crs)
+    if lonlat is not None:
+        if effective_mode == "site":
+            site_geodetic = lonlat
+        else:
+            base_geodetic = lonlat
+    anchor_geodetic = site_geodetic if effective_mode == "site" else base_geodetic
+
+    attr_values: List[Tuple[str, Any, Any]] = []
+
+    def _append_attr(name: str, value_type: Any, value: Any) -> None:
+        if value is None:
+            return
+        attr_values.append((name, value_type, value))
+
+    _append_attr("ifc:stageAnchorMode", Sdf.ValueTypeNames.String, effective_mode)
+    _append_attr(
+        "ifc:stageAnchorTranslation",
+        Sdf.ValueTypeNames.Double3,
+        tuple(float(translation_stage[i]) for i in range(3)),
+    )
+    _append_attr("ifc:stageAnchorRotationDegrees", Sdf.ValueTypeNames.Double, float(rotation_deg))
+    _append_attr(
+        "ifc:stageAnchorBasePointMeters",
+        Sdf.ValueTypeNames.Double3,
+        (float(anchor_easting_m), float(anchor_northing_m), float(anchor_height_m)),
+    )
+    _append_attr("ifc:stageAnchorBasePointUnit", Sdf.ValueTypeNames.String, anchor_unit or "")
+    _append_attr(
+        "ifc:stageAnchorModelBasePointMeters",
+        Sdf.ValueTypeNames.Double3,
+        (float(model_bp_easting_m), float(model_bp_northing_m), float(model_bp_height_m)),
+    )
+    _append_attr("ifc:stageAnchorModelBasePointUnit", Sdf.ValueTypeNames.String, model_bp_unit or "")
+    _append_attr(
+        "ifc:stageAnchorSharedSiteMeters",
+        Sdf.ValueTypeNames.Double3,
+        (float(shared_easting_m), float(shared_northing_m), float(shared_height_m)),
+    )
+    _append_attr("ifc:stageAnchorSharedSiteUnit", Sdf.ValueTypeNames.String, shared_unit or "")
+    _append_attr("ifc:stageAnchorProjectedCRS", Sdf.ValueTypeNames.String, projected_crs or "")
     if map_conv is not None:
-        scale_attr = world_prim.CreateAttribute("ifc:stageAnchorMapScale", Sdf.ValueTypeNames.Double)
-        scale_attr.Set(float(getattr(map_conv, "scale", 1.0) or 1.0))
+        _append_attr(
+            "ifc:stageAnchorMapScale",
+            Sdf.ValueTypeNames.Double,
+            float(getattr(map_conv, "scale", 1.0) or 1.0),
+        )
 
-    geodetic = lonlat or _derive_lonlat_from_base_point(anchor_bp, projected_crs)
-    if geodetic is not None:
-        longitude = float(geodetic.longitude)
-        latitude = float(geodetic.latitude)
-        height_val = float(geodetic.height) if geodetic.height is not None else None
-        world_prim.CreateAttribute("ifc:longitude", Sdf.ValueTypeNames.Double).Set(longitude)
-        world_prim.CreateAttribute("ifc:latitude", Sdf.ValueTypeNames.Double).Set(latitude)
-        if height_val is not None:
-            world_prim.CreateAttribute("ifc:ellipsoidalHeight", Sdf.ValueTypeNames.Double).Set(height_val)
-        world_prim.CreateAttribute("CesiumLongitude", Sdf.ValueTypeNames.Double).Set(longitude)
-        world_prim.CreateAttribute("CesiumLatitude", Sdf.ValueTypeNames.Double).Set(latitude)
-        if height_val is not None:
-            world_prim.CreateAttribute("CesiumHeight", Sdf.ValueTypeNames.Double).Set(height_val)
+    if anchor_geodetic is not None:
+        _append_attr("ifc:longitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.longitude))
+        _append_attr("ifc:latitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.latitude))
+        if anchor_geodetic.height is not None:
+            _append_attr("ifc:ellipsoidalHeight", Sdf.ValueTypeNames.Double, float(anchor_geodetic.height))
+        _append_attr("CesiumLongitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.longitude))
+        _append_attr("CesiumLatitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.latitude))
+        if anchor_geodetic.height is not None:
+            _append_attr("CesiumHeight", Sdf.ValueTypeNames.Double, float(anchor_geodetic.height))
 
-# ---------------- Federated master view — stub (retain signature) ----------------
+    if base_geodetic is not None:
+        _append_attr("ifc:stageAnchorModelLongitude", Sdf.ValueTypeNames.Double, float(base_geodetic.longitude))
+        _append_attr("ifc:stageAnchorModelLatitude", Sdf.ValueTypeNames.Double, float(base_geodetic.latitude))
+        if base_geodetic.height is not None:
+            _append_attr(
+                "ifc:stageAnchorModelEllipsoidalHeight",
+                Sdf.ValueTypeNames.Double,
+                float(base_geodetic.height),
+            )
+        _append_attr("CesiumModelLongitude", Sdf.ValueTypeNames.Double, float(base_geodetic.longitude))
+        _append_attr("CesiumModelLatitude", Sdf.ValueTypeNames.Double, float(base_geodetic.latitude))
+        if base_geodetic.height is not None:
+            _append_attr("CesiumModelHeight", Sdf.ValueTypeNames.Double, float(base_geodetic.height))
+
+    if site_geodetic is not None:
+        _append_attr("ifc:stageAnchorSharedSiteLongitude", Sdf.ValueTypeNames.Double, float(site_geodetic.longitude))
+        _append_attr("ifc:stageAnchorSharedSiteLatitude", Sdf.ValueTypeNames.Double, float(site_geodetic.latitude))
+        if site_geodetic.height is not None:
+            _append_attr(
+                "ifc:stageAnchorSharedSiteEllipsoidalHeight",
+                Sdf.ValueTypeNames.Double,
+                float(site_geodetic.height),
+            )
+        _append_attr("CesiumSharedSiteLongitude", Sdf.ValueTypeNames.Double, float(site_geodetic.longitude))
+        _append_attr("CesiumSharedSiteLatitude", Sdf.ValueTypeNames.Double, float(site_geodetic.latitude))
+        if site_geodetic.height is not None:
+            _append_attr("CesiumSharedSiteHeight", Sdf.ValueTypeNames.Double, float(site_geodetic.height))
+
+    attr_names_to_cleanup = [name for name, _, _ in attr_values]
+
+    instance_root_paths: List[Sdf.Path] = []
+    recorded_root = getattr(caches, "instance_root_path", None)
+    if recorded_root:
+        if isinstance(recorded_root, Sdf.Path):
+            instance_root_paths.append(recorded_root)
+        else:
+            try:
+                instance_root_paths.append(Sdf.Path(str(recorded_root)))
+            except Exception:
+                LOG.debug("Unable to coerce recorded instance root path %r into Sdf.Path", recorded_root)
+
+    if not instance_root_paths:
+        for child in world_prim.GetChildren():
+            if child.GetTypeName() == "Xform" and child.GetName().endswith("_Instances"):
+                instance_root_paths.append(child.GetPath())
+
+    instance_layer = getattr(caches, "instance_layer", None)
+    applied_to_instance = False
+
+    def _apply_to_prim(prim: Usd.Prim, layer: Optional[Sdf.Layer]) -> None:
+        context = Usd.EditContext(stage, layer) if layer is not None else nullcontext()
+        with context:
+            xf = UsdGeom.Xformable(prim)
+            xf.ClearXformOpOrder()
+            xf.AddTransformOp().Set(anchor_matrix)
+            for name, value_type, value in attr_values:
+                attr = prim.CreateAttribute(name, value_type)
+                attr.Set(value)
+
+    for root_path in instance_root_paths:
+        prim = stage.GetPrimAtPath(root_path)
+        if not prim:
+            continue
+        _apply_to_prim(prim, instance_layer)
+        applied_to_instance = True
+
+    if not applied_to_instance:
+        LOG.debug("Instance root not found; applying geo anchor transform on /World fallback.")
+        _apply_to_prim(world_prim, None)
+    else:
+        root_layer = stage.GetRootLayer()
+        cleanup_context = Usd.EditContext(stage, root_layer) if root_layer is not None else nullcontext()
+        with cleanup_context:
+            for name in attr_names_to_cleanup:
+                if world_prim.HasProperty(name):
+                    try:
+                        world_prim.RemoveProperty(name)
+                    except Exception:
+                        LOG.debug("Unable to remove world attribute %s during anchor relocation", name)
+
+# ---------------- Federated master view – stub (retain signature) ----------------
 
 def update_federated_view(
     master_stage_path: PathLike,
