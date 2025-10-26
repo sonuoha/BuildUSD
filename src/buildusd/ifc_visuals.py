@@ -9,7 +9,9 @@ authoring layer without dragging Omniverse/pxr dependencies into the IFC pass.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import re
 
 import ifcopenshell
 import ifcopenshell.util.element
@@ -18,6 +20,7 @@ __all__ = [
     "PBRMaterial",
     "build_material_for_product",
     "extract_uvs_for_product",
+    "extract_face_style_groups",
 ]
 
 
@@ -211,3 +214,112 @@ def _default_name_for_product(product: ifcopenshell.entity_instance) -> str:
     type_name = product.is_a() if hasattr(product, "is_a") else "IfcProduct"
     return f"{type_name}_{label}"
 
+
+def extract_face_style_groups(product: ifcopenshell.entity_instance) -> Dict[str, Dict[str, Any]]:
+    combined: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    face_offset = 0
+    for item in _iter_representation_items(product):
+        item_groups, face_count = _face_style_groups_from_item(item)
+        if face_count == 0:
+            continue
+        for key, entry in item_groups.items():
+            faces = [face_offset + int(idx) for idx in entry.get("faces", [])]
+            if not faces:
+                continue
+            grouped = combined.setdefault(key, {"material": entry.get("material"), "faces": []})
+            grouped["faces"].extend(faces)
+        face_offset += face_count
+    result: Dict[str, Dict[str, Any]] = {}
+    for index, (key, entry) in enumerate(combined.items()):
+        material = entry.get("material")
+        name_hint = getattr(material, "name", None) or "Style"
+        token = _sanitize_style_token(f"{name_hint}_{index}")
+        result[token] = {"material": material, "faces": entry.get("faces", [])}
+    return result
+
+
+def _face_style_groups_from_item(item: ifcopenshell.entity_instance) -> Tuple[Dict[Tuple[Any, ...], Dict[str, Any]], int]:
+    face_count = _face_count_from_item(item)
+    groups: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    maps = getattr(item, "HasColours", None) or []
+    for colour_map in maps:
+        colours_entity = getattr(colour_map, "Colours", None)
+        colour_list = getattr(colours_entity, "ColourList", None) if colours_entity else None
+        indices = getattr(colour_map, "ColourIndex", None) or []
+        if not colour_list or not indices:
+            continue
+        for face_idx, colour_indices in enumerate(indices):
+            if colour_indices in (None, []):
+                continue
+            if isinstance(colour_indices, int):
+                colour_index = int(colour_indices) - 1
+            else:
+                try:
+                    first_index = (colour_indices or [0])[0]
+                    colour_index = int(first_index) - 1
+                except Exception:
+                    continue
+            if colour_index < 0 or colour_index >= len(colour_list):
+                continue
+            raw_colour = colour_list[colour_index]
+            try:
+                r, g, b = (float(raw_colour[0]), float(raw_colour[1]), float(raw_colour[2]))
+            except Exception:
+                continue
+            base_color = (
+                max(0.0, min(1.0, r)),
+                max(0.0, min(1.0, g)),
+                max(0.0, min(1.0, b)),
+            )
+            name_hint = getattr(colour_map, "Name", None) or f"Colour_{colour_index}"
+            pbr = PBRMaterial(name=name_hint, base_color=base_color)
+            key = ("colour", round(base_color[0], 5), round(base_color[1], 5), round(base_color[2], 5))
+            entry = groups.setdefault(key, {"material": pbr, "faces": []})
+            entry["faces"].append(face_idx)
+    if groups:
+        return groups, face_count
+    # Fallback to styles applied to the entire item
+    styles = _styles_for_item(item)
+    if styles and face_count:
+        for idx, mat in enumerate(styles):
+            key = ("style", idx, mat.name or "Style")
+            groups[key] = {"material": mat, "faces": list(range(face_count))}
+            break
+    return groups, face_count
+
+
+def _styles_for_item(item: ifcopenshell.entity_instance) -> List[PBRMaterial]:
+    styled_items = getattr(item, "StyledByItem", None) or []
+    materials: List[PBRMaterial] = []
+    for styled in styled_items:
+        for style in getattr(styled, "Styles", []) or []:
+            if style.is_a("IfcPresentationStyleAssignment"):
+                for sub_style in getattr(style, "Styles", []) or []:
+                    mat = _pbr_from_surface_style(sub_style)
+                    if mat:
+                        materials.append(mat)
+            else:
+                mat = _pbr_from_surface_style(style)
+                if mat:
+                    materials.append(mat)
+    return materials
+
+
+def _face_count_from_item(item: ifcopenshell.entity_instance) -> int:
+    coord_index = getattr(item, "CoordIndex", None)
+    if coord_index:
+        return len(coord_index)
+    faces = getattr(item, "Faces", None)
+    if faces:
+        return len(faces)
+    return 0
+
+
+def _sanitize_style_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_]", "_", value)
+    token = re.sub(r"_+", "_", token).strip("_")
+    if not token:
+        token = "Style"
+    if token[0].isdigit():
+        token = f"Style_{token}"
+    return token[:64]
