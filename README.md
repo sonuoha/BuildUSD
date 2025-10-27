@@ -211,6 +211,7 @@ Examples
     - If any faces in the component already belong to a style group, that style is propagated to all faces in the component.
     - Otherwise, the component adopts the majority style of its neighbours; if no neighbours carry a style, we fall back to the style whose colour matches the raw IFC material most closely.
     - The result is a single, style-named GeomSubset per visual surface (e.g. `Acero_amarillo_0`, `Aluminio_2`), eliminating the patchy “Material_*” subsets that previously showed mixed colours on container walls and roofs.
+    - Extra heuristics keep thin vertical trims on their neutral frame colours, bias horizontal slabs (e.g. container roofs) toward saturated façade styles, and preserve aluminium handles when the raw IFC material already encodes them.
   - Because the reconciliation only ever reuses existing style tokens, downstream material bindings and instance overrides behave exactly as before, just with complete face coverage.
 
 
