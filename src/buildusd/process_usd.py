@@ -441,7 +441,7 @@ def _ensure_material_subsets(
     face_count: int,
     *,
     style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> None:
+) -> bool:
     prim = mesh.GetPrim()
     stage = prim.GetStage()
     imageable = UsdGeom.Imageable(prim)
@@ -452,35 +452,10 @@ def _ensure_material_subsets(
     for subset in existing:
         stage.RemovePrim(subset.GetPrim().GetPath())
 
-    use_style_groups = False
-    if style_groups:
-        seen_faces: Set[int] = set()
-        valid = True
-        for entry in style_groups.values():
-            faces = entry.get("faces") or []
-            for face_index in faces:
-                try:
-                    face_int = int(face_index)
-                except Exception:
-                    valid = False
-                    break
-                if face_int < 0 or face_int >= face_count:
-                    valid = False
-                    break
-                seen_faces.add(face_int)
-            if not valid:
-                break
-        if valid and len(seen_faces) == face_count:
-            use_style_groups = True
-        else:
-            LOG.debug(
-                "Style groups did not cover the entire mesh (%d/%d faces); falling back to material_ids for %s.",
-                len(seen_faces),
-                face_count,
-                mesh.GetPath(),
-            )
+    style_faces_handled: Set[int] = set()
+    created_subsets = False
 
-    if use_style_groups:
+    if style_groups:
         for key, entry in style_groups.items():
             faces = entry.get("faces") or []
             if not faces:
@@ -500,14 +475,22 @@ def _ensure_material_subsets(
                 subset.CreateFamilyNameAttr().Set(family_name)
             except Exception:
                 subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
-        try:
-            UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
-        except Exception:
-            pass
-        return
+            created_subsets = True
+            for face_index in faces:
+                try:
+                    face_int = int(face_index)
+                except Exception:
+                    continue
+                if 0 <= face_int < face_count:
+                    style_faces_handled.add(face_int)
 
     if not material_ids:
-        return
+        if created_subsets:
+            try:
+                UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
+            except Exception:
+                pass
+        return created_subsets
     if len(material_ids) != face_count:
         LOG.debug(
             "Material ids length (%d) did not match face count (%d); skipping subset authoring for %s.",
@@ -515,7 +498,12 @@ def _ensure_material_subsets(
             face_count,
             mesh.GetPath(),
         )
-        return
+        if created_subsets:
+            try:
+                UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
+            except Exception:
+                pass
+        return created_subsets
 
     try:
         UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
@@ -524,9 +512,11 @@ def _ensure_material_subsets(
 
     indices_by_material: Dict[int, List[int]] = defaultdict(list)
     for face_index, material_index in enumerate(material_ids):
+        if face_index in style_faces_handled:
+            continue
         indices_by_material[int(material_index)].append(int(face_index))
     if not indices_by_material:
-        return
+        return created_subsets
 
     for material_index, face_indices in sorted(indices_by_material.items()):
         subset_token = _subset_token_for_material(material_index)
@@ -544,6 +534,8 @@ def _ensure_material_subsets(
             subset.CreateFamilyNameAttr().Set(family_name)
         except Exception:
             subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+        created_subsets = True
+    return created_subsets
 
 
 def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
@@ -607,16 +599,17 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
     mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
 
     face_count = len(payload["face_vertex_counts"])
+    subsets_use_styles = False
     if material_ids:
         mat_attr = Vt.IntArray([int(i) for i in material_ids])
         mesh.GetPrim().CreateAttribute("ifc:materialIds", Sdf.ValueTypeNames.IntArray).Set(mat_attr)
-        _ensure_material_subsets(mesh, list(mat_attr), face_count, style_groups=style_groups)
+        subsets_use_styles = _ensure_material_subsets(mesh, list(mat_attr), face_count, style_groups=style_groups)
     else:
-        _ensure_material_subsets(mesh, [], face_count, style_groups=style_groups)
+        subsets_use_styles = _ensure_material_subsets(mesh, [], face_count, style_groups=style_groups)
 
     # If a single style group covers the entire mesh, author displayColor for quick previews
     try:
-        if style_groups:
+        if style_groups and subsets_use_styles:
             for entry in style_groups.values():
                 faces = entry.get("faces") or []
                 material = entry.get("material")
@@ -877,7 +870,12 @@ def _resolve_color_value(obj: Any) -> Optional[Tuple[float, float, float]]:
                 except Exception:
                     continue
         return None
-    for attr_set in (("Red", "Green", "Blue"), ("R", "G", "B"), ("red", "green", "blue")):
+    for attr_set in (
+        ("Red", "Green", "Blue"),
+        ("R", "G", "B"),
+        ("red", "green", "blue"),
+        ("r", "g", "b"),
+    ):
         values = []
         success = True
         for attr in attr_set:
@@ -974,6 +972,34 @@ def _extract_material_properties(
         "colour",
     )
     color = _resolve_color_value(color_source)
+    if color is None:
+        if isinstance(color_source, dict):
+            nested = color_source.get("diffuse") or color_source.get("Diffuse")
+            if isinstance(nested, dict):
+                color = _resolve_color_value(
+                    nested.get("colour")
+                    or nested.get("color")
+                    or nested.get("albedo")
+                    or nested.get("rgb")
+                    or nested
+                )
+        if color is None and isinstance(material, dict):
+            diffuse_block = material.get("diffuse") or material.get("Diffuse")
+            if isinstance(diffuse_block, dict):
+                color = _resolve_color_value(
+                    diffuse_block.get("colour")
+                    or diffuse_block.get("color")
+                    or diffuse_block.get("albedo")
+                    or diffuse_block.get("rgb")
+                    or diffuse_block
+                )
+        if color is None and hasattr(material, "diffuse"):
+            diffuse_attr = getattr(material, "diffuse")
+            color = _resolve_color_value(
+                getattr(diffuse_attr, "colour", None)
+                or getattr(diffuse_attr, "color", None)
+                or diffuse_attr
+            )
     if color is None:
         color = _resolve_color_value(material)
     if color is None:
@@ -1164,26 +1190,67 @@ def _apply_material_bindings_to_prim(
 ) -> Optional[Sdf.Path]:
     if not resolved_materials:
         return None
-    material_path = next(iter(resolved_materials.values()), None)
-    if material_path is None:
+    items = list(resolved_materials.items())
+    if not items:
         return None
-    material = UsdShade.Material.Get(stage, material_path)
-    if not material:
+
+    def _style_primary_key() -> Optional[Any]:
+        for key in resolved_materials:
+            if isinstance(key, str) and key.strip("'\"").startswith("__style__"):
+                return key
         return None
-    UsdShade.MaterialBindingAPI(prim).Bind(material)
-    if style_groups and mesh_path is not None:
+
+    primary_key = _style_primary_key()
+    primary_path = resolved_materials.get(primary_key) if primary_key is not None else None
+
+    if primary_path is None:
+        numeric_items = [item for item in items if isinstance(item[0], int)]
+        if numeric_items:
+            primary_key, primary_path = numeric_items[0]
+        else:
+            primary_key, primary_path = items[0]
+
+    primary_material = UsdShade.Material.Get(stage, primary_path)
+    if not primary_material:
+        return None
+    UsdShade.MaterialBindingAPI(prim).Bind(primary_material)
+
+    if mesh_path is None:
+        return primary_path
+
+    bound_subset_keys: Set[Any] = set()
+
+    def _bind_subset(key: Any, material_path: Sdf.Path) -> None:
+        if key in bound_subset_keys:
+            return
+        subset_token = _subset_token_for_material(key)
+        subset_path = mesh_path.AppendChild(subset_token)
+        subset_prim = stage.GetPrimAtPath(subset_path)
+        if not subset_prim or subset_prim.GetTypeName() != "GeomSubset":
+            return
+        subset_material = UsdShade.Material.Get(stage, material_path)
+        if not subset_material:
+            return
+        UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
+        bound_subset_keys.add(key)
+
+    style_keys = {
+        key for key in resolved_materials if isinstance(key, str) and key.strip("'\"").startswith("__style__")
+    }
+
+    for key, material_path in items:
+        if key == primary_key or key in style_keys:
+            continue
+        _bind_subset(key, material_path)
+
+    if style_groups:
         for key, entry in style_groups.items():
             material_path = resolved_materials.get(key)
             if material_path is None:
                 continue
-            subset_token = _subset_token_for_material(key)
-            subset_path = mesh_path.AppendChild(subset_token)
-            subset_material = UsdShade.Material.Get(stage, material_path)
-            if not subset_material:
-                continue
-            subset_prim = stage.OverridePrim(subset_path)
-            UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
-    return material_path
+            _bind_subset(key, material_path)
+
+    return primary_path
 
 
 def author_material_layer(
