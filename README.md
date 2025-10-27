@@ -205,4 +205,12 @@ Examples
 
 ![Pipeline output preserving object integrity](data/input/img/Pipeline.png)
 
+- Material style reconciliation (new)
+  - When the incoming IFC tessellation mixes multiple raw material IDs across a single surface, the converter now analyses connected face components and extends the closest IFC face-style across the entire component.  The new logic:
+    - Builds adjacency-connected components per material id.
+    - If any faces in the component already belong to a style group, that style is propagated to all faces in the component.
+    - Otherwise, the component adopts the majority style of its neighbours; if no neighbours carry a style, we fall back to the style whose colour matches the raw IFC material most closely.
+    - The result is a single, style-named GeomSubset per visual surface (e.g. `Acero_amarillo_0`, `Aluminio_2`), eliminating the patchy “Material_*” subsets that previously showed mixed colours on container walls and roofs.
+  - Because the reconciliation only ever reuses existing style tokens, downstream material bindings and instance overrides behave exactly as before, just with complete face coverage.
+
 
