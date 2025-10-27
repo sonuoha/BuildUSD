@@ -17,9 +17,9 @@ import hashlib
 import json
 import re
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 
@@ -454,12 +454,448 @@ def _collect_material_subsets(imageable: UsdGeom.Imageable, family_name: str) ->
     return result
 
 
+def _compute_face_components(
+    face_vertex_counts: Sequence[int],
+    face_vertex_indices: Sequence[int],
+) -> Tuple[List[Tuple[int, ...]], List[Set[int]]]:
+    """Return per-face vertex tuples and adjacency sets."""
+    faces: List[Tuple[int, ...]] = []
+    adjacency: List[Set[int]] = []
+    offset = 0
+    edge_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for face_index, count in enumerate(face_vertex_counts):
+        verts = tuple(int(v) for v in face_vertex_indices[offset : offset + count])
+        offset += count
+        faces.append(verts)
+        adjacency.append(set())
+        if count < 2:
+            continue
+        for i in range(count):
+            a = verts[i]
+            b = verts[(i + 1) % count]
+            edge = (a, b) if a <= b else (b, a)
+            edge_map[edge].append(face_index)
+    for connected_faces in edge_map.values():
+        if len(connected_faces) < 2:
+            continue
+        for i in range(len(connected_faces)):
+            a = connected_faces[i]
+            for j in range(i + 1, len(connected_faces)):
+                b = connected_faces[j]
+                adjacency[a].add(b)
+                adjacency[b].add(a)
+    return faces, adjacency
+
+
+def _face_area_and_normal(points: Sequence[Tuple[float, float, float]], face_vertices: Sequence[int]) -> Tuple[float, Tuple[float, float, float]]:
+    """Return (area, normal) for a polygon (fan triangulation)."""
+    count = len(face_vertices)
+    if count < 3:
+        return 0.0, (0.0, 0.0, 0.0)
+    p0 = np.array(points[face_vertices[0]], dtype=np.float64)
+    area = 0.0
+    normal = np.zeros(3, dtype=np.float64)
+    for i in range(1, count - 1):
+        p1 = np.array(points[face_vertices[i]], dtype=np.float64)
+        p2 = np.array(points[face_vertices[i + 1]], dtype=np.float64)
+        cross = np.cross(p1 - p0, p2 - p0)
+        tri_area = 0.5 * np.linalg.norm(cross)
+        area += tri_area
+        if tri_area > 0.0:
+            normal += cross
+    norm = np.linalg.norm(normal)
+    if norm > 0.0:
+        normal /= norm
+    return float(area), (float(normal[0]), float(normal[1]), float(normal[2]))
+
+
+def _color_from_material(material: Any) -> Optional[Tuple[float, float, float]]:
+    def _try_get(obj: Any, *names: str) -> Optional[Any]:
+        for name in names:
+            if isinstance(obj, dict):
+                if name in obj and obj[name] is not None:
+                    return obj[name]
+            elif hasattr(obj, name):
+                value = getattr(obj, name)
+                if value is not None:
+                    return value
+        return None
+
+    candidate = _try_get(
+        material,
+        "base_color",
+        "baseColor",
+        "diffuseColor",
+        "DiffuseColor",
+        "SurfaceColour",
+        "surface_colour",
+    )
+    if candidate is None:
+        surface = _try_get(material, "SurfaceColour", "SurfaceColor")
+        if surface is not None:
+            r = _try_get(surface, "Red", "red")
+            g = _try_get(surface, "Green", "green")
+            b = _try_get(surface, "Blue", "blue")
+            if all(c is not None for c in (r, g, b)):
+                return (float(r), float(g), float(b))
+        return None
+    try:
+        if hasattr(candidate, "__iter__"):
+            values = list(candidate)
+        else:
+            values = [candidate, candidate, candidate]
+        if len(values) >= 3:
+            return (float(values[0]), float(values[1]), float(values[2]))
+    except Exception:
+        return None
+    return None
+
+
+def _color_saturation(color: Optional[Tuple[float, float, float]]) -> float:
+    if not color:
+        return 0.0
+    try:
+        r, g, b = (float(color[0]), float(color[1]), float(color[2]))
+    except Exception:
+        return 0.0
+    max_c = max(r, g, b)
+    min_c = min(r, g, b)
+    return max_c - min_c
+
+
+def _resolve_component_styles(
+    material_ids: Sequence[int],
+    style_groups: Dict[str, Dict[str, Any]],
+    style_tokens: Dict[str, str],
+    *,
+    points: Optional[Sequence[Tuple[float, float, float]]] = None,
+    face_vertex_counts: Optional[Sequence[int]] = None,
+    face_vertex_indices: Optional[Sequence[int]] = None,
+    materials: Optional[Sequence[Any]] = None,
+) -> Dict[str, List[int]]:
+    """Return mapping of style tokens to face indices covering entire mesh."""
+    face_count = len(material_ids)
+    if not face_count or not style_tokens:
+        return {}
+
+    if (
+        points is None
+        or face_vertex_counts is None
+        or face_vertex_indices is None
+        or len(face_vertex_counts) != face_count
+    ):
+        # Without topology data we can only return the original style groups.
+        result: Dict[str, List[int]] = {}
+        for key, entry in style_groups.items():
+            token = style_tokens.get(key)
+            if not token:
+                continue
+            faces = [int(idx) for idx in (entry.get("faces") or []) if 0 <= int(idx) < face_count]
+            if faces:
+                result[token] = faces
+        return result
+
+    style_color_map: Dict[str, Optional[Tuple[float, float, float]]] = {}
+    for key, entry in style_groups.items():
+        token = style_tokens.get(key)
+        if not token:
+            continue
+        style_color_map[token] = _color_from_material(entry.get("material"))
+
+    material_style_stats: Dict[int, Tuple[str, int]] = {}
+    for key, entry in style_groups.items():
+        token = style_tokens.get(key)
+        if not token:
+            continue
+        id_counts: Counter[int] = Counter()
+        for idx in entry.get("faces") or []:
+            try:
+                face_index = int(idx)
+            except Exception:
+                continue
+            if 0 <= face_index < face_count:
+                id_counts[int(material_ids[face_index])] += 1
+        if not id_counts:
+            continue
+        dominant_id, dominant_count = id_counts.most_common(1)[0]
+        existing = material_style_stats.get(dominant_id)
+        if existing is None or dominant_count > existing[1]:
+            material_style_stats[dominant_id] = (token, dominant_count)
+
+    material_style_lookup: Dict[int, str] = {
+        material_id: token for material_id, (token, _) in material_style_stats.items()
+    }
+
+    face_vertices, adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
+
+    face_styles: List[Optional[str]] = [None] * face_count
+    for key, entry in style_groups.items():
+        token = style_tokens.get(key)
+        if not token:
+            continue
+        for idx in entry.get("faces") or []:
+            try:
+                face_index = int(idx)
+            except Exception:
+                continue
+            if 0 <= face_index < face_count:
+                face_styles[face_index] = token
+
+    style_normals: Dict[str, np.ndarray] = {}
+    style_area_map: Dict[str, float] = {}
+    if points is not None:
+        for face_index, token in enumerate(face_styles):
+            if token is None:
+                continue
+            area, normal = _face_area_and_normal(points, face_vertices[face_index])
+            if area <= 0.0:
+                continue
+            vec = np.asarray(normal, dtype=np.float64) * area
+            if token in style_normals:
+                style_normals[token] += vec
+                style_area_map[token] = style_area_map.get(token, 0.0) + area
+            else:
+                style_normals[token] = vec
+                style_area_map[token] = area
+        for token, vec in list(style_normals.items()):
+            norm = np.linalg.norm(vec)
+            if norm > 0.0:
+                style_normals[token] = vec / norm
+            else:
+                style_normals[token] = vec
+
+    components: List[Dict[str, Any]] = []
+    visited = [False] * face_count
+    for start_face in range(face_count):
+        if visited[start_face]:
+            continue
+        material_id = int(material_ids[start_face])
+        queue = [start_face]
+        faces_in_component: List[int] = []
+        area = 0.0
+        normal_acc = np.zeros(3, dtype=np.float64)
+        bounds_min = np.full(3, np.inf)
+        bounds_max = np.full(3, -np.inf)
+        style_presence: Dict[str, int] = defaultdict(int)
+        neighbor_styles: Dict[str, int] = defaultdict(int)
+
+        while queue:
+            face_idx = queue.pop()
+            if visited[face_idx]:
+                continue
+            if int(material_ids[face_idx]) != material_id:
+                continue
+            visited[face_idx] = True
+            faces_in_component.append(face_idx)
+            verts = face_vertices[face_idx]
+            if points is not None:
+                face_area, normal = _face_area_and_normal(points, verts)
+                area += face_area
+                normal_acc += np.asarray(normal, dtype=np.float64) * face_area
+                for v in verts:
+                    bounds_min = np.minimum(bounds_min, np.asarray(points[v], dtype=np.float64))
+                    bounds_max = np.maximum(bounds_max, np.asarray(points[v], dtype=np.float64))
+            token = face_styles[face_idx]
+            if token:
+                style_presence[token] += 1
+            for nb in adjacency[face_idx]:
+                if not visited[nb] and int(material_ids[nb]) == material_id:
+                    queue.append(nb)
+                else:
+                    neighbor_token = face_styles[nb]
+                    if neighbor_token:
+                        neighbor_styles[neighbor_token] += 1
+
+        if not faces_in_component:
+            continue
+        if np.linalg.norm(normal_acc) > 0.0:
+            normal_acc = normal_acc / np.linalg.norm(normal_acc)
+
+        components.append(
+            {
+                "faces": faces_in_component,
+                "material_id": material_id,
+                "area": area,
+                "normal": tuple(float(v) for v in normal_acc),
+                "bounds_min": tuple(float(v) for v in bounds_min),
+                "bounds_max": tuple(float(v) for v in bounds_max),
+                "style_presence": style_presence,
+                "neighbor_styles": neighbor_styles,
+            }
+        )
+
+    def _style_fallback_for_material(material_id: int) -> Optional[str]:
+        best_token: Optional[str] = None
+        best_distance = float("inf")
+        base_color = None
+        try:
+            if materials and 0 <= material_id < len(materials):
+                base_color = _color_from_material(materials[material_id])
+        except Exception:
+            base_color = None
+        preferred_token = material_style_lookup.get(material_id)
+        if base_color is None and preferred_token is not None:
+            return preferred_token
+        for key, entry in style_groups.items():
+            token = style_tokens.get(key)
+            if not token:
+                continue
+            mat = entry.get("material")
+            style_color = None
+            if mat is not None:
+                try:
+                    style_color = tuple(float(c) for c in getattr(mat, "base_color"))
+                except Exception:
+                    style_color = _color_from_material(mat)
+            if style_color is None:
+                continue
+            if base_color is None:
+                # Without a base color fall back to the first style encountered.
+                return token if best_token is None else best_token
+            dist = sum((float(a) - float(b)) ** 2 for a, b in zip(style_color, base_color))
+            if dist < best_distance:
+                best_distance = dist
+                best_token = token
+        return best_token
+
+    area_threshold = 1.0
+    saturation_threshold = 0.12
+    orientation_override_area = 5.0
+    orientation_override_sat = 0.2
+    color_match_threshold = 0.01
+
+    for component in components:
+        faces_in_component = component["faces"]
+        chosen_token: Optional[str] = None
+        chosen_from_style = False
+        material_color: Optional[Tuple[float, float, float]] = None
+        material_id = component["material_id"]
+        try:
+            if materials and 0 <= material_id < len(materials):
+                material_color = _color_from_material(materials[material_id])
+        except Exception:
+            material_color = None
+
+        if component["style_presence"]:
+            chosen_token = max(component["style_presence"].items(), key=lambda item: item[1])[0]
+            chosen_from_style = True
+        elif component["neighbor_styles"]:
+            neighbor_area_threshold = 1.0
+            filtered_neighbors = [
+                (token, count)
+                for token, count in component["neighbor_styles"].items()
+                if style_area_map.get(token, 0.0) >= neighbor_area_threshold
+            ]
+            if filtered_neighbors:
+                chosen_token = max(filtered_neighbors, key=lambda item: item[1])[0]
+
+        if chosen_token is None:
+            material_id = component["material_id"]
+            fallback_token = _style_fallback_for_material(material_id)
+            chosen_token = fallback_token
+
+        preserve_style_area_threshold = 0.5
+        chosen_color = style_color_map.get(chosen_token) if chosen_token else None
+        color_match = bool(
+            chosen_token
+            and material_color is not None
+            and chosen_color is not None
+            and sum((float(material_color[i]) - float(chosen_color[i])) ** 2 for i in range(3)) < color_match_threshold
+            and _color_saturation(chosen_color) > saturation_threshold
+        )
+
+        if (
+            chosen_token
+            and (
+                not chosen_from_style or style_area_map.get(chosen_token, 0.0) >= preserve_style_area_threshold
+            )
+            and not color_match
+        ):
+            component_normal = np.asarray(component["normal"], dtype=np.float64)
+            comp_norm_len = np.linalg.norm(component_normal)
+            if comp_norm_len > 0.0:
+                component_normal = component_normal / comp_norm_len
+            else:
+                component_normal = None
+            chosen_color = style_color_map.get(chosen_token)
+            chosen_sat = _color_saturation(chosen_color)
+            if chosen_sat < saturation_threshold and component["area"] > area_threshold:
+                candidate_token = chosen_token
+                candidate_score = 0.0
+                neighbor_area_threshold = 1.0
+                for neighbor_token, neighbor_count in component["neighbor_styles"].items():
+                    if style_area_map.get(neighbor_token, 0.0) < neighbor_area_threshold:
+                        continue
+                    neighbor_color = style_color_map.get(neighbor_token)
+                    neighbor_sat = _color_saturation(neighbor_color)
+                    if neighbor_sat <= chosen_sat:
+                        continue
+                    if component_normal is not None:
+                        neighbor_normal = style_normals.get(neighbor_token)
+                        if neighbor_normal is not None:
+                            orientation = float(np.dot(component_normal, neighbor_normal))
+                            if abs(orientation) < 0.4:
+                                continue
+                    score = neighbor_sat * float(neighbor_count)
+                    if score > candidate_score:
+                        candidate_score = score
+                        candidate_token = neighbor_token
+                if candidate_token != chosen_token and candidate_score > 0.0:
+                    chosen_token = candidate_token
+                elif candidate_token == chosen_token or candidate_score == 0.0:
+                    # Fall back to globally available styles with compatible orientation.
+                    global_candidate = chosen_token
+                    global_score = 0.0
+                    for token, color in style_color_map.items():
+                        if token == chosen_token:
+                            continue
+                        token_sat = _color_saturation(color)
+                        if token_sat <= chosen_sat:
+                            continue
+                        if component_normal is not None:
+                            token_normal = style_normals.get(token)
+                        orientation_ok = True
+                        if component_normal is not None and token_normal is not None:
+                            orientation = float(np.dot(component_normal, token_normal))
+                            if abs(orientation) < 0.6:
+                                if (
+                                    style_area_map.get(token, 0.0) >= orientation_override_area
+                                    and token_sat - chosen_sat > orientation_override_sat
+                                ):
+                                    orientation_ok = True
+                                else:
+                                    orientation_ok = False
+                        if not orientation_ok:
+                            continue
+                        area_weight = style_area_map.get(token, 1.0)
+                        score = token_sat * area_weight
+                        if score > global_score:
+                            global_score = score
+                            global_candidate = token
+                    if global_candidate != chosen_token and global_score > 0.0:
+                        chosen_token = global_candidate
+
+        if chosen_token:
+            for face_idx in faces_in_component:
+                face_styles[face_idx] = chosen_token
+
+    mapping: Dict[str, List[int]] = defaultdict(list)
+    for idx, token in enumerate(face_styles):
+        if token is not None:
+            mapping[token].append(idx)
+    return mapping
+
+
 def _ensure_material_subsets(
     mesh: UsdGeom.Mesh,
     material_ids: Optional[List[int]],
     face_count: int,
     *,
     style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
+    materials: Optional[Sequence[Any]] = None,
+    points: Optional[Sequence[Tuple[float, float, float]]] = None,
+    face_vertex_counts: Optional[Sequence[int]] = None,
+    face_vertex_indices: Optional[Sequence[int]] = None,
 ) -> bool:
     prim = mesh.GetPrim()
     stage = prim.GetStage()
@@ -471,38 +907,51 @@ def _ensure_material_subsets(
     for subset in existing:
         stage.RemovePrim(subset.GetPrim().GetPath())
 
-    style_faces_handled: Set[int] = set()
-    created_subsets = False
+    try:
+        UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
+    except Exception:
+        pass
 
-    style_debug: List[Tuple[str, int, int]] = []
+    style_tokens: Dict[str, str] = {}
     if style_groups:
-        for key, entry in style_groups.items():
-            raw_faces = entry.get("faces") or []
-            if not raw_faces:
+        for key in style_groups:
+            style_tokens[key] = _subset_token_for_material(key)
+
+    face_style_map: Dict[str, List[int]] = {}
+    if material_ids and len(material_ids) == face_count and style_groups:
+        face_style_map = _resolve_component_styles(
+            material_ids,
+            style_groups,
+            style_tokens,
+            points=points,
+            face_vertex_counts=face_vertex_counts,
+            face_vertex_indices=face_vertex_indices,
+            materials=materials,
+        )
+        if face_style_map:
+            assigned: Set[int] = set()
+            for faces in face_style_map.values():
+                assigned.update(faces)
+            if len(assigned) < face_count:
+                leftover_by_material: Dict[int, List[int]] = defaultdict(list)
+                for face_index, material_id in enumerate(material_ids):
+                    if face_index not in assigned:
+                        leftover_by_material[int(material_id)].append(face_index)
+                for material_id, faces in leftover_by_material.items():
+                    token = _subset_token_for_material(material_id)
+                    if token in face_style_map:
+                        face_style_map[token].extend(faces)
+                    else:
+                        face_style_map[token] = list(faces)
+
+    created_subsets = False
+    stats: List[Tuple[str, int]] = []
+
+    if face_style_map:
+        for token, faces in face_style_map.items():
+            if not faces:
                 continue
-            valid_faces: List[int] = []
-            invalid_faces = 0
-            for value in raw_faces:
-                try:
-                    face_index = int(value)
-                except Exception:
-                    invalid_faces += 1
-                    continue
-                if 0 <= face_index < face_count:
-                    valid_faces.append(face_index)
-                else:
-                    invalid_faces += 1
-            if not valid_faces:
-                if invalid_faces:
-                    LOG.debug(
-                        "Discarded style subset %s for %s: %d face indices were out of range.",
-                        key,
-                        mesh.GetPath(),
-                        invalid_faces,
-                    )
-                continue
-            subset_token = _subset_token_for_material(key)
-            subset_path = mesh.GetPath().AppendChild(subset_token)
+            subset_path = mesh.GetPath().AppendChild(token)
             subset = UsdGeom.Subset.Define(stage, subset_path)
             try:
                 UsdGeom.Subset.SetElementType(subset, element_token)
@@ -511,106 +960,109 @@ def _ensure_material_subsets(
                     subset.CreateElementTypeAttr().Set(element_token)
                 except AttributeError:
                     subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
-            subset.CreateIndicesAttr(Vt.IntArray(valid_faces))
+            indices_attr = subset.GetIndicesAttr()
+            if not indices_attr:
+                indices_attr = subset.CreateIndicesAttr()
+            indices_attr.Set(Vt.IntArray([int(f) for f in faces]))
             try:
                 subset.CreateFamilyNameAttr().Set(family_name)
             except Exception:
                 subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
             created_subsets = True
-            for face_int in valid_faces:
-                style_faces_handled.add(face_int)
-            if LOG.isEnabledFor(logging.DEBUG):
-                style_debug.append((str(subset_path), len(valid_faces), invalid_faces))
+            stats.append((str(subset_path), len(faces)))
 
-    if not material_ids:
-        if created_subsets:
-            try:
-                UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
-            except Exception:
-                pass
-        return created_subsets
-    if len(material_ids) != face_count:
+    else:
+        # Fallback to original behaviour when component reconciliation fails.
+        style_faces_handled: Set[int] = set()
+        if style_groups:
+            for key, entry in style_groups.items():
+                raw_faces = entry.get("faces") or []
+                if not raw_faces:
+                    continue
+                valid_faces: List[int] = []
+                for value in raw_faces:
+                    try:
+                        face_index = int(value)
+                    except Exception:
+                        continue
+                    if 0 <= face_index < face_count:
+                        valid_faces.append(face_index)
+                if not valid_faces:
+                    continue
+                subset_token = _subset_token_for_material(key)
+                subset_path = mesh.GetPath().AppendChild(subset_token)
+                subset = UsdGeom.Subset.Define(stage, subset_path)
+                try:
+                    UsdGeom.Subset.SetElementType(subset, element_token)
+                except Exception:
+                    try:
+                        subset.CreateElementTypeAttr().Set(element_token)
+                    except AttributeError:
+                        subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+                indices_attr = subset.GetIndicesAttr()
+                if not indices_attr:
+                    indices_attr = subset.CreateIndicesAttr()
+                indices_attr.Set(Vt.IntArray(valid_faces))
+                try:
+                    subset.CreateFamilyNameAttr().Set(family_name)
+                except Exception:
+                    subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+                created_subsets = True
+                stats.append((str(subset_path), len(valid_faces)))
+                for face_int in valid_faces:
+                    style_faces_handled.add(face_int)
+
+        if material_ids and len(material_ids) == face_count:
+            indices_by_material: Dict[int, List[int]] = defaultdict(list)
+            for face_index, material_index in enumerate(material_ids):
+                if face_index in style_faces_handled:
+                    continue
+                indices_by_material[int(material_index)].append(int(face_index))
+            if not style_groups and len(indices_by_material) == 1:
+                # Uniform material with no style information: rely on the mesh-level
+                # binding instead of authoring a redundant GeomSubset.
+                indices_by_material.clear()
+            for material_index, face_indices in sorted(indices_by_material.items()):
+                if not face_indices:
+                    continue
+                subset_token = _subset_token_for_material(material_index)
+                subset_path = mesh.GetPath().AppendChild(subset_token)
+                subset = UsdGeom.Subset.Define(stage, subset_path)
+                try:
+                    UsdGeom.Subset.SetElementType(subset, element_token)
+                except Exception:
+                    try:
+                        subset.CreateElementTypeAttr().Set(element_token)
+                    except AttributeError:
+                        subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+                indices_attr = subset.GetIndicesAttr()
+                if not indices_attr:
+                    indices_attr = subset.CreateIndicesAttr()
+                indices_attr.Set(Vt.IntArray(face_indices))
+                try:
+                    subset.CreateFamilyNameAttr().Set(family_name)
+                except Exception:
+                    subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+                created_subsets = True
+                stats.append((str(subset_path), len(face_indices)))
+
+    if LOG.isEnabledFor(logging.DEBUG) and stats:
+        total_faces = sum(count for _, count in stats)
         LOG.debug(
-            "Material ids length (%d) did not match face count (%d); skipping subset authoring for %s.",
-            len(material_ids),
-            face_count,
+            "Material subset coverage for %s: subsets=%d totalFaces=%d/%d",
             mesh.GetPath(),
-        )
-        if created_subsets:
-            try:
-                UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
-            except Exception:
-                pass
-        return created_subsets
-
-    try:
-        UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
-    except Exception:
-        pass
-
-    indices_by_material: Dict[int, List[int]] = defaultdict(list)
-    for face_index, material_index in enumerate(material_ids):
-        if face_index in style_faces_handled:
-            continue
-        indices_by_material[int(material_index)].append(int(face_index))
-    if not indices_by_material:
-        if LOG.isEnabledFor(logging.DEBUG) and style_debug:
-            LOG.debug(
-                "Style subsets covered all %d faces for %s",
-                len(style_faces_handled),
-                mesh.GetPath(),
-            )
-        return created_subsets
-
-    numeric_debug: List[Tuple[str, int]] = []
-    for material_index, face_indices in sorted(indices_by_material.items()):
-        subset_token = _subset_token_for_material(material_index)
-        subset_path = mesh.GetPath().AppendChild(subset_token)
-        subset = UsdGeom.Subset.Define(stage, subset_path)
-        try:
-            UsdGeom.Subset.SetElementType(subset, element_token)
-        except Exception:
-            try:
-                subset.CreateElementTypeAttr().Set(element_token)
-            except AttributeError:
-                subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
-        subset.CreateIndicesAttr(Vt.IntArray(face_indices))
-        try:
-            subset.CreateFamilyNameAttr().Set(family_name)
-        except Exception:
-            subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
-        created_subsets = True
-        if LOG.isEnabledFor(logging.DEBUG):
-            numeric_debug.append((str(subset_path), len(face_indices)))
-
-    if LOG.isEnabledFor(logging.DEBUG):
-        covered = len(style_faces_handled)
-        numeric_total = sum(count for _, count in numeric_debug)
-        LOG.debug(
-            "Material subset coverage for %s: style=%d, numeric=%d, total=%d/%d",
-            mesh.GetPath(),
-            covered,
-            numeric_total,
-            covered + numeric_total,
+            len(stats),
+            total_faces,
             face_count,
         )
-        if style_debug:
-            for subset_path, count, dropped in style_debug:
-                LOG.debug(
-                    "  Style subset %s -> %d faces (dropped %d out-of-range)",
-                    subset_path,
-                    count,
-                    dropped,
-                )
-        if numeric_debug:
-            for subset_path, count in numeric_debug:
-                LOG.debug("  Numeric subset %s -> %d faces", subset_path, count)
+        for subset_path, count in stats:
+            LOG.debug("  Subset %s -> %d faces", subset_path, count)
 
     return created_subsets
 
 
 def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
-                   material_ids=None, style_groups=None, stage_meters_per_unit=1.0,
+                   material_ids=None, style_groups=None, materials=None, stage_meters_per_unit=1.0,
                    scale_matrix_translation=False):
     """Author a Mesh prim beneath ``parent_path`` with the supplied data."""
     mesh_path = Sdf.Path(parent_path).AppendChild(mesh_name)
@@ -671,12 +1123,34 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
 
     face_count = len(payload["face_vertex_counts"])
     subsets_use_styles = False
+    payload_points = payload.get("points")
+    payload_counts = payload.get("face_vertex_counts")
+    payload_indices = payload.get("face_vertex_indices")
+
     if material_ids:
         mat_attr = Vt.IntArray([int(i) for i in material_ids])
         mesh.GetPrim().CreateAttribute("ifc:materialIds", Sdf.ValueTypeNames.IntArray).Set(mat_attr)
-        subsets_use_styles = _ensure_material_subsets(mesh, list(mat_attr), face_count, style_groups=style_groups)
+        subsets_use_styles = _ensure_material_subsets(
+            mesh,
+            list(mat_attr),
+            face_count,
+            style_groups=style_groups,
+            materials=materials,
+            points=payload_points,
+            face_vertex_counts=payload_counts,
+            face_vertex_indices=payload_indices,
+        )
     else:
-        subsets_use_styles = _ensure_material_subsets(mesh, [], face_count, style_groups=style_groups)
+        subsets_use_styles = _ensure_material_subsets(
+            mesh,
+            [],
+            face_count,
+            style_groups=style_groups,
+            materials=materials,
+            points=payload_points,
+            face_vertex_counts=payload_counts,
+            face_vertex_indices=payload_indices,
+        )
 
     # If a single style group covers the entire mesh, author displayColor for quick previews
     try:
@@ -846,6 +1320,7 @@ def author_prototype_layer(
             # Author the mesh as a child "Geom"
             full_material_ids = list(getattr(proto, "material_ids", []) or [])
             full_style_groups = getattr(proto, "style_face_groups", None)
+            full_materials = list(getattr(proto, "materials", []) or [])
 
             write_usd_mesh(
                 stage,
@@ -855,6 +1330,7 @@ def author_prototype_layer(
                 abs_mat=None,
                 material_ids=full_material_ids,
                 style_groups=full_style_groups,
+                materials=full_materials,
                 stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
             )
 
@@ -1025,8 +1501,6 @@ def _bind_materials_on_prototype_mesh(
         if not style_groups:
             continue
 
-        style_tokens = {_subset_token_for_material(token) for token in style_groups.keys()}
-
         numeric_materials: Dict[int, Sdf.Path] = {}
         proto_label = getattr(proto, "type_name", None) or getattr(proto, "name", None) or "Prototype"
         for idx, mat in enumerate(getattr(proto, "materials", None) or []):
@@ -1051,6 +1525,22 @@ def _bind_materials_on_prototype_mesh(
             if mat_path:
                 numeric_materials[idx] = mat_path
 
+        material_ids_attr = mesh_prim.GetAttribute("ifc:materialIds")
+        material_ids_seq: List[int] = []
+        if material_ids_attr and material_ids_attr.IsValid():
+            try:
+                raw_ids = material_ids_attr.Get()
+                if raw_ids:
+                    material_ids_seq = list(raw_ids)
+            except Exception:
+                material_ids_seq = []
+        LOG.debug("Prototype %s materialIds count: %d", mesh_path, len(material_ids_seq))
+
+        style_tokens: Set[str] = set()
+        style_token_to_material: Dict[str, Sdf.Path] = {}
+        material_id_to_style_path: Dict[int, Sdf.Path] = {}
+        material_conflicts_reported: Set[int] = set()
+
         for token, entry in style_groups.items():
             faces = entry.get("faces") or []
             mat_obj = entry.get("material")
@@ -1066,6 +1556,31 @@ def _bind_materials_on_prototype_mesh(
                 continue
 
             subset_token = _subset_token_for_material(token)
+            style_tokens.add(subset_token)
+            style_token_to_material[subset_token] = material_path
+
+            if material_ids_seq:
+                for face_index in faces:
+                    try:
+                        face_int = int(face_index)
+                    except Exception:
+                        continue
+                    if 0 <= face_int < len(material_ids_seq):
+                        material_id = int(material_ids_seq[face_int])
+                        existing = material_id_to_style_path.get(material_id)
+                        if existing is None:
+                            material_id_to_style_path[material_id] = material_path
+                        elif existing != material_path and material_id not in material_conflicts_reported:
+                            LOG.debug(
+                                "Material ID %d already mapped to %s; skipping alternate style %s for prototype %s",
+                                material_id,
+                                existing,
+                                material_path,
+                                mesh_root,
+                            )
+                            material_conflicts_reported.add(material_id)
+
+        for subset_token, material_path in style_token_to_material.items():
             subset_path = mesh_path.AppendChild(subset_token)
             subset_prim = stage.GetPrimAtPath(subset_path)
             if not subset_prim:
@@ -1093,14 +1608,32 @@ def _bind_materials_on_prototype_mesh(
             material_index = _material_index_from_subset_token(name)
             if material_index is None:
                 continue
-            material_path = numeric_materials.get(material_index)
+            material_path = material_id_to_style_path.get(material_index)
+            rebound_from_style = False
+            if material_path is None:
+                material_path = numeric_materials.get(material_index)
+            else:
+                rebound_from_style = True
+            if material_path is None and style_material_path is not None:
+                material_path = style_material_path
             if not material_path:
                 continue
             material = UsdShade.Material.Get(stage, material_path)
             if not material:
                 continue
             UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(material)
-            LOG.debug("Bound numeric subset %s -> %s", subset.GetPath(), material_path)
+            LOG.debug(
+                "Bound numeric subset %s -> %s (%s)",
+                subset.GetPath(),
+                material_path,
+                "style" if rebound_from_style else "library",
+            )
+            try:
+                indices = subset.GetIndicesAttr().Get()
+                if not indices:
+                    LOG.debug("Numeric subset %s had no indices after binding.", subset.GetPath())
+            except Exception:
+                pass
 
         imageable = UsdGeom.Imageable(mesh_prim)
         try:
@@ -1659,6 +2192,7 @@ def author_instance_layer(
                     record.mesh,
                     abs_mat=None,
                     material_ids=material_ids,
+                    materials=list(getattr(record, "materials", []) or []),
                     stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
                 )
                 if resolved_materials:
