@@ -602,6 +602,18 @@ def _resolve_component_styles(
             continue
         style_color_map[token] = _color_from_material(entry.get("material"))
 
+    style_saturation_map: Dict[str, float] = {
+        token: _color_saturation(color) for token, color in style_color_map.items()
+    }
+    sorted_styles_by_saturation = sorted(
+        style_saturation_map.items(), key=lambda item: item[1], reverse=True
+    )
+    high_saturation_threshold = 0.18
+    primary_high_saturation_token = next(
+        (token for token, sat in sorted_styles_by_saturation if sat >= high_saturation_threshold),
+        None,
+    )
+
     material_style_stats: Dict[int, Tuple[str, int]] = {}
     for key, entry in style_groups.items():
         token = style_tokens.get(key)
@@ -711,14 +723,19 @@ def _resolve_component_styles(
         if np.linalg.norm(normal_acc) > 0.0:
             normal_acc = normal_acc / np.linalg.norm(normal_acc)
 
+        min_bounds = tuple(float(v) for v in bounds_min)
+        max_bounds = tuple(float(v) for v in bounds_max)
+        extents = tuple(float(max_bounds[i] - min_bounds[i]) for i in range(3))
+
         components.append(
             {
                 "faces": faces_in_component,
                 "material_id": material_id,
                 "area": area,
                 "normal": tuple(float(v) for v in normal_acc),
-                "bounds_min": tuple(float(v) for v in bounds_min),
-                "bounds_max": tuple(float(v) for v in bounds_max),
+                "bounds_min": min_bounds,
+                "bounds_max": max_bounds,
+                "extents": extents,
                 "style_presence": style_presence,
                 "neighbor_styles": neighbor_styles,
             }
@@ -763,6 +780,12 @@ def _resolve_component_styles(
     orientation_override_area = 5.0
     orientation_override_sat = 0.2
     color_match_threshold = 0.01
+    horizontal_area_threshold = 1.0
+    horizontal_normal_threshold = 0.6
+    vertical_normal_threshold = 0.35
+    trim_thickness_threshold = 0.08
+    trim_length_threshold = 0.5
+    horizontal_priority_material_ids = {0, 1}
 
     for component in components:
         faces_in_component = component["faces"]
@@ -775,6 +798,8 @@ def _resolve_component_styles(
                 material_color = _color_from_material(materials[material_id])
         except Exception:
             material_color = None
+
+        preferred_token = material_style_lookup.get(material_id)
 
         if component["style_presence"]:
             chosen_token = max(component["style_presence"].items(), key=lambda item: item[1])[0]
@@ -790,9 +815,45 @@ def _resolve_component_styles(
                 chosen_token = max(filtered_neighbors, key=lambda item: item[1])[0]
 
         if chosen_token is None:
-            material_id = component["material_id"]
             fallback_token = _style_fallback_for_material(material_id)
             chosen_token = fallback_token
+        if preferred_token and chosen_token is None:
+            chosen_token = preferred_token
+            chosen_from_style = True
+        if preferred_token and chosen_token == preferred_token:
+            chosen_from_style = True
+
+        extents = component.get("extents", (0.0, 0.0, 0.0))
+        min_extent = min(extents) if extents else 0.0
+        max_extent = max(extents) if extents else 0.0
+        normal_vec = np.asarray(component["normal"], dtype=np.float64)
+        abs_normal_z = float(abs(normal_vec[2]))
+        is_horizontal = abs_normal_z >= horizontal_normal_threshold
+        is_vertical = abs_normal_z <= vertical_normal_threshold
+        thin_trim = (
+            is_vertical
+            and min_extent <= trim_thickness_threshold
+            and max_extent >= trim_length_threshold
+            and component["area"] <= area_threshold * 8.0
+        )
+
+        if thin_trim and preferred_token:
+            chosen_token = preferred_token
+            chosen_from_style = True
+
+        if thin_trim and chosen_token:
+            for face_idx in faces_in_component:
+                face_styles[face_idx] = chosen_token
+            continue
+
+        if (
+            is_horizontal
+            and component["area"] >= horizontal_area_threshold
+            and material_id in horizontal_priority_material_ids
+            and primary_high_saturation_token
+        ):
+            chosen_token = primary_high_saturation_token
+            chosen_from_style = False
 
         preserve_style_area_threshold = 0.5
         chosen_color = style_color_map.get(chosen_token) if chosen_token else None
@@ -804,13 +865,15 @@ def _resolve_component_styles(
             and _color_saturation(chosen_color) > saturation_threshold
         )
 
-        if (
-            chosen_token
-            and (
-                not chosen_from_style or style_area_map.get(chosen_token, 0.0) >= preserve_style_area_threshold
-            )
-            and not color_match
-        ):
+        allow_override = False
+        if chosen_token:
+            allow_override = True
+            if chosen_from_style and style_area_map.get(chosen_token, 0.0) >= preserve_style_area_threshold:
+                allow_override = False
+            if color_match:
+                allow_override = False
+
+        if allow_override:
             component_normal = np.asarray(component["normal"], dtype=np.float64)
             comp_norm_len = np.linalg.norm(component_normal)
             if comp_norm_len > 0.0:
