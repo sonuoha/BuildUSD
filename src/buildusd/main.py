@@ -58,7 +58,7 @@ OPTIONS = ConversionOptions(
     enable_instancing=True,
     enable_hash_dedup=False,
     convert_metadata=True,
-    enable_high_detail_remesh=True,
+    enable_high_detail_remesh=False,
     anchor_mode=None,
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
