@@ -60,6 +60,7 @@ OPTIONS = ConversionOptions(
     convert_metadata=True,
     enable_high_detail_remesh=False,
     anchor_mode=None,
+    split_topology_by_material=False,
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
 DEFAULT_USD_FORMAT = "usdc"
