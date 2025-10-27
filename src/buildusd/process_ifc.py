@@ -344,6 +344,7 @@ class ConversionOptions:
     manifest: Optional['ConversionManifest'] = None
     curve_width_rules: Tuple[CurveWidthRule, ...] = tuple()
     anchor_mode: Optional[Literal["local", "site"]] = None
+    split_topology_by_material: bool = False
 
 @dataclass(frozen=True)
 class PrototypeKey:

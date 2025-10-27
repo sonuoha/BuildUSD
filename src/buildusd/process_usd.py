@@ -289,15 +289,34 @@ def _reindex_for_uv_seams(
     return new_points, new_normals, new_indices, new_uvs
 
 
-def _subset_token_for_material(material_index: Any) -> str:
-    if isinstance(material_index, int):
-        base = f"Material_{material_index}"
-        return _sanitize_identifier(base, fallback=base)
-    text = str(material_index)
+def _subset_token_for_material(material_identifier: Any) -> str:
+    """Return a USD-legal prim token for a material/style identifier."""
+    if isinstance(material_identifier, int):
+        index = int(material_identifier)
+        if index >= 0:
+            return f"Material_{index}"
+        return f"Material_neg{abs(index)}"
+    text = str(material_identifier)
     sanitized = sanitize_name(text, fallback="Style")
     if not sanitized:
         sanitized = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:8]
     return sanitized
+
+
+def _material_index_from_subset_token(token: str) -> Optional[int]:
+    """Recover a material index from a subset token, if it encodes one."""
+    if not token.startswith("Material"):
+        return None
+    if token.startswith("Material_neg"):
+        suffix = token[len("Material_neg") :]
+        if suffix.isdigit():
+            return -int(suffix)
+        return None
+    if token.startswith("Material_"):
+        suffix = token[len("Material_") :]
+        if suffix.isdigit():
+            return int(suffix)
+    return None
 
 
 def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -455,10 +474,32 @@ def _ensure_material_subsets(
     style_faces_handled: Set[int] = set()
     created_subsets = False
 
+    style_debug: List[Tuple[str, int, int]] = []
     if style_groups:
         for key, entry in style_groups.items():
-            faces = entry.get("faces") or []
-            if not faces:
+            raw_faces = entry.get("faces") or []
+            if not raw_faces:
+                continue
+            valid_faces: List[int] = []
+            invalid_faces = 0
+            for value in raw_faces:
+                try:
+                    face_index = int(value)
+                except Exception:
+                    invalid_faces += 1
+                    continue
+                if 0 <= face_index < face_count:
+                    valid_faces.append(face_index)
+                else:
+                    invalid_faces += 1
+            if not valid_faces:
+                if invalid_faces:
+                    LOG.debug(
+                        "Discarded style subset %s for %s: %d face indices were out of range.",
+                        key,
+                        mesh.GetPath(),
+                        invalid_faces,
+                    )
                 continue
             subset_token = _subset_token_for_material(key)
             subset_path = mesh.GetPath().AppendChild(subset_token)
@@ -470,19 +511,16 @@ def _ensure_material_subsets(
                     subset.CreateElementTypeAttr().Set(element_token)
                 except AttributeError:
                     subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
-            subset.CreateIndicesAttr(Vt.IntArray([int(i) for i in faces]))
+            subset.CreateIndicesAttr(Vt.IntArray(valid_faces))
             try:
                 subset.CreateFamilyNameAttr().Set(family_name)
             except Exception:
                 subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
             created_subsets = True
-            for face_index in faces:
-                try:
-                    face_int = int(face_index)
-                except Exception:
-                    continue
-                if 0 <= face_int < face_count:
-                    style_faces_handled.add(face_int)
+            for face_int in valid_faces:
+                style_faces_handled.add(face_int)
+            if LOG.isEnabledFor(logging.DEBUG):
+                style_debug.append((str(subset_path), len(valid_faces), invalid_faces))
 
     if not material_ids:
         if created_subsets:
@@ -516,8 +554,15 @@ def _ensure_material_subsets(
             continue
         indices_by_material[int(material_index)].append(int(face_index))
     if not indices_by_material:
+        if LOG.isEnabledFor(logging.DEBUG) and style_debug:
+            LOG.debug(
+                "Style subsets covered all %d faces for %s",
+                len(style_faces_handled),
+                mesh.GetPath(),
+            )
         return created_subsets
 
+    numeric_debug: List[Tuple[str, int]] = []
     for material_index, face_indices in sorted(indices_by_material.items()):
         subset_token = _subset_token_for_material(material_index)
         subset_path = mesh.GetPath().AppendChild(subset_token)
@@ -535,6 +580,32 @@ def _ensure_material_subsets(
         except Exception:
             subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
         created_subsets = True
+        if LOG.isEnabledFor(logging.DEBUG):
+            numeric_debug.append((str(subset_path), len(face_indices)))
+
+    if LOG.isEnabledFor(logging.DEBUG):
+        covered = len(style_faces_handled)
+        numeric_total = sum(count for _, count in numeric_debug)
+        LOG.debug(
+            "Material subset coverage for %s: style=%d, numeric=%d, total=%d/%d",
+            mesh.GetPath(),
+            covered,
+            numeric_total,
+            covered + numeric_total,
+            face_count,
+        )
+        if style_debug:
+            for subset_path, count, dropped in style_debug:
+                LOG.debug(
+                    "  Style subset %s -> %d faces (dropped %d out-of-range)",
+                    subset_path,
+                    count,
+                    dropped,
+                )
+        if numeric_debug:
+            for subset_path, count in numeric_debug:
+                LOG.debug("  Numeric subset %s -> %d faces", subset_path, count)
+
     return created_subsets
 
 
@@ -773,14 +844,17 @@ def author_prototype_layer(
             UsdGeom.Imageable(proto_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.guide)
 
             # Author the mesh as a child "Geom"
+            full_material_ids = list(getattr(proto, "material_ids", []) or [])
+            full_style_groups = getattr(proto, "style_face_groups", None)
+
             write_usd_mesh(
                 stage,
                 proto_path,
                 "Geom",
                 mesh_payload,
                 abs_mat=None,
-                material_ids=list(getattr(proto, "material_ids", []) or []),
-                style_groups=getattr(proto, "style_face_groups", None),
+                material_ids=full_material_ids,
+                style_groups=full_style_groups,
                 stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
             )
 
@@ -928,6 +1002,119 @@ def _material_properties_from_pbr(
             except Exception:
                 pass
     return None
+
+
+def _bind_materials_on_prototype_mesh(
+    stage: Usd.Stage,
+    proto_paths: Dict[PrototypeKey, Sdf.Path],
+    caches: PrototypeCaches,
+    library: MaterialLibrary,
+) -> None:
+    """Bind style-derived materials on prototype subset prims."""
+
+    for key, proto in _iter_prototypes(caches):
+        mesh_root = proto_paths.get(key)
+        if not mesh_root:
+            continue
+        mesh_path = mesh_root.AppendChild("Geom")
+        mesh_prim = stage.GetPrimAtPath(mesh_path)
+        if not mesh_prim:
+            continue
+
+        style_groups = getattr(proto, "style_face_groups", None) or {}
+        if not style_groups:
+            continue
+
+        style_tokens = {_subset_token_for_material(token) for token in style_groups.keys()}
+
+        numeric_materials: Dict[int, Sdf.Path] = {}
+        proto_label = getattr(proto, "type_name", None) or getattr(proto, "name", None) or "Prototype"
+        for idx, mat in enumerate(getattr(proto, "materials", None) or []):
+            props = _extract_material_properties(mat, prototype_label=proto_label, index=idx)
+            if props is None:
+                LOG.debug(
+                    "Prototype %s material[%d] produced no usable properties (raw type=%s)",
+                    mesh_root,
+                    idx,
+                    type(mat).__name__,
+                )
+                continue
+            sig = _material_signature(props)
+            mat_path = library.signature_to_path.get(sig)
+            LOG.debug(
+                "Prototype %s material[%d] -> signature %s -> %s",
+                mesh_root,
+                idx,
+                sig,
+                mat_path,
+            )
+            if mat_path:
+                numeric_materials[idx] = mat_path
+
+        for token, entry in style_groups.items():
+            faces = entry.get("faces") or []
+            mat_obj = entry.get("material")
+            if not faces or not mat_obj:
+                continue
+
+            props = _material_properties_from_pbr(mat_obj, fallback_name=token)
+            if props is None:
+                continue
+            signature = _material_signature(props)
+            material_path = library.signature_to_path.get(signature)
+            if material_path is None:
+                continue
+
+            subset_token = _subset_token_for_material(token)
+            subset_path = mesh_path.AppendChild(subset_token)
+            subset_prim = stage.GetPrimAtPath(subset_path)
+            if not subset_prim:
+                continue
+
+            material = UsdShade.Material.Get(stage, material_path)
+            if not material:
+                continue
+
+            UsdShade.MaterialBindingAPI(subset_prim).Bind(material)
+            LOG.debug("Bound style subset %s -> %s", subset_path, material_path)
+
+        try:
+            subsets = UsdGeom.Subset.GetGeomSubsets(
+                UsdGeom.Imageable(mesh_prim),
+                elementType=UsdGeom.Tokens.face,
+            )
+        except Exception:
+            subsets = []
+
+        for subset in subsets or []:
+            name = subset.GetPrim().GetName()
+            if name in style_tokens:
+                continue
+            material_index = _material_index_from_subset_token(name)
+            if material_index is None:
+                continue
+            material_path = numeric_materials.get(material_index)
+            if not material_path:
+                continue
+            material = UsdShade.Material.Get(stage, material_path)
+            if not material:
+                continue
+            UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(material)
+            LOG.debug("Bound numeric subset %s -> %s", subset.GetPath(), material_path)
+
+        imageable = UsdGeom.Imageable(mesh_prim)
+        try:
+            if not UsdGeom.Subset.ValidateFamily(
+                imageable,
+                elementType=UsdGeom.Tokens.face,
+                familyName="materialBind",
+            ):
+                LOG.warning(
+                    "Material subset validation failed on prototype %s; face assignment may be incomplete.",
+                    mesh_path,
+                )
+        except Exception:
+            LOG.debug("Unable to validate material subsets for %s", mesh_path, exc_info=True)
 
 
 def _extract_material_properties(
@@ -1340,6 +1527,8 @@ def author_material_layer(
                 log.debug("Authored material %s for signature %s", material_prim_path, signature)
 
     library = MaterialLibrary(signature_to_path)
+    with Usd.EditContext(stage, material_layer):
+        _bind_materials_on_prototype_mesh(stage, proto_paths, caches, library)
     return material_layer, library
 
 
