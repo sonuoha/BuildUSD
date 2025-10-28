@@ -714,6 +714,9 @@ def _resolve_component_styles(
         bounds_max = np.full(3, -np.inf)
         style_presence: Dict[str, int] = defaultdict(int)
         neighbor_styles: Dict[str, int] = defaultdict(int)
+        centroid_sum = np.zeros(3, dtype=np.float64)
+        centroid_weight = 0.0
+        face_metrics: List[Tuple[float, np.ndarray]] = []
 
         while queue:
             face_idx = queue.pop()
@@ -727,10 +730,16 @@ def _resolve_component_styles(
             if points is not None:
                 face_area, normal = _face_area_and_normal(points, verts)
                 area += face_area
-                normal_acc += np.asarray(normal, dtype=np.float64) * face_area
-                for v in verts:
-                    bounds_min = np.minimum(bounds_min, np.asarray(points[v], dtype=np.float64))
-                    bounds_max = np.maximum(bounds_max, np.asarray(points[v], dtype=np.float64))
+                normal_vec_np = np.asarray(normal, dtype=np.float64)
+                normal_acc += normal_vec_np * face_area
+                tri_points = np.asarray([points[v] for v in verts], dtype=np.float64)
+                tri_centroid = tri_points.mean(axis=0)
+                centroid_sum += tri_centroid * face_area
+                centroid_weight += face_area
+                face_metrics.append((face_area, normal_vec_np))
+                for point in tri_points:
+                    bounds_min = np.minimum(bounds_min, point)
+                    bounds_max = np.maximum(bounds_max, point)
             token = face_styles[face_idx]
             if token:
                 style_presence[token] += 1
@@ -751,6 +760,26 @@ def _resolve_component_styles(
         max_bounds = tuple(float(v) for v in bounds_max)
         extents = tuple(float(max_bounds[i] - min_bounds[i]) for i in range(3))
 
+        if centroid_weight > 0.0:
+            centroid = centroid_sum / centroid_weight
+        elif points is not None and faces_in_component:
+            centroid = np.asarray(points[face_vertices[faces_in_component[0]][0]], dtype=np.float64)
+        else:
+            centroid = np.zeros(3, dtype=np.float64)
+
+        normal_variation = 0.0
+        if face_metrics and area > 0.0 and np.linalg.norm(normal_acc) > 0.0:
+            normal_variation = sum(
+                face_area * (1.0 - float(abs(np.dot(normal_acc, face_normal))))
+                for face_area, face_normal in face_metrics
+            ) / area
+
+        orientation_abs = (
+            float(abs(normal_acc[0])),
+            float(abs(normal_acc[1])),
+            float(abs(normal_acc[2])),
+        )
+
         components.append(
             {
                 "faces": faces_in_component,
@@ -760,6 +789,9 @@ def _resolve_component_styles(
                 "bounds_min": min_bounds,
                 "bounds_max": max_bounds,
                 "extents": extents,
+                "centroid": tuple(float(v) for v in centroid),
+                "normal_variation": float(normal_variation),
+                "orientation_abs": orientation_abs,
                 "style_presence": style_presence,
                 "neighbor_styles": neighbor_styles,
             }
@@ -817,6 +849,12 @@ def _resolve_component_styles(
     handle_thickness_threshold = 0.35
     handle_mid_threshold = 0.4
     handle_area_threshold = 6.0
+    roof_z_threshold = 2.2
+    roof_brightness_threshold = 0.4
+    bottom_trim_height = 0.35
+    front_panel_area_threshold = 5.5
+    front_panel_normal_variation_threshold = 0.12
+    front_panel_brightness_threshold = 0.35
     horizontal_priority_material_ids = {0, 1}
 
     for component in components:
@@ -832,6 +870,7 @@ def _resolve_component_styles(
             material_color = None
 
         preferred_token = material_style_lookup.get(material_id)
+        material_brightness = _color_brightness(material_color)
 
         if component["style_presence"]:
             chosen_token = max(component["style_presence"].items(), key=lambda item: item[1])[0]
@@ -864,6 +903,12 @@ def _resolve_component_styles(
         is_vertical = abs_normal_z <= vertical_normal_threshold
         sorted_extents = sorted(extents)
         mid_extent = sorted_extents[1] if len(sorted_extents) >= 2 else max_extent
+        bounds_min = component.get("bounds_min", (0.0, 0.0, 0.0))
+        bounds_max = component.get("bounds_max", (0.0, 0.0, 0.0))
+        min_z = float(bounds_min[2]) if len(bounds_min) >= 3 else 0.0
+        max_z = float(bounds_max[2]) if len(bounds_max) >= 3 else 0.0
+        orientation_abs = component.get("orientation_abs", (0.0, 0.0, 0.0))
+        normal_variation = float(component.get("normal_variation", 0.0))
         thin_trim = (
             min_extent <= trim_thickness_threshold
             and mid_extent <= trim_length_threshold
@@ -879,6 +924,21 @@ def _resolve_component_styles(
                 desired_token = neutral_style_token
             if desired_token:
                 chosen_token = desired_token
+                for face_idx in faces_in_component:
+                    face_styles[face_idx] = chosen_token
+                continue
+
+        is_bottom_trim = (
+            is_horizontal
+            and component["area"] >= min_override_area
+            and max_z <= bottom_trim_height
+            and mid_extent <= trim_mid_threshold
+        )
+        if is_bottom_trim:
+            desired_token = preferred_token or neutral_style_token or chosen_token
+            if desired_token:
+                chosen_token = desired_token
+                chosen_from_style = desired_token == preferred_token
                 for face_idx in faces_in_component:
                     face_styles[face_idx] = chosen_token
                 continue
@@ -899,6 +959,28 @@ def _resolve_component_styles(
                 continue
 
         auto_panel_applied = False
+        is_roof_panel = (
+            is_horizontal
+            and component["area"] >= horizontal_area_threshold
+            and max_z >= roof_z_threshold
+            and material_brightness >= roof_brightness_threshold
+        )
+        if is_roof_panel and primary_high_saturation_token:
+            chosen_token = primary_high_saturation_token
+            chosen_from_style = False
+            auto_panel_applied = True
+
+        is_front_panel = (
+            is_vertical
+            and component["area"] >= front_panel_area_threshold
+            and normal_variation <= front_panel_normal_variation_threshold
+            and material_brightness >= front_panel_brightness_threshold
+            and (orientation_abs[0] >= 0.6 or orientation_abs[1] >= 0.6)
+        )
+        if is_front_panel and primary_high_saturation_token:
+            chosen_token = primary_high_saturation_token
+            chosen_from_style = False
+            auto_panel_applied = True
         if primary_high_saturation_token and material_id in horizontal_priority_material_ids:
             needs_panel_override = (
                 (is_horizontal and component["area"] >= horizontal_area_threshold)
