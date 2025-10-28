@@ -638,6 +638,30 @@ def _resolve_component_styles(
         material_id: token for material_id, (token, _) in material_style_stats.items()
     }
 
+    material_style_stats: Dict[int, Tuple[str, int]] = {}
+    if material_ids:
+        for key, entry in style_groups.items():
+            token = style_tokens.get(key)
+            if not token:
+                continue
+            id_counts: Counter[int] = Counter()
+            for idx in entry.get("faces") or []:
+                try:
+                    face_index = int(idx)
+                except Exception:
+                    continue
+                if 0 <= face_index < face_count:
+                    id_counts[int(material_ids[face_index])] += 1
+            if not id_counts:
+                continue
+            dominant_id, dominant_count = id_counts.most_common(1)[0]
+            existing = material_style_stats.get(dominant_id)
+            if existing is None or dominant_count > existing[1]:
+                material_style_stats[dominant_id] = (token, dominant_count)
+    material_style_lookup: Dict[int, str] = {
+        material_id: token for material_id, (token, _) in material_style_stats.items()
+    }
+
     face_vertices, adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
 
     face_styles: List[Optional[str]] = [None] * face_count
@@ -780,11 +804,14 @@ def _resolve_component_styles(
     orientation_override_area = 5.0
     orientation_override_sat = 0.2
     color_match_threshold = 0.01
-    horizontal_area_threshold = 1.0
+    horizontal_area_threshold = 4.0
     horizontal_normal_threshold = 0.6
-    vertical_normal_threshold = 0.35
+    vertical_area_threshold = 5.0
+    vertical_normal_threshold = 0.3
     trim_thickness_threshold = 0.08
-    trim_length_threshold = 0.5
+    trim_length_threshold = 0.6
+    min_override_area = 2.0
+    panel_area_threshold = 2.5
     horizontal_priority_material_ids = {0, 1}
 
     for component in components:
@@ -830,11 +857,12 @@ def _resolve_component_styles(
         abs_normal_z = float(abs(normal_vec[2]))
         is_horizontal = abs_normal_z >= horizontal_normal_threshold
         is_vertical = abs_normal_z <= vertical_normal_threshold
+        sorted_extents = sorted(extents)
+        mid_extent = sorted_extents[1] if len(sorted_extents) >= 2 else max_extent
         thin_trim = (
-            is_vertical
-            and min_extent <= trim_thickness_threshold
-            and max_extent >= trim_length_threshold
-            and component["area"] <= area_threshold * 8.0
+            min_extent <= trim_thickness_threshold
+            and mid_extent <= trim_length_threshold
+            and component["area"] <= area_threshold * 12.0
         )
 
         if thin_trim and preferred_token:
@@ -846,14 +874,22 @@ def _resolve_component_styles(
                 face_styles[face_idx] = chosen_token
             continue
 
-        if (
-            is_horizontal
-            and component["area"] >= horizontal_area_threshold
-            and material_id in horizontal_priority_material_ids
-            and primary_high_saturation_token
-        ):
-            chosen_token = primary_high_saturation_token
-            chosen_from_style = False
+        auto_panel_applied = False
+        if primary_high_saturation_token and material_id in horizontal_priority_material_ids:
+            needs_panel_override = (
+                (is_horizontal and component["area"] >= horizontal_area_threshold)
+                or (is_vertical and component["area"] >= vertical_area_threshold)
+                or (component["area"] >= panel_area_threshold and min_extent > trim_thickness_threshold and mid_extent > trim_length_threshold)
+            )
+            style_coverage = 0.0
+            if chosen_token:
+                coverage_count = component["style_presence"].get(chosen_token, 0)
+                style_coverage = float(coverage_count) / float(len(faces_in_component) or 1)
+            current_sat = style_saturation_map.get(chosen_token, 0.0) if chosen_token else 0.0
+            if needs_panel_override and (not chosen_from_style or (style_coverage < 0.6 and current_sat < saturation_threshold)):
+                chosen_token = primary_high_saturation_token
+                chosen_from_style = False
+                auto_panel_applied = True
 
         preserve_style_area_threshold = 0.5
         chosen_color = style_color_map.get(chosen_token) if chosen_token else None
@@ -864,14 +900,19 @@ def _resolve_component_styles(
             and sum((float(material_color[i]) - float(chosen_color[i])) ** 2 for i in range(3)) < color_match_threshold
             and _color_saturation(chosen_color) > saturation_threshold
         )
-
-        allow_override = False
+        style_coverage = 0.0
         if chosen_token:
-            allow_override = True
-            if chosen_from_style and style_area_map.get(chosen_token, 0.0) >= preserve_style_area_threshold:
-                allow_override = False
-            if color_match:
-                allow_override = False
+            coverage_count = component["style_presence"].get(chosen_token, 0)
+            style_coverage = float(coverage_count) / float(len(faces_in_component) or 1)
+
+        allow_override = (
+            bool(chosen_token)
+            and not chosen_from_style
+            and not color_match
+            and component["area"] >= min_override_area
+            and not auto_panel_applied
+            and style_coverage < 0.6
+        )
 
         if allow_override:
             component_normal = np.asarray(component["normal"], dtype=np.float64)
@@ -959,6 +1000,7 @@ def _ensure_material_subsets(
     points: Optional[Sequence[Tuple[float, float, float]]] = None,
     face_vertex_counts: Optional[Sequence[int]] = None,
     face_vertex_indices: Optional[Sequence[int]] = None,
+    use_component_classification: bool = False,
 ) -> bool:
     prim = mesh.GetPrim()
     stage = prim.GetStage()
@@ -975,13 +1017,14 @@ def _ensure_material_subsets(
     except Exception:
         pass
 
-    style_tokens: Dict[str, str] = {}
-    if style_groups:
+    created_subsets = False
+    stats: List[Tuple[str, int]] = []
+
+    if use_component_classification and material_ids and len(material_ids) == face_count and style_groups:
+        style_tokens: Dict[str, str] = {}
         for key in style_groups:
             style_tokens[key] = _subset_token_for_material(key)
 
-    face_style_map: Dict[str, List[int]] = {}
-    if material_ids and len(material_ids) == face_count and style_groups:
         face_style_map = _resolve_component_styles(
             material_ids,
             style_groups,
@@ -1007,35 +1050,31 @@ def _ensure_material_subsets(
                     else:
                         face_style_map[token] = list(faces)
 
-    created_subsets = False
-    stats: List[Tuple[str, int]] = []
-
-    if face_style_map:
-        for token, faces in face_style_map.items():
-            if not faces:
-                continue
-            subset_path = mesh.GetPath().AppendChild(token)
-            subset = UsdGeom.Subset.Define(stage, subset_path)
-            try:
-                UsdGeom.Subset.SetElementType(subset, element_token)
-            except Exception:
+            for token, faces in face_style_map.items():
+                if not faces:
+                    continue
+                subset_path = mesh.GetPath().AppendChild(token)
+                subset = UsdGeom.Subset.Define(stage, subset_path)
                 try:
-                    subset.CreateElementTypeAttr().Set(element_token)
-                except AttributeError:
-                    subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
-            indices_attr = subset.GetIndicesAttr()
-            if not indices_attr:
-                indices_attr = subset.CreateIndicesAttr()
-            indices_attr.Set(Vt.IntArray([int(f) for f in faces]))
-            try:
-                subset.CreateFamilyNameAttr().Set(family_name)
-            except Exception:
-                subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
-            created_subsets = True
-            stats.append((str(subset_path), len(faces)))
+                    UsdGeom.Subset.SetElementType(subset, element_token)
+                except Exception:
+                    try:
+                        subset.CreateElementTypeAttr().Set(element_token)
+                    except AttributeError:
+                        subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+                indices_attr = subset.GetIndicesAttr()
+                if not indices_attr:
+                    indices_attr = subset.CreateIndicesAttr()
+                indices_attr.Set(Vt.IntArray([int(f) for f in faces]))
+                try:
+                    subset.CreateFamilyNameAttr().Set(family_name)
+                except Exception:
+                    subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+                created_subsets = True
+                stats.append((str(subset_path), len(faces)))
 
-    else:
-        # Fallback to original behaviour when component reconciliation fails.
+    if not created_subsets:
+        # Legacy/simple behaviour.
         style_faces_handled: Set[int] = set()
         if style_groups:
             for key, entry in style_groups.items():
@@ -1126,7 +1165,7 @@ def _ensure_material_subsets(
 
 def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
                    material_ids=None, style_groups=None, materials=None, stage_meters_per_unit=1.0,
-                   scale_matrix_translation=False):
+                   scale_matrix_translation=False, use_component_classification=False):
     """Author a Mesh prim beneath ``parent_path`` with the supplied data."""
     mesh_path = Sdf.Path(parent_path).AppendChild(mesh_name)
     mesh = UsdGeom.Mesh.Define(stage, mesh_path)
@@ -1202,6 +1241,7 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
             points=payload_points,
             face_vertex_counts=payload_counts,
             face_vertex_indices=payload_indices,
+            use_component_classification=use_component_classification,
         )
     else:
         subsets_use_styles = _ensure_material_subsets(
@@ -1213,6 +1253,7 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
             points=payload_points,
             face_vertex_counts=payload_counts,
             face_vertex_indices=payload_indices,
+            use_component_classification=use_component_classification,
         )
 
     # If a single style group covers the entire mesh, author displayColor for quick previews
@@ -1348,6 +1389,7 @@ def author_prototype_layer(
     proto_root = Sdf.Path("/World/__Prototypes")
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
     used_names: Dict[str, int] = {}
+    use_component_classification = getattr(options, "enable_material_classification", False)
 
     def _unique_name(base: str) -> str:
         c = used_names.get(base, 0)
@@ -1395,6 +1437,7 @@ def author_prototype_layer(
                 style_groups=full_style_groups,
                 materials=full_materials,
                 stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
+                use_component_classification=use_component_classification,
             )
 
     return proto_layer, proto_paths
@@ -2172,6 +2215,8 @@ def author_instance_layer(
     hierarchy_nodes_by_step: Dict[int, Sdf.Path] = {}
     hierarchy_nodes_by_label: Dict[Tuple[Sdf.Path, str], Sdf.Path] = {}
 
+    use_component_classification = getattr(options, "enable_material_classification", False)
+
     def _unique_child_name(parent_path: Sdf.Path, base: str) -> str:
         used = name_counters[parent_path]
         count = used.get(base, 0)
@@ -2257,6 +2302,8 @@ def author_instance_layer(
                     material_ids=material_ids,
                     materials=list(getattr(record, "materials", []) or []),
                     stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
+                    style_groups=style_groups,
+                    use_component_classification=use_component_classification,
                 )
                 if resolved_materials:
                     _apply_material_bindings_to_prim(

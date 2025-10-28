@@ -213,5 +213,6 @@ Examples
     - The result is a single, style-named GeomSubset per visual surface (e.g. `Acero_amarillo_0`, `Aluminio_2`), eliminating the patchy “Material_*” subsets that previously showed mixed colours on container walls and roofs.
     - Extra heuristics keep thin vertical trims on their neutral frame colours, bias horizontal slabs (e.g. container roofs) toward saturated façade styles, and preserve aluminium handles when the raw IFC material already encodes them.
   - Because the reconciliation only ever reuses existing style tokens, downstream material bindings and instance overrides behave exactly as before, just with complete face coverage.
+  - Toggle via `--enable-material-classification` (or `ConversionOptions(enable_material_classification=True)`) to switch between the legacy per-face material IDs and the enhanced component classifier.
 
 
