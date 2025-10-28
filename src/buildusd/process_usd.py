@@ -563,6 +563,16 @@ def _color_saturation(color: Optional[Tuple[float, float, float]]) -> float:
     return max_c - min_c
 
 
+def _color_brightness(color: Optional[Tuple[float, float, float]]) -> float:
+    if not color:
+        return 0.0
+    try:
+        r, g, b = (float(color[0]), float(color[1]), float(color[2]))
+    except Exception:
+        return 0.0
+    return (r + g + b) / 3.0
+
+
 def _resolve_component_styles(
     material_ids: Sequence[int],
     style_groups: Dict[str, Dict[str, Any]],
@@ -613,6 +623,20 @@ def _resolve_component_styles(
         (token for token, sat in sorted_styles_by_saturation if sat >= high_saturation_threshold),
         None,
     )
+    neutral_style_token = (
+        min(style_saturation_map.items(), key=lambda item: item[1])[0]
+        if style_saturation_map
+        else None
+    )
+    aluminium_style_token: Optional[str] = None
+    for token, color in style_color_map.items():
+        if color is None:
+            continue
+        brightness = _color_brightness(color)
+        saturation = style_saturation_map.get(token, 0.0)
+        if brightness >= 0.75 and saturation <= 0.15:
+            aluminium_style_token = token
+            break
 
     material_style_stats: Dict[int, Tuple[str, int]] = {}
     for key, entry in style_groups.items():
@@ -634,30 +658,6 @@ def _resolve_component_styles(
         if existing is None or dominant_count > existing[1]:
             material_style_stats[dominant_id] = (token, dominant_count)
 
-    material_style_lookup: Dict[int, str] = {
-        material_id: token for material_id, (token, _) in material_style_stats.items()
-    }
-
-    material_style_stats: Dict[int, Tuple[str, int]] = {}
-    if material_ids:
-        for key, entry in style_groups.items():
-            token = style_tokens.get(key)
-            if not token:
-                continue
-            id_counts: Counter[int] = Counter()
-            for idx in entry.get("faces") or []:
-                try:
-                    face_index = int(idx)
-                except Exception:
-                    continue
-                if 0 <= face_index < face_count:
-                    id_counts[int(material_ids[face_index])] += 1
-            if not id_counts:
-                continue
-            dominant_id, dominant_count = id_counts.most_common(1)[0]
-            existing = material_style_stats.get(dominant_id)
-            if existing is None or dominant_count > existing[1]:
-                material_style_stats[dominant_id] = (token, dominant_count)
     material_style_lookup: Dict[int, str] = {
         material_id: token for material_id, (token, _) in material_style_stats.items()
     }
@@ -812,6 +812,11 @@ def _resolve_component_styles(
     trim_length_threshold = 0.6
     min_override_area = 2.0
     panel_area_threshold = 2.5
+    trim_mid_threshold = 0.25
+    handle_length_threshold = 1.5
+    handle_thickness_threshold = 0.35
+    handle_mid_threshold = 0.4
+    handle_area_threshold = 6.0
     horizontal_priority_material_ids = {0, 1}
 
     for component in components:
@@ -865,14 +870,33 @@ def _resolve_component_styles(
             and component["area"] <= area_threshold * 12.0
         )
 
-        if thin_trim and preferred_token:
-            chosen_token = preferred_token
-            chosen_from_style = True
+        if thin_trim:
+            desired_token = chosen_token
+            if preferred_token:
+                desired_token = preferred_token
+                chosen_from_style = True
+            elif desired_token is None and neutral_style_token:
+                desired_token = neutral_style_token
+            if desired_token:
+                chosen_token = desired_token
+                for face_idx in faces_in_component:
+                    face_styles[face_idx] = chosen_token
+                continue
 
-        if thin_trim and chosen_token:
-            for face_idx in faces_in_component:
-                face_styles[face_idx] = chosen_token
-            continue
+        is_handle = (
+            max_extent >= handle_length_threshold
+            and min_extent <= handle_thickness_threshold
+            and mid_extent <= handle_mid_threshold
+            and component["area"] <= handle_area_threshold
+        )
+        if is_handle:
+            desired_token = preferred_token or aluminium_style_token or neutral_style_token or chosen_token
+            if desired_token:
+                chosen_token = desired_token
+                chosen_from_style = desired_token == preferred_token
+                for face_idx in faces_in_component:
+                    face_styles[face_idx] = chosen_token
+                continue
 
         auto_panel_applied = False
         if primary_high_saturation_token and material_id in horizontal_priority_material_ids:
