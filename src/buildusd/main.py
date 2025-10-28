@@ -61,6 +61,7 @@ OPTIONS = ConversionOptions(
     enable_high_detail_remesh=False,
     anchor_mode=None,
     split_topology_by_material=False,
+    enable_material_classification=False,
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
 DEFAULT_USD_FORMAT = "usdc"
@@ -335,6 +336,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "When using --usd-format usda, re-export layers as usdc when the file exceeds this many megabytes "
             "(set to 0 to disable; default: %(default)s). Auto mode also relies on this threshold for its heuristic."
         ),
+    )
+    parser.add_argument(
+        "--enable-material-classification",
+        dest="enable_material_classification",
+        action="store_true",
+        help="Enable component-level material classification to reconcile IFC style colours.",
     )
     return parser.parse_args(argv)
 # ------------- helpers -------------
@@ -1310,6 +1317,8 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         options_override = replace(options_override, curve_width_rules=width_rules)
     if cli_anchor_mode is not None and getattr(options_override, "anchor_mode", None) != cli_anchor_mode:
         options_override = replace(options_override, anchor_mode=cli_anchor_mode)
+    if getattr(args, "enable_material_classification", False):
+        options_override = replace(options_override, enable_material_classification=True)
     try:
         results = convert(
             args.input_path,
