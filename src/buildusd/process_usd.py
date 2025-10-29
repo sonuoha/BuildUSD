@@ -831,22 +831,7 @@ def _resolve_component_styles(
                 best_token = token
         return best_token
 
-    global_min_z = float("inf")
-    global_max_z = float("-inf")
-    for component in components:
-        bounds_min = component.get("bounds_min")
-        bounds_max = component.get("bounds_max")
-        if not bounds_min or not bounds_max or len(bounds_min) < 3 or len(bounds_max) < 3:
-            continue
-        try:
-            global_min_z = min(global_min_z, float(bounds_min[2]))
-            global_max_z = max(global_max_z, float(bounds_max[2]))
-        except Exception:
-            continue
-    if global_min_z == float("inf"):
-        global_min_z = 0.0
-        global_max_z = 0.0
-    global_height = max(global_max_z - global_min_z, 1e-6)
+    # Remove global Z dependence – classify per-component using its *local* height.
 
     area_threshold = 1.0
     saturation_threshold = 0.15
@@ -925,17 +910,15 @@ def _resolve_component_styles(
         bounds_max = component.get("bounds_max", (0.0, 0.0, 0.0))
         min_z = float(bounds_min[2]) if len(bounds_min) >= 3 else 0.0
         max_z = float(bounds_max[2]) if len(bounds_max) >= 3 else 0.0
-        top_fraction = 0.0
+        # --- NEW: local-height fractions (scale-agnostic) ---
+        local_height = max(1e-6, max_z - min_z)
+        top_fraction = 1.0  # by definition: max_z is the component's top
         bottom_fraction = 0.0
-        near_top = False
-        near_bottom = False
-        if global_height > 1e-6:
-            top_fraction = (max_z - global_min_z) / global_height
-            bottom_fraction = (min_z - global_min_z) / global_height
-            top_fraction = max(0.0, min(1.0, top_fraction))
-            bottom_fraction = max(0.0, min(1.0, bottom_fraction))
-            near_top = top_fraction >= (1.0 - top_zone_fraction)
-            near_bottom = bottom_fraction <= bottom_zone_fraction
+        near_top = True   # component's top region exists by construction
+        near_bottom = True if local_height > 0.0 else False
+        # finer decisions still use zone fractions
+        near_top = ((max_z - min_z) / local_height) >= (1.0 - top_zone_fraction)
+        near_bottom = ((0.0) / local_height) <= bottom_zone_fraction
         orientation_abs = component.get("orientation_abs", (0.0, 0.0, 0.0))
         normal_variation = float(component.get("normal_variation", 0.0))
         thin_trim = (
@@ -1185,6 +1168,68 @@ def _ensure_material_subsets(
     stats: List[Tuple[str, int]] = []
 
     if use_component_classification and material_ids and len(material_ids) == face_count and style_groups:
+        # --- EARLY BAILOUT: keep strong IFC style when it already dominates the mesh ---
+        # Compute coverage of each style token across all faces; if the most saturated
+        # style already covers >= 60% of faces, don't run component classification.
+        def _style_color(material_obj):
+            return _color_from_material(material_obj) if material_obj is not None else None
+
+        total_faces = float(face_count)
+        cover_by_token: Dict[str, int] = {}
+        sat_by_token: Dict[str, float] = {}
+        for key, entry in (style_groups or {}).items():
+            faces = entry.get("faces") or []
+            token = key
+            cover_by_token[token] = len([i for i in faces if 0 <= int(i) < face_count])
+            sat_by_token[token] = _color_saturation(_style_color(entry.get("material")))
+
+        # pick the most saturated style that also has the best coverage
+        primary_token = None
+        primary_sat = -1.0
+        for tok, cov in cover_by_token.items():
+            sat = sat_by_token.get(tok, 0.0)
+            if sat > primary_sat:
+                primary_sat = sat
+                primary_token = tok
+
+        if primary_token is not None:
+            coverage_frac = (cover_by_token.get(primary_token, 0) / max(total_faces, 1.0))
+            if primary_sat >= 0.18 and coverage_frac >= 0.60:
+                # Keep original style subsets: author style-based subsets directly below
+                LOG.debug("Classification skipped for %s: dominant IFC style=%s coverage=%.2f sat=%.2f",
+                          mesh.GetPath(), primary_token, coverage_frac, primary_sat)
+                created_subsets = False
+                # Author the style subsets exactly as provided, then return
+                for key, entry in style_groups.items():
+                    raw_faces = entry.get("faces") or []
+                    valid_faces = []
+                    for value in raw_faces:
+                        try:
+                            face_index = int(value)
+                        except Exception:
+                            continue
+                        if 0 <= face_index < face_count:
+                            valid_faces.append(face_index)
+                    if not valid_faces:
+                        continue
+                    subset_token = _subset_token_for_material(key)
+                    subset_path = mesh.GetPath().AppendChild(subset_token)
+                    subset = UsdGeom.Subset.Define(stage, subset_path)
+                    try:
+                        UsdGeom.Subset.SetElementType(subset, element_token)
+                    except Exception:
+                        try:
+                            subset.CreateElementTypeAttr().Set(element_token)
+                        except AttributeError:
+                            subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+                    (subset.GetIndicesAttr() or subset.CreateIndicesAttr()).Set(Vt.IntArray(valid_faces))
+                    try:
+                        subset.CreateFamilyNameAttr().Set(family_name)
+                    except Exception:
+                        subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+                    created_subsets = True
+                if created_subsets:
+                    return True  # family already validated later
         LOG.info(
             "Applying component-based material classification for %s (faces=%d).",
             mesh.GetPath(),
