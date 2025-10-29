@@ -59,5 +59,6 @@ _debug_regions.py
 _debug_style_area.py
 _debug_style_normals.py
 _debug_suelo_components.py
+_debug_*.py
 container_material_debug.log
 patch/
