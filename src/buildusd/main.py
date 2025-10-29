@@ -61,7 +61,7 @@ OPTIONS = ConversionOptions(
     enable_high_detail_remesh=False,
     anchor_mode=None,
     split_topology_by_material=False,
-    enable_material_classification=True,
+    enable_material_classification=False,
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
 DEFAULT_USD_FORMAT = "usdc"
@@ -1318,6 +1318,7 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     if cli_anchor_mode is not None and getattr(options_override, "anchor_mode", None) != cli_anchor_mode:
         options_override = replace(options_override, anchor_mode=cli_anchor_mode)
     if getattr(args, "enable_material_classification", False):
+        LOG.info("Material classification enabled: running component-based style reconciliation.")
         options_override = replace(options_override, enable_material_classification=True)
     try:
         results = convert(

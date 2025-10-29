@@ -1127,6 +1127,11 @@ def _ensure_material_subsets(
     stats: List[Tuple[str, int]] = []
 
     if use_component_classification and material_ids and len(material_ids) == face_count and style_groups:
+        LOG.info(
+            "Applying component-based material classification for %s (faces=%d).",
+            mesh.GetPath(),
+            face_count,
+        )
         style_tokens: Dict[str, str] = {}
         for key in style_groups:
             style_tokens[key] = _subset_token_for_material(key)
