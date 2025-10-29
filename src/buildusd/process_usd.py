@@ -831,8 +831,25 @@ def _resolve_component_styles(
                 best_token = token
         return best_token
 
+    global_min_z = float("inf")
+    global_max_z = float("-inf")
+    for component in components:
+        bounds_min = component.get("bounds_min")
+        bounds_max = component.get("bounds_max")
+        if not bounds_min or not bounds_max or len(bounds_min) < 3 or len(bounds_max) < 3:
+            continue
+        try:
+            global_min_z = min(global_min_z, float(bounds_min[2]))
+            global_max_z = max(global_max_z, float(bounds_max[2]))
+        except Exception:
+            continue
+    if global_min_z == float("inf"):
+        global_min_z = 0.0
+        global_max_z = 0.0
+    global_height = max(global_max_z - global_min_z, 1e-6)
+
     area_threshold = 1.0
-    saturation_threshold = 0.12
+    saturation_threshold = 0.15
     orientation_override_area = 5.0
     orientation_override_sat = 0.2
     color_match_threshold = 0.01
@@ -849,13 +866,14 @@ def _resolve_component_styles(
     handle_thickness_threshold = 0.35
     handle_mid_threshold = 0.4
     handle_area_threshold = 6.0
-    roof_z_threshold = 2.2
-    roof_brightness_threshold = 0.4
-    bottom_trim_height = 0.35
+    roof_brightness_threshold = 0.35
     front_panel_area_threshold = 5.5
     front_panel_normal_variation_threshold = 0.12
     front_panel_brightness_threshold = 0.35
     horizontal_priority_material_ids = {0, 1}
+    preserve_style_area_threshold = 0.65
+    top_zone_fraction = 0.18
+    bottom_zone_fraction = 0.12
 
     for component in components:
         faces_in_component = component["faces"]
@@ -907,6 +925,17 @@ def _resolve_component_styles(
         bounds_max = component.get("bounds_max", (0.0, 0.0, 0.0))
         min_z = float(bounds_min[2]) if len(bounds_min) >= 3 else 0.0
         max_z = float(bounds_max[2]) if len(bounds_max) >= 3 else 0.0
+        top_fraction = 0.0
+        bottom_fraction = 0.0
+        near_top = False
+        near_bottom = False
+        if global_height > 1e-6:
+            top_fraction = (max_z - global_min_z) / global_height
+            bottom_fraction = (min_z - global_min_z) / global_height
+            top_fraction = max(0.0, min(1.0, top_fraction))
+            bottom_fraction = max(0.0, min(1.0, bottom_fraction))
+            near_top = top_fraction >= (1.0 - top_zone_fraction)
+            near_bottom = bottom_fraction <= bottom_zone_fraction
         orientation_abs = component.get("orientation_abs", (0.0, 0.0, 0.0))
         normal_variation = float(component.get("normal_variation", 0.0))
         thin_trim = (
@@ -931,7 +960,7 @@ def _resolve_component_styles(
         is_bottom_trim = (
             is_horizontal
             and component["area"] >= min_override_area
-            and max_z <= bottom_trim_height
+            and near_bottom
             and mid_extent <= trim_mid_threshold
         )
         if is_bottom_trim:
@@ -962,7 +991,7 @@ def _resolve_component_styles(
         is_roof_panel = (
             is_horizontal
             and component["area"] >= horizontal_area_threshold
-            and max_z >= roof_z_threshold
+            and near_top
             and material_brightness >= roof_brightness_threshold
         )
         if is_roof_panel and primary_high_saturation_token:
@@ -992,12 +1021,11 @@ def _resolve_component_styles(
                 coverage_count = component["style_presence"].get(chosen_token, 0)
                 style_coverage = float(coverage_count) / float(len(faces_in_component) or 1)
             current_sat = style_saturation_map.get(chosen_token, 0.0) if chosen_token else 0.0
-            if needs_panel_override and (not chosen_from_style or (style_coverage < 0.6 and current_sat < saturation_threshold)):
+            if needs_panel_override and (not chosen_from_style or (style_coverage < preserve_style_area_threshold and current_sat < saturation_threshold)):
                 chosen_token = primary_high_saturation_token
                 chosen_from_style = False
                 auto_panel_applied = True
 
-        preserve_style_area_threshold = 0.5
         chosen_color = style_color_map.get(chosen_token) if chosen_token else None
         color_match = bool(
             chosen_token
@@ -1017,7 +1045,7 @@ def _resolve_component_styles(
             and not color_match
             and component["area"] >= min_override_area
             and not auto_panel_applied
-            and style_coverage < 0.6
+            and style_coverage < preserve_style_area_threshold
         )
 
         if allow_override:
@@ -1084,6 +1112,36 @@ def _resolve_component_styles(
                             global_candidate = token
                     if global_candidate != chosen_token and global_score > 0.0:
                         chosen_token = global_candidate
+
+        final_style_coverage = 0.0
+        if chosen_token:
+            final_style_coverage = float(
+                component["style_presence"].get(chosen_token, 0)
+            ) / float(len(faces_in_component) or 1)
+
+        try:
+            LOG.debug(
+                "Component classify: mat=%s faces=%d area=%.3f horiz=%s vert=%s z=[%.3f, %.3f] frac_top=%.3f frac_bottom=%.3f near_top=%s near_bottom=%s -> %s (from_style=%s coverage=%.2f color_match=%s panel=%s override=%s)",
+                material_id,
+                len(faces_in_component),
+                float(component.get("area", 0.0)),
+                bool(is_horizontal),
+                bool(is_vertical),
+                min_z,
+                max_z,
+                top_fraction,
+                bottom_fraction,
+                near_top,
+                near_bottom,
+                chosen_token,
+                chosen_from_style,
+                final_style_coverage,
+                color_match,
+                auto_panel_applied,
+                allow_override,
+            )
+        except Exception:
+            pass
 
         if chosen_token:
             for face_idx in faces_in_component:
@@ -1757,6 +1815,7 @@ def _bind_materials_on_prototype_mesh(
         style_token_to_material: Dict[str, Sdf.Path] = {}
         material_id_to_style_path: Dict[int, Sdf.Path] = {}
         material_conflicts_reported: Set[int] = set()
+        style_material_path: Optional[Sdf.Path] = None
 
         for token, entry in style_groups.items():
             faces = entry.get("faces") or []
@@ -1773,6 +1832,8 @@ def _bind_materials_on_prototype_mesh(
                 continue
 
             subset_token = _subset_token_for_material(token)
+            if style_material_path is None:
+                style_material_path = material_path
             style_tokens.add(subset_token)
             style_token_to_material[subset_token] = material_path
 
