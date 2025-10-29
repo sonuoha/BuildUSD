@@ -572,6 +572,41 @@ def _color_brightness(color: Optional[Tuple[float, float, float]]) -> float:
         return 0.0
     return (r + g + b) / 3.0
 
+# ---------- NEW helpers: robust per-component banding & centroids ----------
+def _face_centroid(points: Sequence[Tuple[float,float,float]], face_vertices: Sequence[int]) -> Tuple[float,float,float]:
+    if not face_vertices:
+        return (0.0,0.0,0.0)
+    xs = ys = zs = 0.0
+    n = float(len(face_vertices))
+    for v in face_vertices:
+        x,y,z = points[v]
+        xs += float(x); ys += float(y); zs += float(z)
+    return (xs/n, ys/n, zs/n)
+
+def _local_z_bands(
+    points: Sequence[Tuple[float,float,float]],
+    faces: Sequence[Tuple[int,...]],
+    comp_min_z: float,
+    comp_max_z: float,
+    top_frac: float = 0.18,
+    bot_frac: float = 0.12,
+) -> Tuple[set[int], set[int]]:
+    """Return (top_faces, bottom_faces) decided in the component's *local* bbox."""
+    if comp_max_z <= comp_min_z + 1e-9:
+        return set(), set()
+    height = comp_max_z - comp_min_z
+    z_top = comp_min_z + (1.0 - top_frac) * height
+    z_bot = comp_min_z + bot_frac * height
+    top_idx: set[int] = set()
+    bot_idx: set[int] = set()
+    for fi, verts in enumerate(faces):
+        cx, cy, cz = _face_centroid(points, verts)
+        if cz >= z_top:
+            top_idx.add(fi)
+        elif cz <= z_bot:
+            bot_idx.add(fi)
+    return top_idx, bot_idx
+
 
 def _resolve_component_styles(
     material_ids: Sequence[int],
@@ -780,6 +815,10 @@ def _resolve_component_styles(
             float(abs(normal_acc[2])),
         )
 
+        dominant_style_token = None
+        if style_presence:
+            dominant_style_token = max(style_presence.items(), key=lambda item: item[1])[0]
+
         components.append(
             {
                 "faces": faces_in_component,
@@ -794,6 +833,7 @@ def _resolve_component_styles(
                 "orientation_abs": orientation_abs,
                 "style_presence": style_presence,
                 "neighbor_styles": neighbor_styles,
+                "style_token": dominant_style_token,
             }
         )
 
@@ -858,7 +898,40 @@ def _resolve_component_styles(
     horizontal_priority_material_ids = {0, 1}
     preserve_style_area_threshold = 0.65
     top_zone_fraction = 0.18
-    bottom_zone_fraction = 0.12
+    bottom_zone_fraction = 0.10
+
+    # ---- Global priors: major(by coverage), panel(by saturation), neutral(by min saturation) ----
+    face_count_f = float(max(1, len(material_ids)))
+    coverage_by_token: Dict[str, float] = {}
+    for tok, entry in style_groups.items():
+        tkn = style_tokens.get(tok)
+        if not tkn:
+            continue
+        cov = len(entry.get("faces") or [])
+        coverage_by_token[tkn] = cov / face_count_f
+    # Major by coverage
+    major_token: Optional[str] = None
+    major_cov = -1.0
+    for tkn, cov in coverage_by_token.items():
+        if cov > major_cov:
+            major_cov, major_token = cov, tkn
+    # Panel by saturation (the most “colourful” present)
+    panel_token: Optional[str] = None
+    panel_sat = -1.0
+    for tkn, col in style_color_map.items():
+        sat = _color_saturation(col)
+        if sat > panel_sat:
+            panel_sat, panel_token = sat, tkn
+    # Neutral by minimal saturation
+    neutral_token: Optional[str] = None
+    neutral_sat = 10.0
+    for tkn, col in style_color_map.items():
+        sat = _color_saturation(col)
+        if sat < neutral_sat:
+            neutral_sat, neutral_token = sat, tkn
+    # thresholds
+    PANEL_SAT = 0.18      # what we consider “panel-like colour”
+    FRONT_MAJ_COV = 0.45  # min coverage hint to prefer panel on fronts
 
     for component in components:
         faces_in_component = component["faces"]
@@ -910,15 +983,18 @@ def _resolve_component_styles(
         bounds_max = component.get("bounds_max", (0.0, 0.0, 0.0))
         min_z = float(bounds_min[2]) if len(bounds_min) >= 3 else 0.0
         max_z = float(bounds_max[2]) if len(bounds_max) >= 3 else 0.0
-        # --- NEW: local-height fractions (scale-agnostic) ---
         local_height = max(1e-6, max_z - min_z)
-        top_fraction = 1.0  # by definition: max_z is the component's top
-        bottom_fraction = 0.0
-        near_top = True   # component's top region exists by construction
-        near_bottom = True if local_height > 0.0 else False
-        # finer decisions still use zone fractions
-        near_top = ((max_z - min_z) / local_height) >= (1.0 - top_zone_fraction)
-        near_bottom = ((0.0) / local_height) <= bottom_zone_fraction
+        # Band faces using local z; used to robustly identify top/bottom regions
+        top_faces, bottom_faces = _local_z_bands(points or [], face_vertices, min_z, max_z,
+                                                 top_frac=top_zone_fraction, bot_frac=bottom_zone_fraction)
+        # Component is considered near-top/bottom if most of its faces land in that band
+        if faces_in_component:
+            frac_top = len([f for f in faces_in_component if f in top_faces]) / float(len(faces_in_component))
+            frac_bottom = len([f for f in faces_in_component if f in bottom_faces]) / float(len(faces_in_component))
+        else:
+            frac_top = frac_bottom = 0.0
+        near_top = frac_top >= 0.35
+        near_bottom = frac_bottom >= 0.35
         orientation_abs = component.get("orientation_abs", (0.0, 0.0, 0.0))
         normal_variation = float(component.get("normal_variation", 0.0))
         thin_trim = (
@@ -946,14 +1022,6 @@ def _resolve_component_styles(
             and near_bottom
             and mid_extent <= trim_mid_threshold
         )
-        if is_bottom_trim:
-            desired_token = preferred_token or neutral_style_token or chosen_token
-            if desired_token:
-                chosen_token = desired_token
-                chosen_from_style = desired_token == preferred_token
-                for face_idx in faces_in_component:
-                    face_styles[face_idx] = chosen_token
-                continue
 
         is_handle = (
             max_extent >= handle_length_threshold
@@ -977,11 +1045,6 @@ def _resolve_component_styles(
             and near_top
             and material_brightness >= roof_brightness_threshold
         )
-        if is_roof_panel and primary_high_saturation_token:
-            chosen_token = primary_high_saturation_token
-            chosen_from_style = False
-            auto_panel_applied = True
-
         is_front_panel = (
             is_vertical
             and component["area"] >= front_panel_area_threshold
@@ -989,10 +1052,6 @@ def _resolve_component_styles(
             and material_brightness >= front_panel_brightness_threshold
             and (orientation_abs[0] >= 0.6 or orientation_abs[1] >= 0.6)
         )
-        if is_front_panel and primary_high_saturation_token:
-            chosen_token = primary_high_saturation_token
-            chosen_from_style = False
-            auto_panel_applied = True
         if primary_high_saturation_token and material_id in horizontal_priority_material_ids:
             needs_panel_override = (
                 (is_horizontal and component["area"] >= horizontal_area_threshold)
@@ -1010,17 +1069,59 @@ def _resolve_component_styles(
                 auto_panel_applied = True
 
         chosen_color = style_color_map.get(chosen_token) if chosen_token else None
-        color_match = bool(
+        color_match_value = bool(
             chosen_token
             and material_color is not None
             and chosen_color is not None
             and sum((float(material_color[i]) - float(chosen_color[i])) ** 2 for i in range(3)) < color_match_threshold
             and _color_saturation(chosen_color) > saturation_threshold
         )
+        component["color_match"] = color_match_value
         style_coverage = 0.0
         if chosen_token:
             coverage_count = component["style_presence"].get(chosen_token, 0)
             style_coverage = float(coverage_count) / float(len(faces_in_component) or 1)
+
+        # --- Choose a token using priority rules / overrides ---
+        color_match = component.get("color_match", False)
+
+        # Prefer explicit style on component if good coverage; else apply heuristics
+        if chosen_token is None and style_coverage >= 0.50 and component.get("style_token"):
+            chosen_token = component["style_token"]
+            chosen_from_style = True
+
+        # --- RULE 1 (pre): bottom-band guard (prefer neutral on bottom band) ---
+        if chosen_token is None and (is_bottom_trim or thin_trim or near_bottom):
+            chosen_token = neutral_token or component.get("style_token")
+
+        # --- RULE 2: roof assertion – top horizontals inherit panel style when present ---
+        if chosen_token is None and is_roof_panel and panel_token and panel_sat >= PANEL_SAT:
+            chosen_token = panel_token
+            chosen_from_style = False
+            auto_panel_applied = True
+
+        # --- RULE 3: front preference – large verticals (not bottom) prefer panel ---
+        if (
+            chosen_token is None
+            and is_front_panel
+            and not near_bottom
+            and panel_token
+            and panel_sat >= PANEL_SAT
+            and coverage_by_token.get(panel_token, 0.0) >= FRONT_MAJ_COV
+        ):
+            chosen_token = panel_token
+            chosen_from_style = False
+            auto_panel_applied = True
+
+        # --- FINAL VETO: never leave bottom-band/trim/very-thin painted as a coloured panel ---
+        if (near_bottom or is_bottom_trim or thin_trim) and chosen_token:
+            if _color_saturation(style_color_map.get(chosen_token)) >= PANEL_SAT:
+                chosen_token = neutral_token or component.get("style_token") or chosen_token
+
+        if chosen_token:
+            coverage_count = component["style_presence"].get(chosen_token, 0)
+            style_coverage = float(coverage_count) / float(len(faces_in_component) or 1)
+        final_style_coverage = style_coverage
 
         allow_override = (
             bool(chosen_token)
@@ -1096,35 +1197,41 @@ def _resolve_component_styles(
                     if global_candidate != chosen_token and global_score > 0.0:
                         chosen_token = global_candidate
 
-        final_style_coverage = 0.0
         if chosen_token:
+            chosen_color = style_color_map.get(chosen_token)
+            color_match = bool(
+                material_color is not None
+                and chosen_color is not None
+                and sum((float(material_color[i]) - float(chosen_color[i])) ** 2 for i in range(3))
+                < color_match_threshold
+                and _color_saturation(chosen_color) > saturation_threshold
+            )
             final_style_coverage = float(
                 component["style_presence"].get(chosen_token, 0)
             ) / float(len(faces_in_component) or 1)
+        else:
+            final_style_coverage = 0.0
+            color_match = False
 
-        try:
-            LOG.debug(
-                "Component classify: mat=%s faces=%d area=%.3f horiz=%s vert=%s z=[%.3f, %.3f] frac_top=%.3f frac_bottom=%.3f near_top=%s near_bottom=%s -> %s (from_style=%s coverage=%.2f color_match=%s panel=%s override=%s)",
-                material_id,
-                len(faces_in_component),
-                float(component.get("area", 0.0)),
-                bool(is_horizontal),
-                bool(is_vertical),
-                min_z,
-                max_z,
-                top_fraction,
-                bottom_fraction,
-                near_top,
-                near_bottom,
-                chosen_token,
-                chosen_from_style,
-                final_style_coverage,
-                color_match,
-                auto_panel_applied,
-                allow_override,
-            )
-        except Exception:
-            pass
+        LOG.debug(
+            "Component classify: mat=%s faces=%d area=%.3f horiz=%s vert=%s z=[%.3f, %.3f] near_top=%.2f near_bottom=%.2f -> %s (from_style=%s cov=%.2f match=%s panelChoice=%s panelSat=%.2f override=%s)",
+            material_id,
+            len(faces_in_component),
+            float(component.get("area", 0.0)),
+            bool(is_horizontal),
+            bool(is_vertical),
+            min_z,
+            max_z,
+            frac_top,
+            frac_bottom,
+            chosen_token,
+            chosen_from_style,
+            final_style_coverage,
+            color_match,
+            panel_token,
+            panel_sat,
+            allow_override,
+        )
 
         if chosen_token:
             for face_idx in faces_in_component:
