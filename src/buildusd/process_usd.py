@@ -617,11 +617,12 @@ def _resolve_component_styles(
     face_vertex_counts: Optional[Sequence[int]] = None,
     face_vertex_indices: Optional[Sequence[int]] = None,
     materials: Optional[Sequence[Any]] = None,
-) -> Dict[str, List[int]]:
-    """Return mapping of style tokens to face indices covering entire mesh."""
+    cluster_styles: bool = False,
+) -> Tuple[Dict[str, List[int]], Dict[str, str], Dict[str, str]]:
+    """Return mapping of style tokens to face indices (and cluster base map)."""
     face_count = len(material_ids)
     if not face_count or not style_tokens:
-        return {}
+        return {}, {}, {}
 
     if (
         points is None
@@ -638,7 +639,7 @@ def _resolve_component_styles(
             faces = [int(idx) for idx in (entry.get("faces") or []) if 0 <= int(idx) < face_count]
             if faces:
                 result[token] = faces
-        return result
+        return result, {}, {}
 
     style_color_map: Dict[str, Optional[Tuple[float, float, float]]] = {}
     for key, entry in style_groups.items():
@@ -700,6 +701,7 @@ def _resolve_component_styles(
     face_vertices, adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
 
     face_styles: List[Optional[str]] = [None] * face_count
+    face_directions: List[Optional[str]] = [None] * face_count
     for key, entry in style_groups.items():
         token = style_tokens.get(key)
         if not token:
@@ -1161,70 +1163,18 @@ def _resolve_component_styles(
         material_color: Optional[Tuple[float, float, float]] = None
         material_id = component["material_id"]
         direction_label = component.get("direction_label") or ""
-        try:
-            if materials and 0 <= material_id < len(materials):
-                material_color = _color_from_material(materials[material_id])
-        except Exception:
-            material_color = None
+        component.pop("direction_label", None)
+
+        def _assign_faces(token_value: Optional[str], faces_list: List[int]) -> None:
+            if token_value is None:
+                return
+            for face_idx in faces_list:
+                face_styles[face_idx] = token_value
+                face_directions[face_idx] = direction_label or "NA"
 
         preferred_token = material_style_lookup.get(material_id)
         material_brightness = _color_brightness(material_color)
 
-        style_presence_counts: Dict[str, int] = component.get("style_presence", {})
-        locked_style_token: Optional[str] = None
-        if faces_in_component:
-            dominant = None
-            if style_presence_counts:
-                dominant = max(style_presence_counts.items(), key=lambda item: item[1])
-                if dominant[1] >= len(faces_in_component):
-                    locked_style_token = dominant[0]
-            if locked_style_token is None:
-                subset_material_ids = {
-                    int(material_ids[face_idx])
-                    for face_idx in faces_in_component
-                    if 0 <= face_idx < len(material_ids)
-                }
-                if len(subset_material_ids) == 1:
-                    only_mid = next(iter(subset_material_ids))
-                    locked_style_token = material_style_lookup.get(only_mid)
-
-        if locked_style_token:
-            chosen_token = locked_style_token
-            chosen_from_style = True
-            for face_idx in faces_in_component:
-                face_styles[face_idx] = chosen_token
-            LOG.debug(
-                "Directional component locked to source style %s (dir=%s faces=%d)",
-                locked_style_token,
-                direction_label or "NA",
-                len(faces_in_component),
-            )
-            continue
-
-        if style_presence_counts:
-            chosen_token = max(style_presence_counts.items(), key=lambda item: item[1])[0]
-            chosen_from_style = True
-        elif component["neighbor_styles"]:
-            neighbor_area_threshold = 1.0
-            filtered_neighbors = [
-                (token, count)
-                for token, count in component["neighbor_styles"].items()
-                if style_area_map.get(token, 0.0) >= neighbor_area_threshold
-            ]
-            if filtered_neighbors:
-                chosen_token = max(filtered_neighbors, key=lambda item: item[1])[0]
-
-        if chosen_token is None:
-            fallback_token = _style_fallback_for_material(material_id)
-            chosen_token = fallback_token
-        if preferred_token and chosen_token is None:
-            chosen_token = preferred_token
-            chosen_from_style = True
-        if preferred_token and chosen_token == preferred_token:
-            chosen_from_style = True
-
-        direction_label = component.get("direction_label") or ""
-        component.pop("direction_label", None)
         component.pop("face_details", None)
 
         extents = component.get("extents", (0.0, 0.0, 0.0))
@@ -1277,8 +1227,7 @@ def _resolve_component_styles(
             handle_token = preferred_token or aluminium_style_token or neutral_token or chosen_token
             if handle_token:
                 chosen_token = handle_token
-                for face_idx in faces_in_component:
-                    face_styles[face_idx] = chosen_token
+                _assign_faces(chosen_token, faces_in_component)
                 LOG.debug("Handle forced -> %s", chosen_token)
                 continue
 
@@ -1291,8 +1240,7 @@ def _resolve_component_styles(
                 desired_token = neutral_style_token
             if desired_token:
                 chosen_token = desired_token
-                for face_idx in faces_in_component:
-                    face_styles[face_idx] = chosen_token
+                _assign_faces(chosen_token, faces_in_component)
                 continue
 
         is_bottom_trim = (
@@ -1521,14 +1469,109 @@ def _resolve_component_styles(
         )
 
         if chosen_token:
-            for face_idx in faces_in_component:
-                face_styles[face_idx] = chosen_token
+            _assign_faces(chosen_token, faces_in_component)
 
     mapping: Dict[str, List[int]] = defaultdict(list)
+    direction_counters: Dict[str, Counter[str]] = defaultdict(Counter)
+    cluster_lookup: Dict[str, str] = {}
+    cluster_direction_map: Dict[str, str] = {}
     for idx, token in enumerate(face_styles):
-        if token is not None:
-            mapping[token].append(idx)
-    return mapping
+        if token is None:
+            continue
+        mapping[token].append(idx)
+        direction_value = face_directions[idx] or ""
+        direction_counters[token][direction_value] += 1
+
+    def _sanitize_direction_label(label: Optional[str]) -> str:
+        if not label:
+            return "NA"
+        return sanitize_name(label, fallback="NA")
+
+    for token, counter in direction_counters.items():
+        if counter:
+            cluster_direction_map[token] = _sanitize_direction_label(counter.most_common(1)[0][0])
+
+    if cluster_styles and points is not None and face_vertices is not None and len(mapping) > 1:
+        face_set_adjacency = adjacency
+        pts_np = np.asarray(points, dtype=float)
+
+        def _cluster_faces_by_plane(face_list: List[int]) -> List[List[int]]:
+            if not face_list:
+                return []
+            face_set = set(face_list)
+            visited: Set[int] = set()
+            components_local: List[List[int]] = []
+            for fid in face_list:
+                if fid in visited:
+                    continue
+                stack = [fid]
+                comp: List[int] = []
+                while stack:
+                    fcur = stack.pop()
+                    if fcur in visited or fcur not in face_set:
+                        continue
+                    visited.add(fcur)
+                    comp.append(fcur)
+                    for nb in face_set_adjacency[fcur]:
+                        if nb in face_set and nb not in visited:
+                            stack.append(nb)
+                if comp:
+                    components_local.append(comp)
+
+            PLANE_D_TOL = 0.005
+            N_DOT_TOL = 0.98
+            clustered: List[List[int]] = []
+
+            for comp in components_local:
+                planes: List[Tuple[np.ndarray, float, List[int]]] = []
+                for fid in comp:
+                    verts = face_vertices[fid]
+                    _, normal = _face_area_and_normal(points, verts)
+                    n = np.asarray(normal, dtype=float)
+                    norm = np.linalg.norm(n)
+                    if norm < 1e-9:
+                        continue
+                    n /= norm
+                    cx, cy, cz = _face_centroid(points, verts)
+                    d = float(np.dot(n, np.asarray([cx, cy, cz], dtype=float)))
+                    placed = False
+                    for entry in planes:
+                        ref_n, ref_d, lst = entry
+                        if abs(np.dot(ref_n, n)) >= N_DOT_TOL and abs(ref_d - d) <= PLANE_D_TOL:
+                            lst.append(fid)
+                            placed = True
+                            break
+                    if not placed:
+                        planes.append([n, d, [fid]])
+                for _, _, faces_cluster in planes:
+                    if faces_cluster:
+                        clustered.append(faces_cluster)
+            return clustered or [face_list]
+
+        clustered_mapping: Dict[str, List[int]] = {}
+        for token, faces in mapping.items():
+            if not faces:
+                continue
+            clusters = _cluster_faces_by_plane(faces)
+            if len(clusters) <= 1:
+                clustered_mapping[token] = faces
+            else:
+                cluster_direction_map.pop(token, None)
+                for ci, face_subset in enumerate(clusters):
+                    dir_counter = Counter(face_directions[f] or "" for f in face_subset)
+                    if dir_counter:
+                        dir_raw = dir_counter.most_common(1)[0][0]
+                    else:
+                        dir_raw = ""
+                    dir_label = _sanitize_direction_label(dir_raw)
+                    clustered_name = f"{token}_C{ci}_{dir_label}"
+                    clustered_mapping[clustered_name] = face_subset
+                    cluster_lookup[clustered_name] = token
+                    cluster_direction_map[clustered_name] = dir_label
+        if clustered_mapping:
+            mapping = clustered_mapping
+
+    return mapping, cluster_lookup, cluster_direction_map
 
 
 def _ensure_material_subsets(
@@ -1559,6 +1602,17 @@ def _ensure_material_subsets(
         pass
 
     created_subsets = False
+    unique_material_ids: Set[int] = set()
+    if material_ids:
+        for mid in material_ids:
+            try:
+                mid_int = int(mid)
+            except Exception:
+                continue
+            if mid_int >= 0:
+                unique_material_ids.add(mid_int)
+    if use_component_classification and len(unique_material_ids) <= 1:
+        use_component_classification = False
     stats: List[Tuple[str, int]] = []
 
     if use_component_classification and material_ids and len(material_ids) == face_count and style_groups:
@@ -1633,7 +1687,7 @@ def _ensure_material_subsets(
         for key in style_groups:
             style_tokens[key] = _subset_token_for_material(key)
 
-        face_style_map = _resolve_component_styles(
+        face_style_map, cluster_lookup, cluster_dir_map = _resolve_component_styles(
             material_ids,
             style_groups,
             style_tokens,
@@ -1641,6 +1695,7 @@ def _ensure_material_subsets(
             face_vertex_counts=face_vertex_counts,
             face_vertex_indices=face_vertex_indices,
             materials=materials,
+            cluster_styles=True,
         )
         if face_style_map:
             assigned: Set[int] = set()
@@ -1674,6 +1729,12 @@ def _ensure_material_subsets(
                 if not indices_attr:
                     indices_attr = subset.CreateIndicesAttr()
                 indices_attr.Set(Vt.IntArray([int(f) for f in faces]))
+                base_token = cluster_lookup.get(token)
+                if base_token:
+                    subset.GetPrim().CreateAttribute("ifc:baseStyleToken", Sdf.ValueTypeNames.String).Set(base_token)
+                direction_label = cluster_dir_map.get(token)
+                if direction_label:
+                    subset.GetPrim().CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(direction_label)
                 try:
                     subset.CreateFamilyNameAttr().Set(family_name)
                 except Exception:
@@ -1732,6 +1793,126 @@ def _ensure_material_subsets(
                 # Uniform material with no style information: rely on the mesh-level
                 # binding instead of authoring a redundant GeomSubset.
                 indices_by_material.clear()
+
+            authored_geo = False
+            if use_component_classification:
+                face_vertices_data: Optional[List[List[int]]] = None
+                if (
+                    points is not None
+                    and face_vertex_counts is not None
+                    and face_vertex_indices is not None
+                    and len(face_vertex_counts) == face_count
+                ):
+                    try:
+                        face_vertices_data, _ = _compute_face_components(face_vertex_counts, face_vertex_indices)
+                    except Exception:
+                        face_vertices_data = None
+
+                if face_vertices_data is not None:
+                    PLANE_D_TOL = 0.005
+                    N_DOT_TOL = 0.98
+
+                    def _direction_from_normal(vec: np.ndarray) -> str:
+                        if vec.size < 3:
+                            return "NA"
+                        axis = int(np.argmax(np.abs(vec)))
+                        label_axis = ("X", "Y", "Z")[axis]
+                        positive = vec[axis] >= 0.0
+                        if label_axis == "Z":
+                            return "TOP" if positive else "BOTTOM"
+                        return f"POS_{label_axis}" if positive else f"NEG_{label_axis}"
+
+                    def _sanitize_direction_label_sec(label: Optional[str]) -> str:
+                        if not label:
+                            return "NA"
+                        return sanitize_name(label, fallback="NA")
+
+                    try:
+                        _, local_adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
+                    except Exception:
+                        local_adjacency = None
+
+                    def _component_faces(seed: int, mid: int, visited: set[int]) -> List[int]:
+                        if local_adjacency is None:
+                            return [seed]
+                        stack = [seed]
+                        comp: List[int] = []
+                        while stack:
+                            f = stack.pop()
+                            if f in visited:
+                                continue
+                            if int(material_ids[f]) != mid:
+                                continue
+                            visited.add(f)
+                            comp.append(f)
+                            for nb in local_adjacency[f]:
+                                if nb not in visited and int(material_ids[nb]) == mid:
+                                    stack.append(nb)
+                        return comp
+
+                    authored_groups: List[Tuple[int, int, List[int]]] = []
+                    for mid in sorted(set(int(m) for m in material_ids if m is not None and m >= 0)):
+                        mat_faces = [
+                            i for i, m in enumerate(material_ids)
+                            if int(m) == mid and i not in style_faces_handled
+                        ]
+                        if not mat_faces:
+                            continue
+                        visited_faces: set[int] = set()
+                        components: List[List[int]] = []
+                        for fid in mat_faces:
+                            if fid in visited_faces:
+                                continue
+                            comp = _component_faces(fid, mid, visited_faces)
+                            if comp:
+                                components.append(comp)
+                        cluster_counter = 0
+                        for comp in components:
+                            clusters: List[Tuple[np.ndarray, float, List[int]]] = []
+                            for f in comp:
+                                verts = face_vertices_data[f]
+                                _, normal = _face_area_and_normal(points, verts)
+                                n = np.asarray(normal, dtype=float)
+                                ln = np.linalg.norm(n)
+                                if ln < 1e-9:
+                                    continue
+                                n /= ln
+                                cx, cy, cz = _face_centroid(points, verts)
+                                d = float(np.dot(n, np.asarray([cx, cy, cz], dtype=float)))
+                                placed = False
+                                for ref_n, ref_d, lst in clusters:
+                                    if abs(np.dot(ref_n, n)) >= N_DOT_TOL and abs(ref_d - d) <= PLANE_D_TOL:
+                                        lst.append(f)
+                                        placed = True
+                                        break
+                                if not placed:
+                                    clusters.append([n, d, [f]])
+                            for ref_n, _, flist in clusters:
+                                if not flist:
+                                    continue
+                                dir_label_raw = _direction_from_normal(ref_n)
+                                dir_label = _sanitize_direction_label_sec(dir_label_raw)
+                                authored_groups.append((mid, cluster_counter, dir_label, flist))
+                                cluster_counter += 1
+
+                    if authored_groups:
+                        for mid, ci, dir_label, faces in authored_groups:
+                            subset_name = f"Material_{mid}_C{ci}"
+                            if dir_label:
+                                subset_name = f"{subset_name}_{dir_label}"
+                            subset_path = mesh.GetPath().AppendChild(subset_name)
+                            subset = UsdGeom.Subset.Define(stage, subset_path)
+                            subset.CreateFamilyNameAttr().Set(family_name)
+                            subset.CreateElementTypeAttr().Set(element_token)
+                            subset.CreateIndicesAttr(Vt.IntArray([int(f) for f in faces]))
+                            subset.GetPrim().CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(dir_label or "NA")
+                            created_subsets = True
+                            stats.append((str(subset_path), len(faces)))
+                        authored_geo = True
+
+            if authored_geo:
+                indices_by_material.clear()
+
             for material_index, face_indices in sorted(indices_by_material.items()):
                 if not face_indices:
                     continue
@@ -2297,7 +2478,9 @@ def _bind_materials_on_prototype_mesh(
                             )
                             material_conflicts_reported.add(material_id)
 
+        cluster_binding: Dict[str, Sdf.Path] = {}
         for subset_token, material_path in style_token_to_material.items():
+            cluster_binding[subset_token] = material_path
             subset_path = mesh_path.AppendChild(subset_token)
             subset_prim = stage.GetPrimAtPath(subset_path)
             if not subset_prim:
@@ -2317,8 +2500,41 @@ def _bind_materials_on_prototype_mesh(
             )
         except Exception:
             subsets = []
+        subset_list = subsets or []
 
-        for subset in subsets or []:
+        if cluster_binding:
+            for subset in subset_list:
+                name = subset.GetPrim().GetName()
+                if name in cluster_binding:
+                    continue
+                base_attr = subset.GetPrim().GetAttribute("ifc:baseStyleToken")
+                base_token_val = None
+                if base_attr and base_attr.HasAuthoredValue():
+                    try:
+                        base_token_val = str(base_attr.Get())
+                    except Exception:
+                        base_token_val = None
+                if base_token_val:
+                    mat_path = cluster_binding.get(base_token_val)
+                    if mat_path:
+                        material = UsdShade.Material.Get(stage, mat_path)
+                        if material:
+                            UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(material)
+                            style_tokens.add(name)
+                            LOG.debug("Bound clustered style subset %s -> %s", subset.GetPath(), mat_path)
+                            continue
+                for prefix, mat_path in cluster_binding.items():
+                    if not name.startswith(prefix + "_C"):
+                        continue
+                    material = UsdShade.Material.Get(stage, mat_path)
+                    if not material:
+                        continue
+                    UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(material)
+                    style_tokens.add(name)
+                    LOG.debug("Bound clustered style subset %s -> %s", subset.GetPath(), mat_path)
+                    break
+
+        for subset in subset_list:
             name = subset.GetPrim().GetName()
             if name in style_tokens:
                 continue
@@ -3644,4 +3860,3 @@ def update_federated_view(
         pass
     stage.GetRootLayer().Save()
     return stage.GetRootLayer()
-
