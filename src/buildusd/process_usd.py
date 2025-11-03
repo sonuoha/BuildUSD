@@ -735,6 +735,23 @@ def _resolve_component_styles(
             else:
                 style_normals[token] = vec
 
+    style_up_token: Optional[str] = None
+    style_up_score = 0.0
+    style_front_token: Optional[str] = None
+    style_front_score = 0.0
+    for token, vec in style_normals.items():
+        try:
+            z_score = abs(float(vec[2]))
+            if z_score > style_up_score:
+                style_up_score = z_score
+                style_up_token = token
+            xy_score = max(abs(float(vec[0])), abs(float(vec[1])))
+            if xy_score > style_front_score:
+                style_front_score = xy_score
+                style_front_token = token
+        except Exception:
+            continue
+
     components: List[Dict[str, Any]] = []
     visited = [False] * face_count
     for start_face in range(face_count):
@@ -752,6 +769,7 @@ def _resolve_component_styles(
         centroid_sum = np.zeros(3, dtype=np.float64)
         centroid_weight = 0.0
         face_metrics: List[Tuple[float, np.ndarray]] = []
+        face_details: Dict[int, Dict[str, np.ndarray]] = {}
 
         while queue:
             face_idx = queue.pop()
@@ -772,6 +790,11 @@ def _resolve_component_styles(
                 centroid_sum += tri_centroid * face_area
                 centroid_weight += face_area
                 face_metrics.append((face_area, normal_vec_np))
+                face_details[face_idx] = {
+                    "area": face_area,
+                    "normal": normal_vec_np,
+                    "centroid": tri_centroid,
+                }
                 for point in tri_points:
                     bounds_min = np.minimum(bounds_min, point)
                     bounds_max = np.maximum(bounds_max, point)
@@ -834,6 +857,7 @@ def _resolve_component_styles(
                 "style_presence": style_presence,
                 "neighbor_styles": neighbor_styles,
                 "style_token": dominant_style_token,
+                "face_details": face_details,
             }
         )
 
@@ -871,7 +895,7 @@ def _resolve_component_styles(
                 best_token = token
         return best_token
 
-    # Remove global Z dependence – classify per-component using its *local* height.
+    # Remove global Z dependence - classify per-component using its *local* height.
 
     area_threshold = 1.0
     saturation_threshold = 0.15
@@ -887,18 +911,215 @@ def _resolve_component_styles(
     min_override_area = 2.0
     panel_area_threshold = 2.5
     trim_mid_threshold = 0.25
-    handle_length_threshold = 1.5
-    handle_thickness_threshold = 0.35
-    handle_mid_threshold = 0.4
-    handle_area_threshold = 6.0
+    handle_length_threshold = 0.4         # meters - min long edge of a handle bar
+    handle_thickness_threshold = 0.06     # meters - thin section
+    handle_mid_threshold = 0.15
+    handle_area_threshold = 0.6
+    handle_aspect_threshold = 8.0         # very elongated
     roof_brightness_threshold = 0.35
-    front_panel_area_threshold = 5.5
-    front_panel_normal_variation_threshold = 0.12
-    front_panel_brightness_threshold = 0.35
-    horizontal_priority_material_ids = {0, 1}
+    front_panel_area_threshold = panel_area_threshold
+    front_panel_normal_variation_threshold = 0.25
+    front_panel_brightness_threshold = 0.15
     preserve_style_area_threshold = 0.65
     top_zone_fraction = 0.18
     bottom_zone_fraction = 0.10
+
+    # Aggregate global Z bounds for mesh-relative heuristics
+    global_min_z = float("inf")
+    global_max_z = float("-inf")
+    directional_components: List[Dict[str, Any]] = []
+
+    def _rebuild_component_subset(
+        base_component: Dict[str, Any],
+        subset_faces: List[int],
+        direction_label: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not subset_faces:
+            return None
+        face_details = base_component.get("face_details") or {}
+        material_id = base_component["material_id"]
+        area = 0.0
+        normal_acc = np.zeros(3, dtype=np.float64)
+        bounds_min = np.full(3, np.inf)
+        bounds_max = np.full(3, -np.inf)
+        centroid_sum = np.zeros(3, dtype=np.float64)
+        centroid_weight = 0.0
+        face_metrics: List[Tuple[float, np.ndarray]] = []
+        style_presence: Dict[str, int] = defaultdict(int)
+        neighbor_styles: Dict[str, int] = defaultdict(int)
+        sub_face_details: Dict[int, Dict[str, np.ndarray]] = {}
+
+        for face_idx in subset_faces:
+            detail = face_details.get(face_idx)
+            verts = face_vertices[face_idx]
+            tri_points = np.asarray([points[v] for v in verts], dtype=np.float64)
+            bounds_min = np.minimum(bounds_min, tri_points.min(axis=0))
+            bounds_max = np.maximum(bounds_max, tri_points.max(axis=0))
+
+            if detail:
+                face_area = float(detail.get("area", 0.0))
+                normal_vec_np = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
+                tri_centroid = np.asarray(detail.get("centroid", tri_points.mean(axis=0)), dtype=np.float64)
+            else:
+                face_area, normal_vec = _face_area_and_normal(points, verts)
+                normal_vec_np = np.asarray(normal_vec, dtype=np.float64)
+                tri_centroid = tri_points.mean(axis=0)
+                face_area = float(face_area)
+
+            if face_area <= 0.0:
+                continue
+
+            sub_face_details[face_idx] = {
+                "area": face_area,
+                "normal": normal_vec_np,
+                "centroid": tri_centroid,
+            }
+            area += face_area
+            normal_acc += normal_vec_np * face_area
+            centroid_sum += tri_centroid * face_area
+            centroid_weight += face_area
+            face_metrics.append((face_area, normal_vec_np))
+
+            token = face_styles[face_idx]
+            if token:
+                style_presence[token] += 1
+
+        if area <= 0.0:
+            return None
+
+        normal_len = np.linalg.norm(normal_acc)
+        if normal_len > 0.0:
+            orientation_abs = tuple(float(abs(v)) for v in normal_acc / normal_len)
+        else:
+            orientation_abs = (0.0, 0.0, 0.0)
+
+        if centroid_weight > 0.0:
+            centroid = tuple(float(v) for v in (centroid_sum / centroid_weight))
+        else:
+            centroid = tuple(float(v) for v in centroid_sum)
+
+        normal_variation = 0.0
+        if face_metrics and normal_len > 0.0:
+            unit_normal = normal_acc / normal_len
+            normal_variation = sum(
+                face_area * (1.0 - float(abs(np.dot(unit_normal, face_normal))))
+                for face_area, face_normal in face_metrics
+            ) / area
+
+        bounds_min_t = tuple(float(v) for v in bounds_min)
+        bounds_max_t = tuple(float(v) for v in bounds_max)
+        extents_vec = np.maximum(bounds_max - bounds_min, 0.0)
+        extents = tuple(float(v) for v in extents_vec)
+
+        style_token = None
+        if style_presence:
+            style_token = max(style_presence.items(), key=lambda item: item[1])[0]
+
+        subset_set = set(subset_faces)
+        for face_idx in subset_faces:
+            for nb in adjacency[face_idx]:
+                if nb in subset_set:
+                    continue
+                neighbor_token = face_styles[nb]
+                if neighbor_token:
+                    neighbor_styles[neighbor_token] += 1
+
+        return {
+            "faces": subset_faces,
+            "material_id": material_id,
+            "area": area,
+            "normal": tuple(float(v) for v in normal_acc),
+            "bounds_min": bounds_min_t,
+            "bounds_max": bounds_max_t,
+            "extents": extents,
+            "centroid": centroid,
+            "normal_variation": float(normal_variation),
+            "orientation_abs": orientation_abs,
+            "style_presence": style_presence,
+            "neighbor_styles": neighbor_styles,
+            "style_token": style_token,
+            "face_details": sub_face_details,
+            "direction_label": direction_label,
+        }
+
+    for component in components:
+        face_details = component.get("face_details")
+        if points is None or not face_details:
+            component.pop("face_details", None)
+            directional_components.append(component)
+            continue
+
+        bounds_min = np.asarray(component["bounds_min"], dtype=np.float64)
+        bounds_max = np.asarray(component["bounds_max"], dtype=np.float64)
+        extents = np.asarray(component["extents"], dtype=np.float64)
+        edge_tol = 0.2
+        bins: Dict[str, List[int]] = defaultdict(list)
+
+        for face_idx in component["faces"]:
+            detail = face_details.get(face_idx)
+            if not detail:
+                bins["INTERIOR"].append(face_idx)
+                continue
+            area = float(detail.get("area", 0.0))
+            normal_vec = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
+            centroid_vec = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
+            normal_len = np.linalg.norm(normal_vec)
+            if area <= 0.0 or normal_len <= 1e-5:
+                bins["INTERIOR"].append(face_idx)
+                continue
+            axis = int(np.argmax(np.abs(normal_vec)))
+            axis_label = ("X", "Y", "Z")[axis]
+            sign_positive = normal_vec[axis] >= 0.0
+            span = extents[axis]
+            rel = 0.5 if span <= 1e-6 else (centroid_vec[axis] - bounds_min[axis]) / max(span, 1e-6)
+            near_min = rel <= edge_tol
+            near_max = rel >= (1.0 - edge_tol)
+
+            if axis_label == "Z":
+                if span <= 1e-4:
+                    direction = "TOP" if sign_positive else "BOTTOM"
+                elif sign_positive and near_max:
+                    direction = "TOP"
+                elif (not sign_positive) and near_min:
+                    direction = "BOTTOM"
+                else:
+                    direction = "HORIZONTAL"
+            else:
+                if sign_positive and near_max:
+                    direction = f"POS_{axis_label}"
+                elif (not sign_positive) and near_min:
+                    direction = f"NEG_{axis_label}"
+                else:
+                    direction = f"VERT_{axis_label}"
+            bins[direction].append(face_idx)
+
+        if len(bins) <= 1:
+            component.pop("face_details", None)
+            directional_components.append(component)
+            continue
+
+        for direction, subset in bins.items():
+            rebuilt = _rebuild_component_subset(component, subset, direction)
+            if rebuilt:
+                directional_components.append(rebuilt)
+
+    if directional_components:
+        components = directional_components
+
+    for component in components:
+        bounds_min = component.get("bounds_min")
+        bounds_max = component.get("bounds_max")
+        if not bounds_min or not bounds_max or len(bounds_min) < 3 or len(bounds_max) < 3:
+            continue
+        try:
+            global_min_z = min(global_min_z, float(bounds_min[2]))
+            global_max_z = max(global_max_z, float(bounds_max[2]))
+        except Exception:
+            continue
+    if global_min_z == float("inf"):
+        global_min_z = 0.0
+        global_max_z = 0.0
+    global_height = max(global_max_z - global_min_z, 1e-6)
 
     # ---- Global priors: major(by coverage), panel(by saturation), neutral(by min saturation) ----
     face_count_f = float(max(1, len(material_ids)))
@@ -915,7 +1136,7 @@ def _resolve_component_styles(
     for tkn, cov in coverage_by_token.items():
         if cov > major_cov:
             major_cov, major_token = cov, tkn
-    # Panel by saturation (the most “colourful” present)
+    # Panel by saturation (the most colourful present)
     panel_token: Optional[str] = None
     panel_sat = -1.0
     for tkn, col in style_color_map.items():
@@ -930,7 +1151,7 @@ def _resolve_component_styles(
         if sat < neutral_sat:
             neutral_sat, neutral_token = sat, tkn
     # thresholds
-    PANEL_SAT = 0.18      # what we consider “panel-like colour”
+    PANEL_SAT = 0.18      # what we consider panel-like colour
     FRONT_MAJ_COV = 0.45  # min coverage hint to prefer panel on fronts
 
     for component in components:
@@ -939,6 +1160,7 @@ def _resolve_component_styles(
         chosen_from_style = False
         material_color: Optional[Tuple[float, float, float]] = None
         material_id = component["material_id"]
+        direction_label = component.get("direction_label") or ""
         try:
             if materials and 0 <= material_id < len(materials):
                 material_color = _color_from_material(materials[material_id])
@@ -948,8 +1170,39 @@ def _resolve_component_styles(
         preferred_token = material_style_lookup.get(material_id)
         material_brightness = _color_brightness(material_color)
 
-        if component["style_presence"]:
-            chosen_token = max(component["style_presence"].items(), key=lambda item: item[1])[0]
+        style_presence_counts: Dict[str, int] = component.get("style_presence", {})
+        locked_style_token: Optional[str] = None
+        if faces_in_component:
+            dominant = None
+            if style_presence_counts:
+                dominant = max(style_presence_counts.items(), key=lambda item: item[1])
+                if dominant[1] >= len(faces_in_component):
+                    locked_style_token = dominant[0]
+            if locked_style_token is None:
+                subset_material_ids = {
+                    int(material_ids[face_idx])
+                    for face_idx in faces_in_component
+                    if 0 <= face_idx < len(material_ids)
+                }
+                if len(subset_material_ids) == 1:
+                    only_mid = next(iter(subset_material_ids))
+                    locked_style_token = material_style_lookup.get(only_mid)
+
+        if locked_style_token:
+            chosen_token = locked_style_token
+            chosen_from_style = True
+            for face_idx in faces_in_component:
+                face_styles[face_idx] = chosen_token
+            LOG.debug(
+                "Directional component locked to source style %s (dir=%s faces=%d)",
+                locked_style_token,
+                direction_label or "NA",
+                len(faces_in_component),
+            )
+            continue
+
+        if style_presence_counts:
+            chosen_token = max(style_presence_counts.items(), key=lambda item: item[1])[0]
             chosen_from_style = True
         elif component["neighbor_styles"]:
             neighbor_area_threshold = 1.0
@@ -970,6 +1223,10 @@ def _resolve_component_styles(
         if preferred_token and chosen_token == preferred_token:
             chosen_from_style = True
 
+        direction_label = component.get("direction_label") or ""
+        component.pop("direction_label", None)
+        component.pop("face_details", None)
+
         extents = component.get("extents", (0.0, 0.0, 0.0))
         min_extent = min(extents) if extents else 0.0
         max_extent = max(extents) if extents else 0.0
@@ -984,17 +1241,20 @@ def _resolve_component_styles(
         min_z = float(bounds_min[2]) if len(bounds_min) >= 3 else 0.0
         max_z = float(bounds_max[2]) if len(bounds_max) >= 3 else 0.0
         local_height = max(1e-6, max_z - min_z)
-        # Band faces using local z; used to robustly identify top/bottom regions
-        top_faces, bottom_faces = _local_z_bands(points or [], face_vertices, min_z, max_z,
-                                                 top_frac=top_zone_fraction, bot_frac=bottom_zone_fraction)
-        # Component is considered near-top/bottom if most of its faces land in that band
-        if faces_in_component:
-            frac_top = len([f for f in faces_in_component if f in top_faces]) / float(len(faces_in_component))
-            frac_bottom = len([f for f in faces_in_component if f in bottom_faces]) / float(len(faces_in_component))
+        centroid_z = float(component.get("centroid", (0.0, 0.0, 0.0))[2]) if len(component.get("centroid", (0.0, 0.0, 0.0))) >= 3 else (min_z + max_z) * 0.5
+        rel_local = (centroid_z - min_z) / local_height
+        near_top = False
+        near_bottom = False
+        if direction_label == "TOP":
+            near_top = True
+        elif direction_label == "BOTTOM":
+            near_bottom = True
         else:
-            frac_top = frac_bottom = 0.0
-        near_top = frac_top >= 0.35
-        near_bottom = frac_bottom >= 0.35
+            near_top = rel_local >= (1.0 - top_zone_fraction)
+            near_bottom = rel_local <= bottom_zone_fraction
+        rel_global = (centroid_z - global_min_z) / max(global_height, 1e-6)
+        is_top_band = direction_label == "TOP" or rel_global >= 0.80
+        is_bottom_band = direction_label == "BOTTOM" or rel_global <= 0.20
         orientation_abs = component.get("orientation_abs", (0.0, 0.0, 0.0))
         normal_variation = float(component.get("normal_variation", 0.0))
         thin_trim = (
@@ -1002,6 +1262,25 @@ def _resolve_component_styles(
             and mid_extent <= trim_length_threshold
             and component["area"] <= area_threshold * 12.0
         )
+
+        axis_tag = direction_label.split("_")[1] if "_" in direction_label else ""
+        is_vertical_direction = direction_label.startswith("POS_") or direction_label.startswith("NEG_") or direction_label.startswith("VERT_")
+        is_horizontal_direction = direction_label in ("TOP", "BOTTOM", "HORIZONTAL", "")
+
+        # ---------- HANDLE RULE (aspect ratio + small area) ----------
+        is_handle_component = (
+            max_extent / max(1e-6, min_extent) >= handle_aspect_threshold
+            and component["area"] <= handle_area_threshold
+            and (is_vertical or abs_normal_z <= 0.3)
+        )
+        if is_handle_component:
+            handle_token = preferred_token or aluminium_style_token or neutral_token or chosen_token
+            if handle_token:
+                chosen_token = handle_token
+                for face_idx in faces_in_component:
+                    face_styles[face_idx] = chosen_token
+                LOG.debug("Handle forced -> %s", chosen_token)
+                continue
 
         if thin_trim:
             desired_token = chosen_token
@@ -1023,50 +1302,54 @@ def _resolve_component_styles(
             and mid_extent <= trim_mid_threshold
         )
 
-        is_handle = (
-            max_extent >= handle_length_threshold
-            and min_extent <= handle_thickness_threshold
-            and mid_extent <= handle_mid_threshold
-            and component["area"] <= handle_area_threshold
-        )
-        if is_handle:
-            desired_token = preferred_token or aluminium_style_token or neutral_style_token or chosen_token
-            if desired_token:
-                chosen_token = desired_token
-                chosen_from_style = desired_token == preferred_token
-                for face_idx in faces_in_component:
-                    face_styles[face_idx] = chosen_token
-                continue
-
         auto_panel_applied = False
         is_roof_panel = (
-            is_horizontal
-            and component["area"] >= horizontal_area_threshold
-            and near_top
-            and material_brightness >= roof_brightness_threshold
+            (direction_label == "TOP")
+            or (
+                is_horizontal_direction
+                and component["area"] >= horizontal_area_threshold
+                and (near_top or is_top_band)
+                and material_brightness >= roof_brightness_threshold
+            )
         )
         is_front_panel = (
-            is_vertical
+            (is_vertical_direction and axis_tag in ("X", "Y"))
+            or (
+                is_vertical
+                and (orientation_abs[0] >= 0.6 or orientation_abs[1] >= 0.6)
+            )
+        )
+        is_front_panel = (
+            is_front_panel
             and component["area"] >= front_panel_area_threshold
             and normal_variation <= front_panel_normal_variation_threshold
             and material_brightness >= front_panel_brightness_threshold
-            and (orientation_abs[0] >= 0.6 or orientation_abs[1] >= 0.6)
         )
-        if primary_high_saturation_token and material_id in horizontal_priority_material_ids:
-            needs_panel_override = (
-                (is_horizontal and component["area"] >= horizontal_area_threshold)
-                or (is_vertical and component["area"] >= vertical_area_threshold)
-                or (component["area"] >= panel_area_threshold and min_extent > trim_thickness_threshold and mid_extent > trim_length_threshold)
-            )
-            style_coverage = 0.0
-            if chosen_token:
-                coverage_count = component["style_presence"].get(chosen_token, 0)
-                style_coverage = float(coverage_count) / float(len(faces_in_component) or 1)
-            current_sat = style_saturation_map.get(chosen_token, 0.0) if chosen_token else 0.0
-            if needs_panel_override and (not chosen_from_style or (style_coverage < preserve_style_area_threshold and current_sat < saturation_threshold)):
-                chosen_token = primary_high_saturation_token
-                chosen_from_style = False
-                auto_panel_applied = True
+
+        roof_candidate = None
+        if panel_token and panel_sat >= PANEL_SAT:
+            roof_candidate = panel_token
+        elif style_up_token:
+            roof_candidate = style_up_token
+
+        if is_roof_panel and roof_candidate:
+            chosen_token = roof_candidate
+            auto_panel_applied = True
+
+        front_candidate = None
+        if panel_token and panel_sat >= PANEL_SAT:
+            front_candidate = panel_token
+        elif style_front_token:
+            front_candidate = style_front_token
+
+        if (
+            is_front_panel
+            and not near_bottom
+            and front_candidate
+            and coverage_by_token.get(front_candidate, 0.0) >= FRONT_MAJ_COV
+        ):
+            chosen_token = front_candidate
+            auto_panel_applied = True
 
         chosen_color = style_color_map.get(chosen_token) if chosen_token else None
         color_match_value = bool(
@@ -1094,29 +1377,34 @@ def _resolve_component_styles(
         if chosen_token is None and (is_bottom_trim or thin_trim or near_bottom):
             chosen_token = neutral_token or component.get("style_token")
 
-        # --- RULE 2: roof assertion – top horizontals inherit panel style when present ---
-        if chosen_token is None and is_roof_panel and panel_token and panel_sat >= PANEL_SAT:
-            chosen_token = panel_token
+        # --- RULE 2: roof assertion - top horizontals inherit panel style when present ---
+        if chosen_token is None and is_roof_panel and roof_candidate:
+            chosen_token = roof_candidate
             chosen_from_style = False
             auto_panel_applied = True
 
-        # --- RULE 3: front preference – large verticals (not bottom) prefer panel ---
+        # --- RULE 3: front preference - large verticals (not bottom) prefer panel ---
         if (
             chosen_token is None
             and is_front_panel
             and not near_bottom
-            and panel_token
-            and panel_sat >= PANEL_SAT
-            and coverage_by_token.get(panel_token, 0.0) >= FRONT_MAJ_COV
+            and front_candidate
+            and coverage_by_token.get(front_candidate, 0.0) >= FRONT_MAJ_COV
         ):
-            chosen_token = panel_token
+            chosen_token = front_candidate
             chosen_from_style = False
             auto_panel_applied = True
 
         # --- FINAL VETO: never leave bottom-band/trim/very-thin painted as a coloured panel ---
-        if (near_bottom or is_bottom_trim or thin_trim) and chosen_token:
+        if (near_bottom or is_bottom_band or is_bottom_trim or thin_trim) and chosen_token:
             if _color_saturation(style_color_map.get(chosen_token)) >= PANEL_SAT:
                 chosen_token = neutral_token or component.get("style_token") or chosen_token
+
+        if (direction_label == "TOP" or is_top_band) and roof_candidate:
+            if chosen_token is None or chosen_token == neutral_token:
+                chosen_token = roof_candidate
+                auto_panel_applied = True
+                chosen_from_style = False
 
         if chosen_token:
             coverage_count = component["style_presence"].get(chosen_token, 0)
@@ -1214,23 +1502,22 @@ def _resolve_component_styles(
             color_match = False
 
         LOG.debug(
-            "Component classify: mat=%s faces=%d area=%.3f horiz=%s vert=%s z=[%.3f, %.3f] near_top=%.2f near_bottom=%.2f -> %s (from_style=%s cov=%.2f match=%s panelChoice=%s panelSat=%.2f override=%s)",
+            "Component classify: mat=%s faces=%d area=%.3f horiz=%s vert=%s dir=%s z=[%.3f, %.3f] near_top=%.2f near_bottom=%s -> %s (from_style=%s cov=%.2f panelChoice=%s panelSat=%.2f)",
             material_id,
             len(faces_in_component),
             float(component.get("area", 0.0)),
             bool(is_horizontal),
             bool(is_vertical),
+            direction_label or "NA",
             min_z,
             max_z,
-            frac_top,
-            frac_bottom,
+            float(is_top_band),
+            str(near_bottom),
             chosen_token,
             chosen_from_style,
             final_style_coverage,
-            color_match,
             panel_token,
             panel_sat,
-            allow_override,
         )
 
         if chosen_token:
@@ -3316,7 +3603,7 @@ def apply_stage_anchor_transform(
                     except Exception:
                         LOG.debug("Unable to remove world attribute %s during anchor relocation", name)
 
-# ---------------- Federated master view – stub (retain signature) ----------------
+# ---------------- Federated master view - stub (retain signature) ----------------
 
 def update_federated_view(
     master_stage_path: PathLike,
