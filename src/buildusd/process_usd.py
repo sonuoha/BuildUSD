@@ -509,6 +509,43 @@ def _face_area_and_normal(points: Sequence[Tuple[float, float, float]], face_ver
     return float(area), (float(normal[0]), float(normal[1]), float(normal[2]))
 
 
+def _prepare_face_geometry(
+    points: Sequence[Tuple[float, float, float]],
+    face_vertices: Sequence[Sequence[int]],
+) -> _FaceGeometry:
+    """Pre-compute normals, centroids, and plane offsets for faces."""
+    face_count = len(face_vertices)
+    normals = np.zeros((face_count, 3), dtype=np.float64)
+    centroids = np.zeros((face_count, 3), dtype=np.float64)
+    areas = np.zeros(face_count, dtype=np.float64)
+    plane_d = np.zeros(face_count, dtype=np.float64)
+    bbox_min = np.full((face_count, 3), np.inf, dtype=np.float64)
+    bbox_max = np.full((face_count, 3), -np.inf, dtype=np.float64)
+
+    for idx, verts in enumerate(face_vertices):
+        area, normal = _face_area_and_normal(points, verts)
+        areas[idx] = area
+        normals[idx] = np.asarray(normal, dtype=np.float64)
+        if verts:
+            coords = np.asarray([points[v] for v in verts], dtype=np.float64)
+            centroid = np.mean(coords, axis=0)
+            centroids[idx] = centroid
+            plane_d[idx] = float(np.dot(normals[idx], centroid))
+            bbox_min[idx] = coords.min(axis=0)
+            bbox_max[idx] = coords.max(axis=0)
+        else:
+            centroids[idx] = 0.0
+            plane_d[idx] = 0.0
+    return _FaceGeometry(
+        normals=normals,
+        centroids=centroids,
+        areas=areas,
+        plane_d=plane_d,
+        bbox_min=bbox_min,
+        bbox_max=bbox_max,
+    )
+
+
 def _color_from_material(material: Any) -> Optional[Tuple[float, float, float]]:
     def _try_get(obj: Any, *names: str) -> Optional[Any]:
         for name in names:
@@ -698,7 +735,37 @@ def _resolve_component_styles(
         material_id: token for material_id, (token, _) in material_style_stats.items()
     }
 
+    material_color_cache: Dict[int, Optional[Tuple[float, float, float]]] = {}
+
+    def _material_color_for_id(material_id: int) -> Optional[Tuple[float, float, float]]:
+        if material_id in material_color_cache:
+            return material_color_cache[material_id]
+        color: Optional[Tuple[float, float, float]] = None
+        if materials is not None:
+            try:
+                mat = None
+                if isinstance(materials, dict):
+                    mat = materials.get(material_id)
+                    if mat is None:
+                        mat = materials.get(str(material_id))
+                else:
+                    if 0 <= material_id < len(materials):
+                        mat = materials[material_id]
+                if mat is not None:
+                    color = _color_from_material(mat)
+            except Exception:
+                color = None
+        material_color_cache[material_id] = color
+        return color
+
     face_vertices, adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
+    face_geometry = _prepare_face_geometry(points, face_vertices)
+    face_normals = face_geometry.normals
+    face_centroids = face_geometry.centroids
+    face_areas = face_geometry.areas
+    face_plane_d = face_geometry.plane_d
+    face_bbox_min = face_geometry.bbox_min
+    face_bbox_max = face_geometry.bbox_max
 
     face_styles: List[Optional[str]] = [None] * face_count
     face_directions: List[Optional[str]] = [None] * face_count
@@ -720,10 +787,13 @@ def _resolve_component_styles(
         for face_index, token in enumerate(face_styles):
             if token is None:
                 continue
-            area, normal = _face_area_and_normal(points, face_vertices[face_index])
-            if area <= 0.0:
+            area = float(face_areas[face_index])
+            if area <= 1e-9:
                 continue
-            vec = np.asarray(normal, dtype=np.float64) * area
+            normal_vec = np.asarray(face_normals[face_index], dtype=np.float64)
+            if normal_vec.size != 3:
+                continue
+            vec = normal_vec * area
             if token in style_normals:
                 style_normals[token] += vec
                 style_area_map[token] = style_area_map.get(token, 0.0) + area
@@ -766,6 +836,7 @@ def _resolve_component_styles(
         normal_acc = np.zeros(3, dtype=np.float64)
         bounds_min = np.full(3, np.inf)
         bounds_max = np.full(3, -np.inf)
+        bbox_initialized = False
         style_presence: Dict[str, int] = defaultdict(int)
         neighbor_styles: Dict[str, int] = defaultdict(int)
         centroid_sum = np.zeros(3, dtype=np.float64)
@@ -781,25 +852,30 @@ def _resolve_component_styles(
                 continue
             visited[face_idx] = True
             faces_in_component.append(face_idx)
-            verts = face_vertices[face_idx]
-            if points is not None:
-                face_area, normal = _face_area_and_normal(points, verts)
+            face_area = float(face_areas[face_idx])
+            normal_vec_np = np.asarray(face_normals[face_idx], dtype=np.float64)
+            centroid_vec = np.asarray(face_centroids[face_idx], dtype=np.float64)
+            if face_area > 1e-9 and normal_vec_np.size == 3:
                 area += face_area
-                normal_vec_np = np.asarray(normal, dtype=np.float64)
                 normal_acc += normal_vec_np * face_area
-                tri_points = np.asarray([points[v] for v in verts], dtype=np.float64)
-                tri_centroid = tri_points.mean(axis=0)
-                centroid_sum += tri_centroid * face_area
+                centroid_sum += centroid_vec * face_area
                 centroid_weight += face_area
                 face_metrics.append((face_area, normal_vec_np))
                 face_details[face_idx] = {
                     "area": face_area,
                     "normal": normal_vec_np,
-                    "centroid": tri_centroid,
+                    "centroid": centroid_vec,
                 }
-                for point in tri_points:
-                    bounds_min = np.minimum(bounds_min, point)
-                    bounds_max = np.maximum(bounds_max, point)
+            bbox_face_min = face_bbox_min[face_idx]
+            bbox_face_max = face_bbox_max[face_idx]
+            if np.isfinite(bbox_face_min).all() and np.isfinite(bbox_face_max).all():
+                if not bbox_initialized:
+                    bounds_min = np.array(bbox_face_min, copy=True)
+                    bounds_max = np.array(bbox_face_max, copy=True)
+                    bbox_initialized = True
+                else:
+                    bounds_min = np.minimum(bounds_min, bbox_face_min)
+                    bounds_max = np.maximum(bounds_max, bbox_face_max)
             token = face_styles[face_idx]
             if token:
                 style_presence[token] += 1
@@ -813,6 +889,9 @@ def _resolve_component_styles(
 
         if not faces_in_component:
             continue
+        if not bbox_initialized:
+            bounds_min = np.zeros(3, dtype=np.float64)
+            bounds_max = np.zeros(3, dtype=np.float64)
         if np.linalg.norm(normal_acc) > 0.0:
             normal_acc = normal_acc / np.linalg.norm(normal_acc)
 
@@ -822,8 +901,8 @@ def _resolve_component_styles(
 
         if centroid_weight > 0.0:
             centroid = centroid_sum / centroid_weight
-        elif points is not None and faces_in_component:
-            centroid = np.asarray(points[face_vertices[faces_in_component[0]][0]], dtype=np.float64)
+        elif faces_in_component:
+            centroid = np.asarray(face_centroids[faces_in_component[0]], dtype=np.float64)
         else:
             centroid = np.zeros(3, dtype=np.float64)
 
@@ -866,12 +945,7 @@ def _resolve_component_styles(
     def _style_fallback_for_material(material_id: int) -> Optional[str]:
         best_token: Optional[str] = None
         best_distance = float("inf")
-        base_color = None
-        try:
-            if materials and 0 <= material_id < len(materials):
-                base_color = _color_from_material(materials[material_id])
-        except Exception:
-            base_color = None
+        base_color = _material_color_for_id(material_id)
         preferred_token = material_style_lookup.get(material_id)
         if base_color is None and preferred_token is not None:
             return preferred_token
@@ -953,23 +1027,23 @@ def _resolve_component_styles(
 
         for face_idx in subset_faces:
             detail = face_details.get(face_idx)
-            verts = face_vertices[face_idx]
-            tri_points = np.asarray([points[v] for v in verts], dtype=np.float64)
-            bounds_min = np.minimum(bounds_min, tri_points.min(axis=0))
-            bounds_max = np.maximum(bounds_max, tri_points.max(axis=0))
-
             if detail:
                 face_area = float(detail.get("area", 0.0))
                 normal_vec_np = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
-                tri_centroid = np.asarray(detail.get("centroid", tri_points.mean(axis=0)), dtype=np.float64)
+                tri_centroid = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
             else:
-                face_area, normal_vec = _face_area_and_normal(points, verts)
-                normal_vec_np = np.asarray(normal_vec, dtype=np.float64)
-                tri_centroid = tri_points.mean(axis=0)
-                face_area = float(face_area)
+                face_area = float(face_areas[face_idx])
+                normal_vec_np = np.asarray(face_normals[face_idx], dtype=np.float64)
+                tri_centroid = np.asarray(face_centroids[face_idx], dtype=np.float64)
 
-            if face_area <= 0.0:
+            if face_area <= 1e-9 or normal_vec_np.size != 3:
                 continue
+
+            bbox_face_min = face_bbox_min[face_idx]
+            bbox_face_max = face_bbox_max[face_idx]
+            if np.isfinite(bbox_face_min).all() and np.isfinite(bbox_face_max).all():
+                bounds_min = np.minimum(bounds_min, bbox_face_min)
+                bounds_max = np.maximum(bounds_max, bbox_face_max)
 
             sub_face_details[face_idx] = {
                 "area": face_area,
@@ -1059,12 +1133,14 @@ def _resolve_component_styles(
 
         for face_idx in component["faces"]:
             detail = face_details.get(face_idx)
-            if not detail:
-                bins["INTERIOR"].append(face_idx)
-                continue
-            area = float(detail.get("area", 0.0))
-            normal_vec = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
-            centroid_vec = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
+            if detail:
+                area = float(detail.get("area", 0.0))
+                normal_vec = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
+                centroid_vec = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
+            else:
+                area = float(face_areas[face_idx])
+                normal_vec = np.asarray(face_normals[face_idx], dtype=np.float64)
+                centroid_vec = np.asarray(face_centroids[face_idx], dtype=np.float64)
             normal_len = np.linalg.norm(normal_vec)
             if area <= 0.0 or normal_len <= 1e-5:
                 bins["INTERIOR"].append(face_idx)
@@ -1160,7 +1236,6 @@ def _resolve_component_styles(
         faces_in_component = component["faces"]
         chosen_token: Optional[str] = None
         chosen_from_style = False
-        material_color: Optional[Tuple[float, float, float]] = None
         material_id = component["material_id"]
         direction_label = component.get("direction_label") or ""
         component.pop("direction_label", None)
@@ -1172,6 +1247,7 @@ def _resolve_component_styles(
                 face_styles[face_idx] = token_value
                 face_directions[face_idx] = direction_label or "NA"
 
+        material_color = _material_color_for_id(material_id)
         preferred_token = material_style_lookup.get(material_id)
         material_brightness = _color_brightness(material_color)
 
@@ -1493,7 +1569,6 @@ def _resolve_component_styles(
 
     if cluster_styles and points is not None and face_vertices is not None and len(mapping) > 1:
         face_set_adjacency = adjacency
-        pts_np = np.asarray(points, dtype=float)
 
         def _cluster_faces_by_plane(face_list: List[int]) -> List[List[int]]:
             if not face_list:
@@ -1525,15 +1600,12 @@ def _resolve_component_styles(
             for comp in components_local:
                 planes: List[Tuple[np.ndarray, float, List[int]]] = []
                 for fid in comp:
-                    verts = face_vertices[fid]
-                    _, normal = _face_area_and_normal(points, verts)
-                    n = np.asarray(normal, dtype=float)
+                    n = np.asarray(face_normals[fid], dtype=float)
                     norm = np.linalg.norm(n)
                     if norm < 1e-9:
                         continue
                     n /= norm
-                    cx, cy, cz = _face_centroid(points, verts)
-                    d = float(np.dot(n, np.asarray([cx, cy, cz], dtype=float)))
+                    d = float(face_plane_d[fid])
                     placed = False
                     for entry in planes:
                         ref_n, ref_d, lst = entry
@@ -2281,6 +2353,16 @@ class _MaterialProperties:
     display_color: Tuple[float, float, float]
     opacity: float
     emissive_color: Optional[Tuple[float, float, float]] = None
+
+
+@dataclass(frozen=True)
+class _FaceGeometry:
+    normals: np.ndarray       # (F, 3)
+    centroids: np.ndarray     # (F, 3)
+    areas: np.ndarray         # (F,)
+    plane_d: np.ndarray       # (F,)
+    bbox_min: np.ndarray      # (F, 3)
+    bbox_max: np.ndarray      # (F, 3)
 
 
 @dataclass
