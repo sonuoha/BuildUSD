@@ -758,6 +758,93 @@ def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
     return (x, y, z)
 
 
+def _point_list_entry_to_tuple(entry) -> Tuple[float, float, float]:
+    """Best-effort conversion for CoordList tuples (supports 2D/3D lists)."""
+    if entry is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(entry, (list, tuple)):
+        seq = entry
+    else:
+        if hasattr(entry, "wrappedValue"):
+            seq = entry.wrappedValue
+        elif hasattr(entry, "CoordList"):
+            seq = getattr(entry, "CoordList") or []
+        elif hasattr(entry, "Coordinates"):
+            seq = getattr(entry, "Coordinates") or []
+        else:
+            try:
+                seq = list(entry)
+            except Exception:
+                seq = []
+    x = _as_float(seq[0] if len(seq) > 0 else 0.0)
+    y = _as_float(seq[1] if len(seq) > 1 else 0.0)
+    z = _as_float(seq[2] if len(seq) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _indexed_polycurve_points(curve) -> List[Tuple[float, float, float]]:
+    """Expand an IfcIndexedPolyCurve into explicit XYZ points."""
+    point_list = getattr(curve, "Points", None)
+    if point_list is None:
+        return []
+    coord_list = getattr(point_list, "CoordList", None)
+    if coord_list is None:
+        coord_list = getattr(point_list, "CoordinatesList", None)
+    coords: List[Tuple[float, float, float]] = []
+    if coord_list:
+        for entry in coord_list:
+            coords.append(_point_list_entry_to_tuple(entry))
+    if not coords:
+        return []
+
+    segments = list(getattr(curve, "Segments", None) or [])
+    if not segments:
+        return coords
+
+    result: List[Tuple[float, float, float]] = []
+
+    def _append_index(raw_index) -> None:
+        try:
+            idx = int(raw_index)
+        except Exception:
+            return
+        idx -= 1  # IfcPositiveInteger is 1-based
+        if idx < 0 or idx >= len(coords):
+            return
+        point = coords[idx]
+        if result and result[-1] == point:
+            return
+        result.append(point)
+
+    for segment in segments:
+        if segment is None:
+            continue
+        if hasattr(segment, "wrappedValue"):
+            indices = segment.wrappedValue
+        elif hasattr(segment, "Points"):
+            indices = getattr(segment, "Points", None) or ()
+        elif isinstance(segment, (list, tuple)):
+            indices = segment
+        else:
+            try:
+                indices = list(segment)
+            except Exception:
+                indices = (segment,)
+        if not indices:
+            continue
+        # Some representations wrap the tuple once more (e.g. [(1,2,3)]).
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            indices = indices[0]
+        for raw_index in indices:
+            if isinstance(raw_index, (list, tuple)):
+                for nested in raw_index:
+                    _append_index(nested)
+            else:
+                _append_index(raw_index)
+
+    return result if result else coords
+
+
 def _object_placement_to_np(obj_placement) -> np.ndarray:
     """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
     try:
@@ -974,6 +1061,8 @@ def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
                 for sub in getattr(mapped, "Items", []) or []:
                     pts.extend(_extract_curve_points(sub))
                 return pts
+    if hasattr(item, "is_a") and item.is_a("IfcIndexedPolyCurve"):
+        return _indexed_polycurve_points(item)
     return []
 
 def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
