@@ -3594,7 +3594,12 @@ def author_geometry2d_layer(
 
             width_value = _resolved_curve_width(curve)
             if width_value is not None:
-                basis.CreateWidthsAttr(Vt.FloatArray([float(width_value)]))
+                curve_count = max(1, len(counts))
+                widths = Vt.FloatArray(curve_count)
+                for idx in range(curve_count):
+                    widths[idx] = float(width_value)
+                basis.CreateWidthsAttr(widths)
+                basis.SetWidthsInterpolation(UsdGeom.Tokens.uniform)
 
             prim = basis.GetPrim()
             try:
