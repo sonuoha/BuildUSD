@@ -221,6 +221,70 @@ class _JoinPathAction(argparse.Action):
         setattr(namespace, self.dest, joined or None)
 
 
+def _normalize_stage_unit_target(path: PathLike) -> str:
+    """Return an absolute/local path or passthrough omniverse URI."""
+    if path is None:
+        raise ValueError("--set-stage-unit requires a target USD path.")
+    raw = str(path).strip()
+    if not raw:
+        raise ValueError("--set-stage-unit requires a target USD path.")
+    if is_omniverse_path(raw):
+        return raw
+    path_obj = Path(raw).expanduser().resolve()
+    return str(path_obj)
+
+
+def _apply_stage_unit(target_path: PathLike, meters_per_unit: float) -> None:
+    """Open a USD stage/layer and update its metersPerUnit metadata."""
+    from .pxr_utils import Sdf, Usd, UsdGeom
+
+    meters = float(meters_per_unit)
+    if meters <= 0.0:
+        raise ValueError("--stage-unit-value must be greater than zero.")
+    normalized = _normalize_stage_unit_target(target_path)
+    LOG.info("Setting metersPerUnit on %s to %s", normalized, meters)
+
+    stage = None
+    try:
+        stage = Usd.Stage.Open(normalized)
+    except Exception as exc:  # pragma: no cover - logging only
+        LOG.debug("Usd.Stage.Open failed for %s: %s", normalized, exc)
+        stage = None
+
+    if stage is not None:
+        UsdGeom.SetStageMetersPerUnit(stage, meters)
+        root_layer = stage.GetRootLayer()
+        if root_layer is None:
+            raise ValueError(f"Stage {normalized} has no root layer to edit.")
+        root_layer.Save()
+        close = getattr(stage, "Close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # pragma: no cover - logging only
+                LOG.debug("stage.Close() failed for %s: %s", normalized, exc)
+        return
+
+    layer = Sdf.Layer.FindOrOpen(normalized)
+    if layer is None:
+        raise ValueError(f"Failed to open USD layer {normalized}")
+    layer.metersPerUnit = meters
+    layer.Save()
+
+
+def set_stage_unit(target_path: PathLike, meters_per_unit: float = 1.0, *, offline: bool = False) -> None:
+    """Update the meters-per-unit metadata on an existing USD layer or stage."""
+    raw_path = str(target_path).strip() if target_path is not None else ""
+    if not raw_path:
+        raise ValueError("--set-stage-unit requires a target USD path.")
+    if meters_per_unit <= 0.0:
+        raise ValueError("--stage-unit-value must be greater than zero.")
+    if offline and is_omniverse_path(raw_path):
+        raise ValueError("--offline cannot be combined with --set-stage-unit for omniverse:// targets.")
+    initialize_usd(offline=offline)
+    _apply_stage_unit(raw_path, meters_per_unit)
+
+
 # ---------------- CLI ----------------
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the standalone converter."""
@@ -287,6 +351,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         dest="offline",
         action="store_true",
         help="Force standalone USD (no Kit). All input/output paths must be local.",
+    )
+    parser.add_argument(
+        "--set-stage-unit",
+        dest="set_stage_unit",
+        nargs="+",
+        action=_JoinPathAction,
+        default=None,
+        help=(
+            "Path to an existing USD layer/stage whose metersPerUnit metadata should be updated. "
+            "When provided the command performs only this edit and skips IFC conversion."
+        ),
+    )
+    parser.add_argument(
+        "--stage-unit-value",
+        dest="stage_unit_value",
+        type=float,
+        default=1.0,
+        help="Meters-per-unit value applied when using --set-stage-unit (must be >0, default: %(default)s).",
     )
     parser.add_argument(
         "--annotation-width-default",
@@ -1301,6 +1383,19 @@ def _process_single_ifc(
 def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv)
+    if getattr(args, "set_stage_unit", None):
+        try:
+            set_stage_unit(
+                args.set_stage_unit,
+                meters_per_unit=getattr(args, "stage_unit_value", 1.0),
+                offline=bool(getattr(args, "offline", False)),
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            shutdown_usd_context()
+            raise SystemExit(2) from exc
+        shutdown_usd_context()
+        return []
     try:
         width_rules = _gather_annotation_width_rules(args)
     except ValueError as exc:

@@ -19,6 +19,7 @@ from .main import (
     ConversionOptions,
     ConversionResult,
     convert as _convert,
+    set_stage_unit as _set_stage_unit,
     OPTIONS as DEFAULT_CONVERSION_OPTIONS,
 )
 from .process_usd import apply_stage_anchor_transform
@@ -39,6 +40,7 @@ __all__ = [
     "FEDERATION_DEFAULTS",
     "apply_stage_anchor_transform",
     "convert",
+    "set_stage_unit",
     "federate_stages",
     "DEFAULT_BASE_POINT",
     "DEFAULT_SHARED_BASE_POINT",
@@ -131,6 +133,17 @@ def convert(
         anchor_mode=normalized_anchor_mode,
         cancel_event=cancel_event,
     )
+
+
+def set_stage_unit(
+    target_path: PathLike,
+    meters_per_unit: float = 1.0,
+    *,
+    offline: bool = False,
+) -> None:
+    """Expose the CLI stage-unit helper as a reusable API call."""
+
+    _set_stage_unit(target_path, meters_per_unit, offline=offline)
 
 
 @dataclass(frozen=True)

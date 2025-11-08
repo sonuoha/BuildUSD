@@ -624,31 +624,51 @@ def _collect_spatial_hierarchy(product) -> Tuple[Tuple[str, Optional[int]], ...]
 # Minimal map conversion (same signature as before)
 
 def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
-    """Return the preferred IfcMapConversion definition, if present."""
-    best = None
+    """Return the preferred coordinate operation (map conversion or rigid)."""
+
+    def _map_data_from_conversion(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "Eastings", 0.0), 0.0),
+            northings=_as_float(getattr(op, "Northings", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "OrthogonalHeight", 0.0), 0.0),
+            x_axis_abscissa=_as_float(getattr(op, "XAxisAbscissa", 1.0), 1.0),
+            x_axis_ordinate=_as_float(getattr(op, "XAxisOrdinate", 0.0), 0.0),
+            scale=_as_float(getattr(op, "Scale", 1.0), 1.0) or 1.0,
+        )
+
+    def _map_data_from_rigid(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "FirstCoordinate", 0.0), 0.0),
+            northings=_as_float(getattr(op, "SecondCoordinate", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "Height", 0.0), 0.0),
+            x_axis_abscissa=1.0,
+            x_axis_ordinate=0.0,
+            scale=1.0,
+        )
+
+    best_data: Optional[MapConversionData] = None
     for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
         ops = getattr(ctx, "HasCoordinateOperation", None) or []
         for op in ops:
-            if op is None or not op.is_a("IfcMapConversion"): continue
-            if getattr(ctx, "ContextType", None) == "Model" and getattr(ctx, "CoordinateSpaceDimension", None) == 3:
-                return MapConversionData(
-                    eastings=_as_float(getattr(op,"Eastings",0.0),0.0),
-                    northings=_as_float(getattr(op,"Northings",0.0),0.0),
-                    orthogonal_height=_as_float(getattr(op,"OrthogonalHeight",0.0),0.0),
-                    x_axis_abscissa=_as_float(getattr(op,"XAxisAbscissa",1.0),1.0),
-                    x_axis_ordinate=_as_float(getattr(op,"XAxisOrdinate",0.0),0.0),
-                    scale=_as_float(getattr(op,"Scale",1.0),1.0) or 1.0,
-                )
-            best = best or op
-    if best is None: return None
-    return MapConversionData(
-        eastings=_as_float(getattr(best,"Eastings",0.0),0.0),
-        northings=_as_float(getattr(best,"Northings",0.0),0.0),
-        orthogonal_height=_as_float(getattr(best,"OrthogonalHeight",0.0),0.0),
-        x_axis_abscissa=_as_float(getattr(best,"XAxisAbscissa",1.0),1.0),
-        x_axis_ordinate=_as_float(getattr(best,"XAxisOrdinate",0.0),0.0),
-        scale=_as_float(getattr(best,"Scale",1.0),1.0) or 1.0,
-    )
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            data: Optional[MapConversionData] = None
+            if op.is_a("IfcMapConversion"):
+                data = _map_data_from_conversion(op)
+            elif op.is_a("IfcRigidOperation"):
+                data = _map_data_from_rigid(op)
+            if data is None:
+                continue
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return data
+            if best_data is None:
+                best_data = data
+    return best_data
+
+
 
 # Absolute/world transform resolver (same signature used by process_usd)
 
@@ -939,6 +959,18 @@ def _map_conversion_to_np(conv) -> np.ndarray:
     mat[2, 3] = height
     return mat
 
+
+def _rigid_operation_to_np(op) -> np.ndarray:
+    """Build a 4x4 translation matrix from an IfcRigidOperation."""
+    tx = _as_float(getattr(op, "FirstCoordinate", 0.0), 0.0)
+    ty = _as_float(getattr(op, "SecondCoordinate", 0.0), 0.0)
+    tz = _as_float(getattr(op, "Height", 0.0), 0.0)
+    mat = np.eye(4, dtype=float)
+    mat[0, 3] = tx
+    mat[1, 3] = ty
+    mat[2, 3] = tz
+    return mat
+
 def _context_to_np(ctx) -> np.ndarray:
     """Compose nested representation contexts into a single matrix."""
     transform = np.eye(4, dtype=float)
@@ -952,11 +984,13 @@ def _context_to_np(ctx) -> np.ndarray:
         for op in getattr(current, "HasCoordinateOperation", None) or []:
             if op is None:
                 continue
-            if op.is_a("IfcMapConversion"):
-                try:
+            try:
+                if op.is_a("IfcMapConversion"):
                     transform = transform @ _map_conversion_to_np(op)
-                except Exception:
-                    continue
+                elif op.is_a("IfcRigidOperation"):
+                    transform = transform @ _rigid_operation_to_np(op)
+            except Exception:
+                continue
         current = getattr(current, "ParentContext", None)
     return transform
 
