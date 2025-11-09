@@ -47,6 +47,8 @@ __all__ = [
     "ConversionOptions",
     "CurveWidthRule",
     "ConversionManifest",
+    "set_stage_unit",
+    "set_stage_up_axis",
 ]
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
@@ -285,6 +287,70 @@ def set_stage_unit(target_path: PathLike, meters_per_unit: float = 1.0, *, offli
     _apply_stage_unit(raw_path, meters_per_unit)
 
 
+def _normalize_up_axis(axis: str | None) -> str:
+    axis_text = str(axis or "").strip().upper()
+    if axis_text not in {"X", "Y", "Z"}:
+        raise ValueError("--stage-up-axis must be one of X, Y, or Z.")
+    return axis_text
+
+
+def _apply_stage_up_axis(target_path: PathLike, axis: str) -> None:
+    from .pxr_utils import Sdf, Usd, UsdGeom
+
+    normalized_path = _normalize_stage_unit_target(target_path)
+    tokens = {
+        "X": UsdGeom.Tokens.x,
+        "Y": UsdGeom.Tokens.y,
+        "Z": UsdGeom.Tokens.z,
+    }
+    axis_token = tokens[axis]
+
+    stage = None
+    try:
+        stage = Usd.Stage.Open(normalized_path)
+    except Exception as exc:  # pragma: no cover - logging only
+        LOG.debug("Usd.Stage.Open failed for %s: %s", normalized_path, exc)
+        stage = None
+
+    if stage is not None:
+        UsdGeom.SetStageUpAxis(stage, axis_token)
+        root_layer = stage.GetRootLayer()
+        if root_layer is None:
+            raise ValueError(f"Stage {normalized_path} has no root layer to edit.")
+        root_layer.Save()
+        close = getattr(stage, "Close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # pragma: no cover - logging only
+                LOG.debug("stage.Close() failed for %s: %s", normalized_path, exc)
+        return
+
+    layer = Sdf.Layer.FindOrOpen(normalized_path)
+    if layer is None:
+        raise ValueError(f"Failed to open USD layer {normalized_path}")
+    layer.upAxis = axis
+    layer.Save()
+
+
+def set_stage_up_axis(
+    target_path: PathLike,
+    axis: str = "Y",
+    *,
+    offline: bool = False,
+) -> None:
+    """Update the up-axis metadata on an existing USD stage/layer."""
+
+    axis_norm = _normalize_up_axis(axis)
+    raw_path = str(target_path).strip() if target_path is not None else ""
+    if not raw_path:
+        raise ValueError("--set-stage-up-axis requires a target USD path.")
+    if offline and is_omniverse_path(raw_path):
+        raise ValueError("--offline cannot be combined with --set-stage-up-axis for omniverse:// targets.")
+    initialize_usd(offline=offline)
+    _apply_stage_up_axis(raw_path, axis_norm)
+
+
 # ---------------- CLI ----------------
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the standalone converter."""
@@ -369,6 +435,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Meters-per-unit value applied when using --set-stage-unit (must be >0, default: %(default)s).",
+    )
+    parser.add_argument(
+        "--set-stage-up-axis",
+        dest="set_stage_up_axis",
+        nargs="+",
+        action=_JoinPathAction,
+        default=None,
+        help=(
+            "Path to an existing USD layer/stage whose upAxis metadata should be updated. "
+            "When provided the command performs only this edit and skips IFC conversion."
+        ),
+    )
+    parser.add_argument(
+        "--stage-up-axis",
+        dest="stage_up_axis",
+        choices=("X", "Y", "Z", "x", "y", "z"),
+        default="Y",
+        help="Up-axis value applied when using --set-stage-up-axis (default: %(default)s).",
     )
     parser.add_argument(
         "--annotation-width-default",
@@ -1388,6 +1472,19 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             set_stage_unit(
                 args.set_stage_unit,
                 meters_per_unit=getattr(args, "stage_unit_value", 1.0),
+                offline=bool(getattr(args, "offline", False)),
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            shutdown_usd_context()
+            raise SystemExit(2) from exc
+        shutdown_usd_context()
+        return []
+    if getattr(args, "set_stage_up_axis", None):
+        try:
+            set_stage_up_axis(
+                args.set_stage_up_axis,
+                axis=getattr(args, "stage_up_axis", "Y"),
                 offline=bool(getattr(args, "offline", False)),
             )
         except ValueError as exc:

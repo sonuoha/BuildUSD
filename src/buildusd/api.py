@@ -20,6 +20,7 @@ from .main import (
     ConversionResult,
     convert as _convert,
     set_stage_unit as _set_stage_unit,
+    set_stage_up_axis as _set_stage_up_axis,
     OPTIONS as DEFAULT_CONVERSION_OPTIONS,
 )
 from .process_usd import apply_stage_anchor_transform
@@ -41,6 +42,7 @@ __all__ = [
     "apply_stage_anchor_transform",
     "convert",
     "set_stage_unit",
+    "set_stage_up_axis",
     "federate_stages",
     "DEFAULT_BASE_POINT",
     "DEFAULT_SHARED_BASE_POINT",
@@ -144,6 +146,17 @@ def set_stage_unit(
     """Expose the CLI stage-unit helper as a reusable API call."""
 
     _set_stage_unit(target_path, meters_per_unit, offline=offline)
+
+
+def set_stage_up_axis(
+    target_path: PathLike,
+    axis: str = "Y",
+    *,
+    offline: bool = False,
+) -> None:
+    """Expose the CLI stage up-axis helper as a reusable API call."""
+
+    _set_stage_up_axis(target_path, axis, offline=offline)
 
 
 @dataclass(frozen=True)
