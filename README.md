@@ -72,6 +72,8 @@ Usage (CLI)
   - python -m buildusd --input omniverse://server/Projects/IFC --all
 - Update meters-per-unit metadata on an existing USD stage/layer (no IFC conversion):
   - python -m buildusd --set-stage-unit "omniverse://server/Projects/file.usdc" --stage-unit-value 0.001
+- Update up-axis metadata on an existing USD stage/layer (no IFC conversion):
+  - python -m buildusd --set-stage-up-axis "omniverse://server/Projects/file.usdc" --stage-up-axis Z
 - Annotation curve widths:
   - python -m buildusd --input C:\\path\\to\\dir --annotation-width-default 15mm
   - python -m buildusd --input C:\\path\\to\\dir --annotation-width-rule width=0.02,layer=Survey*,curve=*Centerline*
@@ -89,6 +91,8 @@ Usage (Python)
 - convert("path/to/file.ifc", output_dir="data/output", checkpoint=True)  # omniverse:// required for checkpoints
 - from buildusd.api import set_stage_unit
 - set_stage_unit("omniverse://server/Projects/file.usdc", meters_per_unit=0.001)
+- from buildusd.api import set_stage_up_axis
+- set_stage_up_axis("omniverse://server/Projects/file.usdc", axis="Z")
 
 Outputs
 - Per-IFC stages and layers are written to data/output:
@@ -218,4 +222,3 @@ Examples
     - Extra heuristics keep thin vertical trims on their neutral frame colours, bias horizontal slabs (e.g. container roofs) toward saturated façade styles, and preserve aluminium handles when the raw IFC material already encodes them.
   - Because the reconciliation only ever reuses existing style tokens, downstream material bindings and instance overrides behave exactly as before, just with complete face coverage.
   - Toggle via `--enable-material-classification` (or `ConversionOptions(enable_material_classification=True)`) to switch between the legacy per-face material IDs and the enhanced component classifier.
-
