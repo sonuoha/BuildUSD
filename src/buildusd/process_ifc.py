@@ -27,6 +27,10 @@ from dataclasses import dataclass, field
 import hashlib
 
 from .ifc_visuals import PBRMaterial, build_material_for_product, extract_face_style_groups
+from . import occ_detail
+
+if TYPE_CHECKING:
+    from .occ_detail import OCCDetailMesh
 
 
 def _clone_materials(source):
@@ -158,6 +162,44 @@ def _apply_geom_settings(settings, overrides: Dict[str, Any]) -> None:
                 settings.set(alt_key, value)
             except Exception:
                 pass
+
+
+def _get_setting_float(settings, key: str, default: float) -> float:
+    """Return a float setting value (with dash/underscore tolerance)."""
+    if settings is None:
+        return float(default)
+    try:
+        if hasattr(settings, "get"):
+            value = settings.get(key)
+        else:
+            attr = key.replace("-", "_")
+            value = getattr(settings, attr, None)
+    except Exception:
+        value = None
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _build_detail_mesh_payload(shape_obj: Any, settings) -> Optional["OCCDetailMesh"]:
+    """Construct OCC face meshes for detail-mode geometry."""
+    if shape_obj is None or settings is None or not occ_detail.is_available():
+        return None
+    linear_def = _get_setting_float(settings, "mesher-linear-deflection", float(_BASE_GEOM_SETTINGS["mesher-linear-deflection"]))
+    angular_def = _get_setting_float(settings, "mesher-angular-deflection", float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"]))
+    try:
+        angular_rad = math.radians(float(angular_def))
+    except Exception:
+        angular_rad = math.radians(float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"]))
+    return occ_detail.build_detail_mesh(
+        shape_obj,
+        linear_deflection=float(linear_def),
+        angular_deflection_rad=angular_rad,
+        logger=log,
+    )
 
 
 def _settings_fingerprint(settings) -> str:
@@ -303,6 +345,7 @@ class MeshProto:
     style_face_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     count: int = 0
     style_material: Optional[PBRMaterial] = None
+    detail_mesh: Optional["OCCDetailMesh"] = None
 
 @dataclass
 class HashProto:
@@ -321,6 +364,7 @@ class HashProto:
     settings_fp: Optional[str] = None
     count: int = 0
     style_material: Optional[PBRMaterial] = None
+    detail_mesh: Optional["OCCDetailMesh"] = None
 
 @dataclass(frozen=True)
 class CurveWidthRule:
@@ -396,6 +440,7 @@ class InstanceRecord:
     guid: Optional[str] = None
     style_material: Optional[PBRMaterial] = None
     style_face_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    detail_mesh: Optional["OCCDetailMesh"] = None
 
 @dataclass
 class AnnotationCurve:
@@ -1339,6 +1384,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             )
         detail_reasons: List[str] = []
         detail_mode = "base"
+        detail_mesh_data: Optional["OCCDetailMesh"] = None
 
         needs_high_detail = False
         allow_brep_fallback = False
@@ -1375,6 +1421,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     materials = _clone_materials(getattr(remeshed, "materials", materials) or materials)
                     material_ids = list(getattr(remeshed, "material_ids", material_ids) or material_ids)
                     detail_mode = "high"
+                    detail_mesh_data = _build_detail_mesh_payload(remeshed, high_detail_settings)
                 else:
                     mesh_dict = mesh_dict_base
                     mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
@@ -1398,6 +1445,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     materials = _clone_materials(getattr(remeshed_brep, "materials", materials) or materials)
                     material_ids = list(getattr(remeshed_brep, "material_ids", material_ids) or material_ids)
                     detail_mode = "brep"
+                    detail_mesh_data = _build_detail_mesh_payload(remeshed_brep, high_detail_settings)
                 else:
                     detail_reasons.append("brep_fallback_empty_geometry")
                     mesh_dict = mesh_dict_base
@@ -1488,11 +1536,15 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 if not info.material_ids and material_ids: info.material_ids = list(material_ids)
                 if not info.style_face_groups and face_style_groups:
                     info.style_face_groups = _clone_style_groups(face_style_groups)
+                if info.detail_mesh is None and detail_mesh_data is not None:
+                    info.detail_mesh = detail_mesh_data
                 info.count = 0
 
             if info.mesh is not None and info.mesh_hash == mesh_hash and info.settings_fp == settings_fp_current:
                 info.count += 1; repmap_counts[type_id] += 1
                 primary_key = PrototypeKey(kind="repmap", identifier=type_id)
+            if info.detail_mesh is None and detail_mesh_data is not None:
+                info.detail_mesh = detail_mesh_data
 
         if primary_key is None:
             if options.enable_hash_dedup and mesh_hash is not None:
@@ -1512,6 +1564,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                         count=0,
                         style_material=style_material,
                         style_face_groups=_clone_style_groups(face_style_groups),
+                        detail_mesh=detail_mesh_data,
                     )
                     hashes[digest] = bucket
                 bucket.count += 1
@@ -1526,9 +1579,24 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     bucket.style_face_groups = _clone_style_groups(face_style_groups)
                 if bucket.canonical_frame is None and xf_tuple is not None and _is_affine_invertible_tuple(xf_tuple):
                     bucket.canonical_frame = xf_tuple
+                if bucket.detail_mesh is None and detail_mesh_data is not None:
+                    bucket.detail_mesh = detail_mesh_data
                 primary_key = PrototypeKey(kind="hash", identifier=digest)
             else:
                 instance_mesh = mesh_dict
+
+        detail_mesh_for_instance: Optional["OCCDetailMesh"] = detail_mesh_data
+        if primary_key is not None:
+            prototype_bucket = None
+            if primary_key.kind == "repmap":
+                prototype_bucket = repmaps.get(primary_key.identifier)
+            elif primary_key.kind == "hash":
+                prototype_bucket = hashes.get(primary_key.identifier)
+            if prototype_bucket is not None:
+                if detail_mesh_for_instance is None:
+                    detail_mesh_for_instance = prototype_bucket.detail_mesh
+        else:
+            detail_mesh_for_instance = detail_mesh_data
 
         if primary_key is None and instance_mesh is None:
             if not iterator.next(): break
@@ -1603,6 +1671,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             guid=guid,
             style_material=style_material,
             style_face_groups=_clone_style_groups(face_style_groups),
+            detail_mesh=detail_mesh_for_instance,
         )
 
         if not iterator.next(): break
