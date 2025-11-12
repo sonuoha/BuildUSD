@@ -16,7 +16,7 @@ from .io_utils import (
     path_suffix,
     read_text,
 )
-from .main import (
+from .conversion import (
     DEFAULT_BASE_POINT,
     DEFAULT_GEODETIC_CRS,
     DEFAULT_MASTER_STAGE,

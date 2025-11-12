@@ -229,6 +229,8 @@ _BREP_FALLBACK_CLASSES = {
     "IFCMEMBER",
 }
 
+_OCC_ALIGNMENT_THRESHOLD = 1.0  # metres; larger deltas suggest double transforms
+
 
 def _apply_geom_settings(settings, overrides: Dict[str, Any]) -> None:
     """Apply iterator settings while tolerating different schema naming conventions."""
@@ -241,6 +243,16 @@ def _apply_geom_settings(settings, overrides: Dict[str, Any]) -> None:
                 settings.set(alt_key, value)
             except Exception:
                 pass
+
+
+def _force_local_coordinates(settings) -> None:
+    """Ensure geometry is emitted relative to the IFC local placement."""
+    for key in ("use-world-coords", "USE_WORLD_COORDS"):
+        try:
+            settings.set(key, False)
+            return
+        except Exception:
+            continue
 
 
 def _enable_occ(settings) -> bool:
@@ -337,6 +349,35 @@ def _mesh_stats(mesh: Dict[str, Any]) -> Optional[Dict[str, float]]:
         "area": area,
         "area_per_face": area_per_face,
     }
+
+
+def _mesh_center(mesh: Optional[Dict[str, Any]]) -> Optional[np.ndarray]:
+    if not mesh:
+        return None
+    verts = mesh.get("vertices")
+    if verts is None or getattr(verts, "size", 0) == 0:
+        return None
+    try:
+        mins = np.min(verts, axis=0)
+        maxs = np.max(verts, axis=0)
+        return (mins + maxs) * 0.5
+    except Exception:
+        return None
+
+
+def _occ_mesh_misaligned(base_mesh: Optional[Dict[str, Any]], occ_mesh: Dict[str, Any]) -> bool:
+    """Return True when the OCC mesh looks geolocated relative to the base iterator mesh."""
+    if not base_mesh:
+        return False
+    base_center = _mesh_center(base_mesh)
+    occ_center = _mesh_center(occ_mesh)
+    if base_center is None or occ_center is None:
+        return False
+    try:
+        delta = float(np.linalg.norm(occ_center - base_center))
+    except Exception:
+        return False
+    return delta > _OCC_ALIGNMENT_THRESHOLD
 
 
 def round_tuple_list(xs: Iterable[Iterable[float]], tol: int = 9) -> Tuple[Tuple[float, ...], ...]:
@@ -546,11 +587,13 @@ class PrototypeBuildContext:
             if str(value).strip()
         }
 
-        detail_mode_requested = detail_scope in ("all", "object")
+        detail_mode_requested = detail_scope == "all"
         user_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
         enable_high_detail = user_high_detail or detail_mode_requested
         if not enable_high_detail:
             log.info("High-detail remeshing is DISABLED; using iterator tessellation only.")
+        if detail_scope == "object":
+            log.info("Detail scope 'object': iterator meshes stay in base mode; OCC detail applies only to requested ids.")
 
         settings = ifcopenshell.geom.settings()
         _apply_geom_settings(settings, _BASE_GEOM_SETTINGS)
@@ -614,6 +657,7 @@ class PrototypeBuildContext:
             try:
                 object_scope_settings = ifcopenshell.geom.settings()
                 _apply_geom_settings(object_scope_settings, _BASE_GEOM_SETTINGS)
+                _force_local_coordinates(object_scope_settings)
                 if not _enable_occ(object_scope_settings):
                     object_scope_settings = None
             except Exception:
@@ -5104,16 +5148,31 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                         len(faces_list),
                     )
             occ_mesh_dict = occ_detail.mesh_from_detail_mesh(detail_mesh_data)
-            if occ_mesh_dict is not None and (
-                mesh_dict is None
-                or "faces" not in mesh_dict
-                or mesh_dict["faces"].size == 0
-            ):
-                mesh_dict = occ_mesh_dict
-                mesh_dict_base = occ_mesh_dict
-                mesh_stats = _mesh_stats(occ_mesh_dict)
-                if detail_settings_obj is high_detail_settings and high_detail_settings is not None:
-                    settings_fp_current = settings_fp_high
+            if occ_mesh_dict is not None:
+                if _occ_mesh_misaligned(mesh_dict_base, occ_mesh_dict):
+                    base_center = _mesh_center(mesh_dict_base)
+                    occ_center = _mesh_center(occ_mesh_dict)
+                    delta_val = (
+                        float(np.linalg.norm(occ_center - base_center))
+                        if base_center is not None and occ_center is not None
+                        else float("nan")
+                    )
+                    log.warning(
+                        "Detail mode: OCC mesh appears geolocated (center delta %.2fm) for %s guid=%s; keeping iterator mesh.",
+                        delta_val,
+                        product_class_upper or product_class or "<unknown>",
+                        getattr(product, "GlobalId", None),
+                    )
+                elif (
+                    mesh_dict is None
+                    or "faces" not in mesh_dict
+                    or getattr(mesh_dict["faces"], "size", 0) == 0
+                ):
+                    mesh_dict = occ_mesh_dict
+                    mesh_dict_base = occ_mesh_dict
+                    mesh_stats = _mesh_stats(occ_mesh_dict)
+                    if detail_settings_obj is high_detail_settings and high_detail_settings is not None:
+                        settings_fp_current = settings_fp_high
 
         if mesh_dict is None:
             continue

@@ -10,44 +10,13 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Literal, Set, Cal
 import numpy as np
 import ifcopenshell
 
-try:
-    from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
-    from OCC.Core.IMeshTools import IMeshTools_Parameters
-    from OCC.Core.BRepCheck import BRepCheck_Analyzer
-    from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Sewing
-    from OCC.Core.ShapeFix import ShapeFix_Shape
-    from OCC.Core.Message import Message_ProgressRange
-    from OCC.Core.TopAbs import TopAbs_COMPOUND, TopAbs_COMPSOLID, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID
-    from OCC.Core.TopExp import TopExp_Explorer
-    from OCC.Core.TopoDS import TopoDS_Shape, topods_Face
-    from OCC.Core.TopLoc import TopLoc_Location
-    from OCC.Core.BRep import BRep_Tool
-    from OCC.Core.Bnd import Bnd_Box
-    from OCC.Core.BRepBndLib import brepbndlib_Add
-    from ifcopenshell.geom import occ_utils as _occ_utils
-
-    _HAVE_OCC = True
-except Exception:  # pragma: no cover - optional dependency
-    BRepMesh_IncrementalMesh = None  # type: ignore
-    IMeshTools_Parameters = None  # type: ignore
-    BRepCheck_Analyzer = None  # type: ignore
-    BRepBuilderAPI_Sewing = None  # type: ignore
-    ShapeFix_Shape = None  # type: ignore
-    Message_ProgressRange = None  # type: ignore
-    TopAbs_FACE = None  # type: ignore
-    TopAbs_SOLID = None  # type: ignore
-    TopAbs_COMPSOLID = None  # type: ignore
-    TopAbs_COMPOUND = None  # type: ignore
-    TopAbs_SHELL = None  # type: ignore
-    TopExp_Explorer = None  # type: ignore
-    TopoDS_Shape = None  # type: ignore
-    topods_Face = None  # type: ignore
-    TopLoc_Location = None  # type: ignore
-    BRep_Tool = None  # type: ignore
-    Bnd_Box = None  # type: ignore
-    brepbndlib_Add = None  # type: ignore
-    _occ_utils = None  # type: ignore
-    _HAVE_OCC = False
+from .occ_detail_bootstrap import (
+    bootstrap_occ,
+    is_available as _occ_bootstrap_available,
+    last_failure_reason as _occ_last_failure,
+    sym,
+    sym_optional,
+)
 
 log = logging.getLogger(__name__)
 
@@ -114,29 +83,19 @@ class OCCDetailMesh:
 
 
 def is_available() -> bool:
-    """
-    Return True when pythonocc + IfcOpenShell occ_utils are importable.
-    Uses a live check so it doesn't depend on earlier import order.
-    """
-    try:
-        from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh  # noqa: F401
-        from ifcopenshell.geom import occ_utils  # noqa: F401
-        return True
-    except Exception:
-        return False
+    """Return True once all OCC dependencies have been bootstrapped."""
+    return _occ_bootstrap_available()
 
 
 def why_unavailable() -> str:
     """Return a short reason if OCC detail isn't available."""
-    try:
-        from OCC.Core import BRepMesh as _chk_mesh_mod  # noqa: F401
-    except Exception as exc:
-        return f"OCC.Core import failed: {exc!r}"
-    try:
-        from ifcopenshell.geom import occ_utils as _chk_occ_utils  # noqa: F401
-    except Exception as exc:
-        return f"ifcopenshell.geom.occ_utils import failed: {exc!r}"
-    return "Unknown: imports succeed here; earlier cached state may have been False"
+    if is_available():
+        return "OCC bootstrap already complete"
+    bootstrap_occ(strict=False)
+    reason = _occ_last_failure()
+    if reason:
+        return "OCC bootstrap failed:\n  " + reason
+    return "OCC bootstrap failed: unknown reason (check logs)"
 
 
 
@@ -190,19 +149,17 @@ def _extract_topods_shape(shape_obj: Any, logger: Optional[logging.Logger] = Non
     """Best-effort conversion of ifcopenshell shapes to TopoDS_Shape."""
     if not is_available():
         return None
-    global _occ_utils
-    if _occ_utils is None:
-        try:
-            from ifcopenshell.geom import occ_utils as _occ_utils  # type: ignore  # noqa: F401
-        except Exception as exc:
-            if logger:
-                logger.debug("OCC detail: occ_utils import failed during extraction (%s)", exc)
-            return None
+    try:
+        occ_utils = sym("occ_utils")
+    except Exception as exc:
+        if logger:
+            logger.debug("OCC detail: occ_utils import failed during extraction (%s)", exc)
+        return None
     if _is_topods(shape_obj):
         return shape_obj
     for candidate in _iter_occ_candidates(shape_obj):
         try:
-            result = _occ_utils.create_shape_from_serialization(candidate)  # type: ignore[arg-type]
+            result = occ_utils.create_shape_from_serialization(candidate)  # type: ignore[arg-type]
         except Exception as exc:  # pragma: no cover - defensive
             if logger:
                 logger.debug("OCC serialization failed for %s: %s", type(candidate).__name__, exc)
@@ -238,49 +195,24 @@ def _is_topods(candidate: Any) -> bool:
         return False
     if not is_available():
         return False
-    if TopoDS_Shape is not None and isinstance(candidate, TopoDS_Shape):
+    try:
+        topo_cls = sym("TopoDS_Shape")
+    except Exception:
+        topo_cls = None
+    if topo_cls is not None and isinstance(candidate, topo_cls):
         return True
     return hasattr(candidate, "ShapeType") and hasattr(candidate, "IsNull") and callable(candidate.ShapeType)
 
 
-def _ensure_occ_components() -> bool:
-    if not is_available():
-        return False
-    missing = [
-        component is None
-        for component in (
-            BRepCheck_Analyzer,
-            ShapeFix_Shape,
-            BRepBuilderAPI_Sewing,
-            IMeshTools_Parameters,
-            BRepMesh_IncrementalMesh,
-        )
-    ]
-    if not any(missing):
-        return True
-    try:
-        from OCC.Core.BRepCheck import BRepCheck_Analyzer as _BRepCheck_Analyzer  # type: ignore
-        from OCC.Core.ShapeFix import ShapeFix_Shape as _ShapeFix_Shape  # type: ignore
-        from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Sewing as _BRepBuilderAPI_Sewing  # type: ignore
-        from OCC.Core.IMeshTools import IMeshTools_Parameters as _IMeshTools_Parameters  # type: ignore
-        from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh as _BRepMesh_IncrementalMesh  # type: ignore
-    except Exception as exc:
-        log.debug("Detail mesher: OCC re-import failed: %s", exc)
-        return False
-
-    globals()["BRepCheck_Analyzer"] = _BRepCheck_Analyzer
-    globals()["ShapeFix_Shape"] = _ShapeFix_Shape
-    globals()["BRepBuilderAPI_Sewing"] = _BRepBuilderAPI_Sewing
-    globals()["IMeshTools_Parameters"] = _IMeshTools_Parameters
-    globals()["BRepMesh_IncrementalMesh"] = _BRepMesh_IncrementalMesh
-    return True
-
-
 def _require_occ_components(ifc_entity=None) -> None:
-    if not _ensure_occ_components():
-        msg = f"Detail mesher unavailable: OCC bindings not loaded for {ifc_entity}"
+    if is_available():
+        return
+    try:
+        bootstrap_occ()
+    except ImportError as exc:
+        msg = f"Detail mesher unavailable: OCC bindings not loaded for {ifc_entity}: {exc}"
         log.error(msg)
-        raise RuntimeError(msg)
+        raise RuntimeError(msg) from exc
 
 
 _SHAPE_TYPE_NAMES = {
@@ -342,12 +274,24 @@ def _set_bool_flag(params, candidates: Tuple[str, ...], value: bool) -> None:
 
 
 def _shape_diagonal(shape: Any) -> float:
-    if not is_available() or Bnd_Box is None or brepbndlib_Add is None:
+    if not is_available():
         return 1.0
     try:
+        Bnd_Box = sym("Bnd_Box")
+        add_callable = None
+        try:
+            from OCC.Core import brepbndlib as _brepbndlib  # type: ignore
+
+            add_callable = getattr(_brepbndlib, "Add", None)
+        except Exception:
+            add_callable = None
+        if add_callable is None:
+            add_callable = sym_optional("brepbndlib_Add")
         box = Bnd_Box()
         box.SetGap(0.0)
-        brepbndlib_Add(shape, box)
+        if add_callable is None:
+            raise RuntimeError("brepbndlib Add helper unavailable")
+        add_callable(shape, box)
         xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
         dx = float(xmax - xmin)
         dy = float(ymax - ymin)
@@ -380,24 +324,16 @@ def safe_mesh_shape(
 
     _require_occ_components(ifc_entity)
 
-    missing_components = [
-        name
-        for name, component in (
-            ("BRepCheck_Analyzer", BRepCheck_Analyzer),
-            ("ShapeFix_Shape", ShapeFix_Shape),
-            ("BRepBuilderAPI_Sewing", BRepBuilderAPI_Sewing),
-            ("IMeshTools_Parameters", IMeshTools_Parameters),
-            ("BRepMesh_IncrementalMesh", BRepMesh_IncrementalMesh),
-        )
-        if component is None
-    ]
-    if missing_components:
-        msg = (
-            f"Detail mesher: OCC components {', '.join(missing_components)} missing; "
-            f"cannot mesh {ifc_entity}"
-        )
+    try:
+        BRepCheck_Analyzer = sym("BRepCheck_Analyzer")
+        ShapeFix_Shape = sym("ShapeFix_Shape")
+        BRepBuilderAPI_Sewing = sym("BRepBuilderAPI_Sewing")
+        IMeshTools_Parameters = sym("IMeshTools_Parameters")
+        BRepMesh_IncrementalMesh = sym("BRepMesh_IncrementalMesh")
+    except Exception as exc:
+        msg = f"Detail mesher: OCC components unavailable for {ifc_entity}: {exc}"
         active_log.error(msg)
-        raise RuntimeError(msg)
+        raise RuntimeError(msg) from exc
 
     try:
         analyzer = BRepCheck_Analyzer(occ_shape)
@@ -488,12 +424,15 @@ def _perform_meshing(
 
 def _collect_face_meshes(target_shape: Any, start_index: int, *, material_key: Optional[Any] = None) -> tuple[List[OCCFaceMesh], int]:
     """Collect OCCFaceMesh entries for every face in ``target_shape``."""
+    _require_occ_components()
+    TopExp_Explorer = sym("TopExp_Explorer")
+    TopAbs_FACE = sym("TopAbs_FACE")
     faces: List[OCCFaceMesh] = []
     face_index = start_index
     explorer = TopExp_Explorer(target_shape, TopAbs_FACE)
     while explorer.More():
         try:
-            face = topods_Face(explorer.Current())
+            face = explorer.Current()
         except Exception:
             explorer.Next()
             face_index += 1
@@ -510,47 +449,108 @@ def _collect_face_meshes(target_shape: Any, start_index: int, *, material_key: O
 
 
 def _triangulate_face(face: Any) -> Optional[OCCFaceMesh]:
+    TopLoc_Location = sym("TopLoc_Location")
+    BRep_Tool = sym("BRep_Tool")
     loc = TopLoc_Location()
     triangulation = BRep_Tool.Triangulation(face, loc)
     if triangulation is None:
         return None
-    nodes = triangulation.Nodes()
-    triangles = triangulation.Triangles()
-    if nodes is None or triangles is None or nodes.Length() == 0 or triangles.Length() == 0:
+
+    def _iter_nodes():
+        nodes_fn = getattr(triangulation, "Nodes", None)
+        if callable(nodes_fn):
+            nodes_handle = nodes_fn()
+            if nodes_handle is None:
+                return []
+            length = nodes_handle.Length()
+            return [nodes_handle.Value(i) for i in range(1, length + 1)]
+        nb_nodes_fn = getattr(triangulation, "NbNodes", None)
+        node_fn = getattr(triangulation, "Node", None)
+        if callable(nb_nodes_fn) and callable(node_fn):
+            length = int(nb_nodes_fn())
+            return [node_fn(i) for i in range(1, length + 1)]
+        return []
+
+    def _iter_triangles():
+        triangles_fn = getattr(triangulation, "Triangles", None)
+        if callable(triangles_fn):
+            triangles_handle = triangles_fn()
+            if triangles_handle is None:
+                return []
+            length = triangles_handle.Length()
+            return [triangles_handle.Value(i) for i in range(1, length + 1)]
+        nb_triangles_fn = getattr(triangulation, "NbTriangles", None)
+        triangle_fn = getattr(triangulation, "Triangle", None)
+        if callable(nb_triangles_fn) and callable(triangle_fn):
+            length = int(nb_triangles_fn())
+            return [triangle_fn(i) for i in range(1, length + 1)]
+        return []
+
+    node_points = _iter_nodes()
+    triangle_handles = _iter_triangles()
+    if not node_points or not triangle_handles:
         return None
+
     use_transform = hasattr(loc, "IsIdentity") and not loc.IsIdentity()
     transform = loc.Transformation() if use_transform else None
-    vertices = np.zeros((nodes.Length(), 3), dtype=np.float64)
-    for i in range(1, nodes.Length() + 1):
-        point = nodes.Value(i)
+    vertices = np.zeros((len(node_points), 3), dtype=np.float64)
+    for idx, point in enumerate(node_points):
         if transform is not None:
-            point = point.Transformed(transform)
-        vertices[i - 1, :] = (point.X(), point.Y(), point.Z())
-    faces_arr = np.zeros((triangles.Length(), 3), dtype=np.int32)
-    for tri_idx in range(1, triangles.Length() + 1):
-        tri = triangles.Value(tri_idx)
+            try:
+                point = point.Transformed(transform)
+            except Exception:
+                pass
+        vertices[idx, :] = (point.X(), point.Y(), point.Z())
+
+    faces_arr = np.zeros((len(triangle_handles), 3), dtype=np.int32)
+    for tri_idx, tri in enumerate(triangle_handles):
         try:
             i1, i2, i3 = tri.Get()
         except Exception:  # pragma: no cover - compatibility guard
             indices = [0, 0, 0]
-            tri.Get(indices)  # type: ignore[arg-type]
-            i1, i2, i3 = indices
-        faces_arr[tri_idx - 1, :] = (int(i1) - 1, int(i2) - 1, int(i3) - 1)
+            try:
+                tri.Get(indices)  # type: ignore[arg-type]
+                i1, i2, i3 = indices
+            except Exception:
+                continue
+        try:
+            faces_arr[tri_idx, :] = (int(i1) - 1, int(i2) - 1, int(i3) - 1)
+        except Exception:
+            continue
+
     return OCCFaceMesh(face_index=0, vertices=vertices, faces=faces_arr)
 
 
 def _primary_subshape_list(topo_shape: Any) -> List[tuple[str, Any]]:
     """Return a list of first-level subshapes (prefer solids, then shells, etc.)."""
     collected: List[tuple[str, Any]] = []
-    if hasattr(_occ_utils, "yield_subshapes"):
+    occ_utils = None
+    try:
+        occ_utils = sym("occ_utils")
+    except Exception:
+        occ_utils = None
+    if occ_utils is not None and hasattr(occ_utils, "yield_subshapes"):
+        type_buckets: Dict[str, List[tuple[str, Any]]] = {}
         try:
-            for index, subshape in enumerate(_occ_utils.yield_subshapes(topo_shape)):
+            for subshape in occ_utils.yield_subshapes(topo_shape):
                 shape_name = _shape_type_name(subshape)
                 if shape_name not in _DETAIL_TYPE_WHITELIST:
                     continue
-                collected.append((f"{shape_name}_{index}", subshape))
+                bucket = type_buckets.setdefault(shape_name, [])
+                bucket.append((f"{shape_name}_{len(bucket)}", subshape))
         except Exception as exc:
             log.debug("OCC detail: yield_subshapes failed (%s); falling back to TopExp iterator.", exc)
+        if type_buckets:
+            for preferred in ("SOLID", "COMPSOLID", "SHELL", "COMPOUND"):
+                entries = type_buckets.get(preferred)
+                if entries:
+                    collected.extend(entries)
+                    break
+            if not collected:
+                # Fallback to whichever bucket exists (preserves previous behaviour)
+                for entries in type_buckets.values():
+                    collected.extend(entries)
+                    break
     if collected:
         log.debug(
             "OCC detail: yield_subshapes produced %d subshapes for %s",
@@ -559,11 +559,21 @@ def _primary_subshape_list(topo_shape: Any) -> List[tuple[str, Any]]:
         )
         return collected
 
+    try:
+        top_abs_solid = sym("TopAbs_SOLID")
+        top_abs_compsolid = sym("TopAbs_COMPSOLID")
+        top_abs_shell = sym("TopAbs_SHELL")
+        top_abs_compound = sym("TopAbs_COMPOUND")
+        TopExp_Explorer = sym("TopExp_Explorer")
+    except Exception as exc:
+        log.debug("OCC detail: TopAbs/TopExp imports failed (%s)", exc)
+        return collected
+
     order = [
-        (TopAbs_SOLID, "Solid"),
-        (TopAbs_COMPSOLID, "CompositeSolid"),
-        (TopAbs_SHELL, "Shell"),
-        (TopAbs_COMPOUND, "Compound"),
+        (top_abs_solid, "Solid"),
+        (top_abs_compsolid, "CompositeSolid"),
+        (top_abs_shell, "Shell"),
+        (top_abs_compound, "Compound"),
     ]
     for top_abs, label in order:
         explorer = TopExp_Explorer(topo_shape, top_abs)
