@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from typing import Any, Sequence
+from typing import Sequence
 
 
 class _JoinPathAction(argparse.Action):
@@ -21,7 +21,7 @@ def parse_args(
     default_usd_format: str,
     default_usd_auto_binary_threshold_mb: float,
 ) -> argparse.Namespace:
-    """Build the CLI parser for the standalone converter."""
+    """Parse the CLI arguments for the standalone converter."""
 
     parser = argparse.ArgumentParser(description="Convert IFC to USD")
     parser.add_argument(

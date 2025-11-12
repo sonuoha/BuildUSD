@@ -13,6 +13,7 @@ from .conversion import (
     ConversionResult,
     CurveWidthRule,
     convert,
+    main as _conversion_main,
     parse_args,
     set_stage_unit,
     set_stage_up_axis,
@@ -22,6 +23,7 @@ __all__ = [
     "ConversionCancelledError",
     "ConversionResult",
     "convert",
+    "main",
     "parse_args",
     "ConversionOptions",
     "CurveWidthRule",
@@ -29,3 +31,7 @@ __all__ = [
     "set_stage_unit",
     "set_stage_up_axis",
 ]
+
+
+def main(argv=None):
+    return _conversion_main(argv)

@@ -28,6 +28,7 @@ from .io_utils import (
     read_text,
     stat_entry,
 )
+from .occ_detail_bootstrap import bootstrap_occ
 from .process_ifc import ConversionOptions, CurveWidthRule, build_prototypes
 from .process_usd import (
     apply_stage_anchor_transform,
@@ -90,6 +91,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         usd_format_choices=USD_FORMAT_CHOICES,
         default_usd_format=DEFAULT_USD_FORMAT,
         default_usd_auto_binary_threshold_mb=DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB,
+    )
+
+
+def _detail_features_requested(args: argparse.Namespace) -> bool:
+    """Return True when any CLI knob requires OCC detail meshing."""
+
+    if args is None:
+        return False
+    scope = getattr(args, "detail_scope", None)
+    scope_requested = scope is not None and scope.lower() != "none"
+    return any(
+        (
+            getattr(args, "detail_mode", False),
+            scope_requested,
+            bool(getattr(args, "detail_level", None)),
+            bool(getattr(args, "detail_object_ids", None)),
+            bool(getattr(args, "detail_object_guids", None)),
+        )
     )
 
 
@@ -1357,6 +1376,16 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         LOG.info("Loaded %d annotation width rule(s).", len(width_rules))
         for idx, rule in enumerate(width_rules, start=1):
             LOG.debug("Annotation width rule %d: %s", idx, rule)
+    detail_requested = _detail_features_requested(args)
+    if detail_requested:
+        LOG.info("Detail pipeline requested; verifying OCC runtime...")
+        try:
+            bootstrap_occ()
+        except ImportError as exc:
+            print(f"Error: OCC detail runtime unavailable: {exc}", file=sys.stderr)
+            shutdown_usd_context()
+            raise SystemExit(2) from exc
+        LOG.info("OCC detail runtime ready.")
     cli_anchor_mode = _normalize_anchor_mode(getattr(args, "anchor_mode", None))
     options_override = OPTIONS
     if width_rules:

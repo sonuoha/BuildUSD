@@ -15,7 +15,7 @@ from .federate import (
     federate_stages as _federate_stages,
 )
 from .io_utils import is_omniverse_path
-from .main import (
+from .conversion import (
     ConversionOptions,
     ConversionResult,
     convert as _convert,
