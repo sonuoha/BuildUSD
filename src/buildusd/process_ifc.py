@@ -129,6 +129,9 @@ _HIGH_DETAIL_OVERRIDES: Dict[str, Any] = {
     "mesher-angular-deflection": 0.2,
 }
 
+_DEFAULT_LINEAR_DEF = float(_BASE_GEOM_SETTINGS["mesher-linear-deflection"])
+_DEFAULT_ANGULAR_DEF = float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"])
+
 _HIGH_DETAIL_CLASSES = {
     "IFCSTAIR",
     "IFCSTAIRFLIGHT",
@@ -145,12 +148,6 @@ _BREP_FALLBACK_CLASSES = {
     "IFCPLATE",
     "IFCMEMBER",
 }
-
-_PROXY_SHORT_DIM_THRESHOLD = 0.06  # metres
-_PROXY_SLENDER_RATIO = 40.0
-_PROXY_SMALL_DIAGONAL = 3.0
-_PROXY_FACE_COUNT_THRESHOLD = 120
-_PROXY_AREA_PER_FACE_THRESHOLD = 0.02
 
 
 def _apply_geom_settings(settings, overrides: Dict[str, Any]) -> None:
@@ -189,384 +186,6 @@ def _enable_occ(settings) -> bool:
         )
         _OCC_WARNING_EMITTED = True
     return False
-
-
-def _get_setting_float(settings, key: str, default: float) -> float:
-    """Return a float setting value (with dash/underscore tolerance)."""
-    if settings is None:
-        return float(default)
-    try:
-        if hasattr(settings, "get"):
-            value = settings.get(key)
-        else:
-            attr = key.replace("-", "_")
-            value = getattr(settings, attr, None)
-    except Exception:
-        value = None
-    if value is None:
-        return float(default)
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _build_detail_mesh_payload(shape_obj: Any, settings, *, product=None) -> Optional["OCCDetailMesh"]:
-    """Construct OCC face meshes for detail-mode geometry.
-
-    When iterator geometry lacks embedded OCC data, fall back to the per-item
-    OpenCascade extraction validated in the pyocc test harness.
-    """
-    if settings is None or not occ_detail.is_available():
-        return None
-    if shape_obj is None and product is None:
-        return None
-    linear_def = _get_setting_float(
-        settings,
-        "mesher-linear-deflection",
-        float(_BASE_GEOM_SETTINGS["mesher-linear-deflection"]),
-    )
-    angular_def = _get_setting_float(
-        settings,
-        "mesher-angular-deflection",
-        float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"]),
-    )
-    try:
-        angular_rad = math.radians(float(angular_def))
-    except Exception:
-        angular_rad = math.radians(float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"]))
-
-    detail_mesh: Optional["OCCDetailMesh"] = None
-
-    def _run_occ_detail(source_obj, source_label: str) -> Optional["OCCDetailMesh"]:
-        if source_obj is None:
-            return None
-        detail = occ_detail.build_detail_mesh(
-            source_obj,
-            linear_deflection=float(linear_def),
-            angular_deflection_rad=angular_rad,
-            logger=log,
-        )
-        if detail is None:
-            log.debug(
-                "Detail mode: OCC meshing returned no faces for %s source of %s (guid=%s).",
-                source_label,
-                product_name(product) if product is not None else "<unknown>",
-                getattr(product, "GlobalId", None) if product is not None else "<n/a>",
-            )
-        return detail
-
-    if shape_obj is not None:
-        detail_mesh = _run_occ_detail(shape_obj, "iterator")
-
-    if detail_mesh is None and product is not None:
-        product_occ_shape = _create_occ_product_shape(settings, product)
-        detail_mesh = _run_occ_detail(product_occ_shape, "product")
-
-    if detail_mesh is None and product is not None:
-        detail_mesh = _build_representation_detail_mesh(
-            product,
-            settings,
-            float(linear_def),
-            angular_rad,
-        )
-        if detail_mesh is not None:
-            log.debug(
-                "OCC detail: fallback per-representation extraction succeeded for %s (guid=%s)",
-                getattr(product, "is_a", lambda: type(product).__name__)(),
-                getattr(product, "GlobalId", None),
-            )
-    if detail_mesh is None:
-        target_name = type(shape_obj).__name__ if shape_obj is not None else "IfcProduct"
-        log.debug("OCC detail: no mesh generated for %s", target_name)
-        return None
-
-    subshape_count = len(getattr(detail_mesh, "subshapes", []) or [])
-    face_total = detail_mesh.face_count if hasattr(detail_mesh, "face_count") else 0
-    log.debug(
-        "OCC detail: generated %d subshape mesh(es) totalling %s faces for %s",
-        subshape_count,
-        face_total,
-        type(shape_obj).__name__ if shape_obj is not None else "IfcProduct",
-    )
-    return detail_mesh
-
-
-def _build_representation_detail_mesh(product, settings, linear_def: float, angular_rad: float):
-    """Fallback OCC extraction that tessellates each representation item directly."""
-    representation = getattr(product, "Representation", None)
-    if representation is None:
-        return None
-    item_meshes: List["OCCDetailMesh"] = []
-    for rep_index, item_index, item in _iter_representation_items(product):
-        detail_mesh = _detail_mesh_for_item(
-            item,
-            settings,
-            linear_def,
-            angular_rad,
-            product=product,
-            rep_index=rep_index,
-            item_index=item_index,
-        )
-        if detail_mesh is None:
-            continue
-        _annotate_detail_subshapes(detail_mesh, product, rep_index, item_index, item)
-        item_meshes.append(detail_mesh)
-    if not item_meshes:
-        return None
-    if len(item_meshes) == 1:
-        _normalize_detail_indices(item_meshes[0])
-        return item_meshes[0]
-    return _merge_detail_meshes(item_meshes)
-
-
-def _iter_representation_items(product):
-    representation = getattr(product, "Representation", None)
-    if representation is None:
-        return
-    reps = getattr(representation, "Representations", None) or []
-    for rep_index, rep in enumerate(reps):
-        if rep is None:
-            continue
-        items = getattr(rep, "Items", None) or []
-        for item_index, item in enumerate(items):
-            if item is None:
-                continue
-            yield rep_index, item_index, item
-
-
-def _describe_rep_item(item) -> str:
-    if item is None:
-        return "<None>"
-    name = getattr(item, "Name", None)
-    type_name = item.is_a() if hasattr(item, "is_a") else type(item).__name__
-    try:
-        step_id = item.id()
-    except Exception:
-        step_id = getattr(item, "id", lambda: None)()
-    label = f"{type_name}"
-    if name:
-        label += f":{name}"
-    if step_id is not None:
-        label += f"#{step_id}"
-    return label
-
-
-def product_name(product) -> str:
-    if product is None:
-        return "<product>"
-    return getattr(product, "Name", None) or getattr(product, "GlobalId", None) or (
-        product.is_a() if hasattr(product, "is_a") else "<product>"
-    )
-
-
-def _detail_mesh_for_item(
-    item,
-    settings,
-    linear_def: float,
-    angular_rad: float,
-    *,
-    product=None,
-    rep_index: Optional[int] = None,
-    item_index: Optional[int] = None,
-):
-    if item is None:
-        return None
-    occ_source = _create_occ_shape(
-        settings,
-        item,
-        product=product,
-        rep_index=rep_index,
-        item_index=item_index,
-    )
-    if occ_source is None:
-        return None
-    detail_mesh = occ_detail.build_detail_mesh(
-        occ_source,
-        linear_deflection=float(linear_def),
-        angular_deflection_rad=float(angular_rad),
-        logger=log,
-    )
-    if detail_mesh is None:
-        log.debug(
-            "Detail mode: OCC tessellation yielded no faces for product=%s step=%s item=%s rep=%s/%s",
-            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
-            getattr(product, "id", lambda: None)(),
-            _describe_rep_item(item),
-            rep_index,
-            item_index,
-        )
-    else:
-        subshape_count = len(getattr(detail_mesh, "subshapes", None) or [])
-        log.debug(
-            "Detail mode: OCC tessellation succeeded for product=%s step=%s item=%s rep=%s/%s subshapes=%d",
-            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
-            getattr(product, "id", lambda: None)(),
-            _describe_rep_item(item),
-            rep_index,
-            item_index,
-            subshape_count,
-        )
-    return detail_mesh
-
-
-def _create_occ_shape(
-    settings,
-    element,
-    *,
-    product=None,
-    rep_index: Optional[int] = None,
-    item_index: Optional[int] = None,
-):
-    try:
-        shape_obj = ifcopenshell.geom.create_shape(settings, element)
-    except Exception as exc:
-        step_id = None
-        try:
-            step_id = element.id()
-        except Exception:
-            step_id = getattr(element, "id", lambda: None)()
-        log.debug(
-            "Detail OCC fallback: create_shape failed for product=%s step=%s item=%s rep=%s/%s error=%s",
-            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
-            getattr(product, "id", lambda: None)(),
-            _describe_rep_item(element),
-            rep_index,
-            item_index,
-            exc,
-        )
-        return None
-    geometry = getattr(shape_obj, "geometry", shape_obj)
-    if not geometry:
-        log.debug(
-            "Detail OCC fallback: create_shape returned empty geometry for product=%s item=%s rep=%s/%s",
-            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
-            _describe_rep_item(element),
-            rep_index,
-            item_index,
-        )
-    return geometry or shape_obj
-
-
-def _create_occ_product_shape(settings, product):
-    try:
-        shape_obj = ifcopenshell.geom.create_shape(
-            settings,
-            product,
-        )
-    except Exception as exc:
-        log.debug(
-            "Detail OCC product fallback failed for guid=%s: %s",
-            getattr(product, "GlobalId", None),
-            exc,
-        )
-        return None
-    geometry = getattr(shape_obj, "geometry", shape_obj)
-    if not geometry:
-        log.debug(
-            "Detail OCC product fallback returned empty geometry for guid=%s",
-            getattr(product, "GlobalId", None),
-        )
-    return geometry or shape_obj
-
-
-def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index: int, item):
-    """Tag OCC subshape labels so downstream USD meshes remain traceable."""
-    subshapes = getattr(detail_mesh, "subshapes", None) or []
-    if not subshapes:
-        return
-    product_label = getattr(product, "GlobalId", None) or getattr(product, "Name", None) or product.is_a()
-    item_name = getattr(item, "Name", None) or (item.is_a() if hasattr(item, "is_a") else f"Item{item_index}")
-    prefix = f"{product_label}_rep{rep_index}_item{item_index}_{item_name}"
-    for local_index, subshape in enumerate(subshapes):
-        current = getattr(subshape, "label", f"Subshape_{local_index}")
-        subshape.label = f"{prefix}_{current}"
-
-
-def _normalize_detail_indices(detail_mesh):
-    subshapes = getattr(detail_mesh, "subshapes", None) or []
-    for idx, subshape in enumerate(subshapes):
-        subshape.index = idx
-
-
-def _merge_detail_meshes(meshes: List["OCCDetailMesh"]) -> Optional["OCCDetailMesh"]:
-    combined: List["occ_detail.OCCSubshapeMesh"] = []
-    for mesh in meshes:
-        for subshape in getattr(mesh, "subshapes", None) or []:
-            label = getattr(subshape, "label", None) or f"Subshape_{len(combined)}"
-            combined.append(
-                occ_detail.OCCSubshapeMesh(
-                    index=len(combined),
-                    label=label,
-                    shape_type=getattr(subshape, "shape_type", "UNKNOWN"),
-                    faces=list(getattr(subshape, "faces", []) or []),
-                )
-            )
-    if not combined:
-        return None
-    return occ_detail.OCCDetailMesh(shape=None, subshapes=combined)
-
-
-def _mesh_from_detail_mesh(detail_mesh: Optional["OCCDetailMesh"]) -> Optional[Dict[str, Any]]:
-    """Flatten OCC detail meshes into the standard vertex/face dict used by proto pipeline."""
-    if detail_mesh is None:
-        return None
-    faces = getattr(detail_mesh, "faces", None) or []
-    if not faces:
-        subshapes = getattr(detail_mesh, "subshapes", None) or []
-        for entry in subshapes:
-            faces.extend(getattr(entry, "faces", None) or [])
-        if not faces:
-            return None
-    vert_arrays: List[np.ndarray] = []
-    face_arrays: List[np.ndarray] = []
-    offset = 0
-    for face in faces:
-        verts = np.asarray(getattr(face, "vertices", None), dtype=np.float64)
-        tris = np.asarray(getattr(face, "faces", None), dtype=np.int64)
-        if verts.size == 0 or tris.size == 0:
-            continue
-        vert_arrays.append(verts)
-        face_arrays.append(tris + offset)
-        offset += verts.shape[0]
-    if not vert_arrays or not face_arrays:
-        return None
-    try:
-        vertices = np.vstack(vert_arrays)
-        faces_arr = np.vstack(face_arrays)
-    except Exception:
-        return None
-    return {"vertices": vertices, "faces": faces_arr}
-
-
-def _precompute_detail_meshes(ifc, settings) -> Dict[int, "OCCDetailMesh"]:
-    """Precompute OCC detail meshes for every product (detail-mode prepass)."""
-    cache: Dict[int, "OCCDetailMesh"] = {}
-    if settings is None or not occ_detail.is_available():
-        return cache
-    products = ifc.by_type("IfcProduct") or []
-    total = 0
-    for product in products:
-        total += 1
-        try:
-            product_id = int(product.id())
-        except Exception:
-            product_id = None
-        if product_id is None:
-            continue
-        detail_mesh = _build_detail_mesh_payload(
-            None,
-            settings,
-            product=product,
-        )
-        if detail_mesh is not None:
-            cache[product_id] = detail_mesh
-    log.info(
-        "Detail prepass: cached OCC meshes for %d / %d product(s).",
-        len(cache),
-        total,
-    )
-    return cache
 
 
 def _settings_fingerprint(settings) -> str:
@@ -638,33 +257,6 @@ def _mesh_stats(mesh: Dict[str, Any]) -> Optional[Dict[str, float]]:
         "area": area,
         "area_per_face": area_per_face,
     }
-
-
-def _proxy_requires_high_detail(stats: Dict[str, float]) -> Tuple[bool, List[str]]:
-    reasons: List[str] = []
-    face_count = int(stats.get("face_count", 0))
-    if face_count <= 0:
-        return False, reasons
-    shortest = float(stats.get("shortest", 0.0))
-    longest = float(stats.get("longest", 0.0))
-    diagonal = float(stats.get("diagonal", 0.0))
-    area_per_face = float(stats.get("area_per_face", 0.0))
-
-    thin = shortest <= _PROXY_SHORT_DIM_THRESHOLD
-    slender = shortest > 0.0 and longest / max(shortest, 1e-6) >= _PROXY_SLENDER_RATIO
-    small = diagonal <= _PROXY_SMALL_DIAGONAL
-    sparse = face_count <= _PROXY_FACE_COUNT_THRESHOLD or area_per_face >= _PROXY_AREA_PER_FACE_THRESHOLD
-
-    if thin and slender:
-        reasons.append(
-            f"slender (shortest={shortest:.3f}m longest={longest:.3f}m)"
-        )
-    if small and sparse:
-        reasons.append(
-            f"small_sparse (diag={diagonal:.3f}m faces={face_count} area/face={area_per_face:.4f})"
-        )
-
-    return (len(reasons) > 0), reasons
 
 
 def round_tuple_list(xs: Iterable[Iterable[float]], tol: int = 9) -> Tuple[Tuple[float, ...], ...]:
@@ -875,7 +467,13 @@ class PrototypeBuildContext:
         detail_mesh_cache: Dict[int, "OCCDetailMesh"] = {}
         if enable_high_detail and occ_detail.is_available():
             detail_prepass_settings = high_detail_settings or settings
-            detail_mesh_cache = _precompute_detail_meshes(ifc_file, detail_prepass_settings)
+            detail_mesh_cache = occ_detail.precompute_detail_meshes(
+                ifc_file,
+                detail_prepass_settings,
+                default_linear_def=_DEFAULT_LINEAR_DEF,
+                default_angular_def=_DEFAULT_ANGULAR_DEF,
+                logger=log,
+            )
 
         settings_fp_base = _settings_fingerprint(settings)
         if enable_high_detail and high_detail_settings is not None:
@@ -2364,7 +1962,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             and product_class_upper == "IFCBUILDINGELEMENTPROXY"
             and mesh_stats is not None
         ):
-            proxy_needs_high_detail, proxy_reasons = _proxy_requires_high_detail(mesh_stats)
+            proxy_needs_high_detail, proxy_reasons = occ_detail.proxy_requires_high_detail(mesh_stats)
             if proxy_needs_high_detail:
                 needs_high_detail = True
                 detail_reasons.extend(proxy_reasons)
@@ -2418,10 +2016,13 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
 
         if enable_high_detail and detail_mesh_data is None:
             detail_settings_obj = high_detail_settings or settings
-            detail_mesh_data = _build_detail_mesh_payload(
+            detail_mesh_data = occ_detail.build_detail_mesh_payload(
                 detail_source_obj,
                 detail_settings_obj,
                 product=product,
+                default_linear_def=_DEFAULT_LINEAR_DEF,
+                default_angular_def=_DEFAULT_ANGULAR_DEF,
+                logger=log,
             )
             if detail_mesh_data is None:
                 log.debug(
@@ -2456,7 +2057,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                         shape_type,
                         len(faces_list),
                     )
-            occ_mesh_dict = _mesh_from_detail_mesh(detail_mesh_data)
+            occ_mesh_dict = occ_detail.mesh_from_detail_mesh(detail_mesh_data)
             if occ_mesh_dict is not None and (
                 mesh_dict is None
                 or "faces" not in mesh_dict
