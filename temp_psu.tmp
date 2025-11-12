@@ -509,43 +509,6 @@ def _face_area_and_normal(points: Sequence[Tuple[float, float, float]], face_ver
     return float(area), (float(normal[0]), float(normal[1]), float(normal[2]))
 
 
-def _prepare_face_geometry(
-    points: Sequence[Tuple[float, float, float]],
-    face_vertices: Sequence[Sequence[int]],
-) -> _FaceGeometry:
-    """Pre-compute normals, centroids, and plane offsets for faces."""
-    face_count = len(face_vertices)
-    normals = np.zeros((face_count, 3), dtype=np.float64)
-    centroids = np.zeros((face_count, 3), dtype=np.float64)
-    areas = np.zeros(face_count, dtype=np.float64)
-    plane_d = np.zeros(face_count, dtype=np.float64)
-    bbox_min = np.full((face_count, 3), np.inf, dtype=np.float64)
-    bbox_max = np.full((face_count, 3), -np.inf, dtype=np.float64)
-
-    for idx, verts in enumerate(face_vertices):
-        area, normal = _face_area_and_normal(points, verts)
-        areas[idx] = area
-        normals[idx] = np.asarray(normal, dtype=np.float64)
-        if verts:
-            coords = np.asarray([points[v] for v in verts], dtype=np.float64)
-            centroid = np.mean(coords, axis=0)
-            centroids[idx] = centroid
-            plane_d[idx] = float(np.dot(normals[idx], centroid))
-            bbox_min[idx] = coords.min(axis=0)
-            bbox_max[idx] = coords.max(axis=0)
-        else:
-            centroids[idx] = 0.0
-            plane_d[idx] = 0.0
-    return _FaceGeometry(
-        normals=normals,
-        centroids=centroids,
-        areas=areas,
-        plane_d=plane_d,
-        bbox_min=bbox_min,
-        bbox_max=bbox_max,
-    )
-
-
 def _color_from_material(material: Any) -> Optional[Tuple[float, float, float]]:
     def _try_get(obj: Any, *names: str) -> Optional[Any]:
         for name in names:
@@ -655,11 +618,11 @@ def _resolve_component_styles(
     face_vertex_indices: Optional[Sequence[int]] = None,
     materials: Optional[Sequence[Any]] = None,
     cluster_styles: bool = False,
-) -> Tuple[Dict[str, List[int]], Dict[str, str], Dict[str, str]]:
-    """Return mapping of style tokens to face indices (and cluster base map)."""
+) -> Dict[str, List[int]]:
+    """Return mapping of style tokens to face indices covering entire mesh."""
     face_count = len(material_ids)
     if not face_count or not style_tokens:
-        return {}, {}, {}
+        return {}, {}
 
     if (
         points is None
@@ -676,7 +639,7 @@ def _resolve_component_styles(
             faces = [int(idx) for idx in (entry.get("faces") or []) if 0 <= int(idx) < face_count]
             if faces:
                 result[token] = faces
-        return result, {}, {}
+        return result, {}
 
     style_color_map: Dict[str, Optional[Tuple[float, float, float]]] = {}
     for key, entry in style_groups.items():
@@ -735,40 +698,9 @@ def _resolve_component_styles(
         material_id: token for material_id, (token, _) in material_style_stats.items()
     }
 
-    material_color_cache: Dict[int, Optional[Tuple[float, float, float]]] = {}
-
-    def _material_color_for_id(material_id: int) -> Optional[Tuple[float, float, float]]:
-        if material_id in material_color_cache:
-            return material_color_cache[material_id]
-        color: Optional[Tuple[float, float, float]] = None
-        if materials is not None:
-            try:
-                mat = None
-                if isinstance(materials, dict):
-                    mat = materials.get(material_id)
-                    if mat is None:
-                        mat = materials.get(str(material_id))
-                else:
-                    if 0 <= material_id < len(materials):
-                        mat = materials[material_id]
-                if mat is not None:
-                    color = _color_from_material(mat)
-            except Exception:
-                color = None
-        material_color_cache[material_id] = color
-        return color
-
     face_vertices, adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
-    face_geometry = _prepare_face_geometry(points, face_vertices)
-    face_normals = face_geometry.normals
-    face_centroids = face_geometry.centroids
-    face_areas = face_geometry.areas
-    face_plane_d = face_geometry.plane_d
-    face_bbox_min = face_geometry.bbox_min
-    face_bbox_max = face_geometry.bbox_max
 
     face_styles: List[Optional[str]] = [None] * face_count
-    face_directions: List[Optional[str]] = [None] * face_count
     for key, entry in style_groups.items():
         token = style_tokens.get(key)
         if not token:
@@ -787,13 +719,10 @@ def _resolve_component_styles(
         for face_index, token in enumerate(face_styles):
             if token is None:
                 continue
-            area = float(face_areas[face_index])
-            if area <= 1e-9:
+            area, normal = _face_area_and_normal(points, face_vertices[face_index])
+            if area <= 0.0:
                 continue
-            normal_vec = np.asarray(face_normals[face_index], dtype=np.float64)
-            if normal_vec.size != 3:
-                continue
-            vec = normal_vec * area
+            vec = np.asarray(normal, dtype=np.float64) * area
             if token in style_normals:
                 style_normals[token] += vec
                 style_area_map[token] = style_area_map.get(token, 0.0) + area
@@ -836,7 +765,6 @@ def _resolve_component_styles(
         normal_acc = np.zeros(3, dtype=np.float64)
         bounds_min = np.full(3, np.inf)
         bounds_max = np.full(3, -np.inf)
-        bbox_initialized = False
         style_presence: Dict[str, int] = defaultdict(int)
         neighbor_styles: Dict[str, int] = defaultdict(int)
         centroid_sum = np.zeros(3, dtype=np.float64)
@@ -852,30 +780,25 @@ def _resolve_component_styles(
                 continue
             visited[face_idx] = True
             faces_in_component.append(face_idx)
-            face_area = float(face_areas[face_idx])
-            normal_vec_np = np.asarray(face_normals[face_idx], dtype=np.float64)
-            centroid_vec = np.asarray(face_centroids[face_idx], dtype=np.float64)
-            if face_area > 1e-9 and normal_vec_np.size == 3:
+            verts = face_vertices[face_idx]
+            if points is not None:
+                face_area, normal = _face_area_and_normal(points, verts)
                 area += face_area
+                normal_vec_np = np.asarray(normal, dtype=np.float64)
                 normal_acc += normal_vec_np * face_area
-                centroid_sum += centroid_vec * face_area
+                tri_points = np.asarray([points[v] for v in verts], dtype=np.float64)
+                tri_centroid = tri_points.mean(axis=0)
+                centroid_sum += tri_centroid * face_area
                 centroid_weight += face_area
                 face_metrics.append((face_area, normal_vec_np))
                 face_details[face_idx] = {
                     "area": face_area,
                     "normal": normal_vec_np,
-                    "centroid": centroid_vec,
+                    "centroid": tri_centroid,
                 }
-            bbox_face_min = face_bbox_min[face_idx]
-            bbox_face_max = face_bbox_max[face_idx]
-            if np.isfinite(bbox_face_min).all() and np.isfinite(bbox_face_max).all():
-                if not bbox_initialized:
-                    bounds_min = np.array(bbox_face_min, copy=True)
-                    bounds_max = np.array(bbox_face_max, copy=True)
-                    bbox_initialized = True
-                else:
-                    bounds_min = np.minimum(bounds_min, bbox_face_min)
-                    bounds_max = np.maximum(bounds_max, bbox_face_max)
+                for point in tri_points:
+                    bounds_min = np.minimum(bounds_min, point)
+                    bounds_max = np.maximum(bounds_max, point)
             token = face_styles[face_idx]
             if token:
                 style_presence[token] += 1
@@ -889,9 +812,6 @@ def _resolve_component_styles(
 
         if not faces_in_component:
             continue
-        if not bbox_initialized:
-            bounds_min = np.zeros(3, dtype=np.float64)
-            bounds_max = np.zeros(3, dtype=np.float64)
         if np.linalg.norm(normal_acc) > 0.0:
             normal_acc = normal_acc / np.linalg.norm(normal_acc)
 
@@ -901,8 +821,8 @@ def _resolve_component_styles(
 
         if centroid_weight > 0.0:
             centroid = centroid_sum / centroid_weight
-        elif faces_in_component:
-            centroid = np.asarray(face_centroids[faces_in_component[0]], dtype=np.float64)
+        elif points is not None and faces_in_component:
+            centroid = np.asarray(points[face_vertices[faces_in_component[0]][0]], dtype=np.float64)
         else:
             centroid = np.zeros(3, dtype=np.float64)
 
@@ -945,7 +865,12 @@ def _resolve_component_styles(
     def _style_fallback_for_material(material_id: int) -> Optional[str]:
         best_token: Optional[str] = None
         best_distance = float("inf")
-        base_color = _material_color_for_id(material_id)
+        base_color = None
+        try:
+            if materials and 0 <= material_id < len(materials):
+                base_color = _color_from_material(materials[material_id])
+        except Exception:
+            base_color = None
         preferred_token = material_style_lookup.get(material_id)
         if base_color is None and preferred_token is not None:
             return preferred_token
@@ -1027,23 +952,23 @@ def _resolve_component_styles(
 
         for face_idx in subset_faces:
             detail = face_details.get(face_idx)
+            verts = face_vertices[face_idx]
+            tri_points = np.asarray([points[v] for v in verts], dtype=np.float64)
+            bounds_min = np.minimum(bounds_min, tri_points.min(axis=0))
+            bounds_max = np.maximum(bounds_max, tri_points.max(axis=0))
+
             if detail:
                 face_area = float(detail.get("area", 0.0))
                 normal_vec_np = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
-                tri_centroid = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
+                tri_centroid = np.asarray(detail.get("centroid", tri_points.mean(axis=0)), dtype=np.float64)
             else:
-                face_area = float(face_areas[face_idx])
-                normal_vec_np = np.asarray(face_normals[face_idx], dtype=np.float64)
-                tri_centroid = np.asarray(face_centroids[face_idx], dtype=np.float64)
+                face_area, normal_vec = _face_area_and_normal(points, verts)
+                normal_vec_np = np.asarray(normal_vec, dtype=np.float64)
+                tri_centroid = tri_points.mean(axis=0)
+                face_area = float(face_area)
 
-            if face_area <= 1e-9 or normal_vec_np.size != 3:
+            if face_area <= 0.0:
                 continue
-
-            bbox_face_min = face_bbox_min[face_idx]
-            bbox_face_max = face_bbox_max[face_idx]
-            if np.isfinite(bbox_face_min).all() and np.isfinite(bbox_face_max).all():
-                bounds_min = np.minimum(bounds_min, bbox_face_min)
-                bounds_max = np.maximum(bounds_max, bbox_face_max)
 
             sub_face_details[face_idx] = {
                 "area": face_area,
@@ -1133,14 +1058,12 @@ def _resolve_component_styles(
 
         for face_idx in component["faces"]:
             detail = face_details.get(face_idx)
-            if detail:
-                area = float(detail.get("area", 0.0))
-                normal_vec = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
-                centroid_vec = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
-            else:
-                area = float(face_areas[face_idx])
-                normal_vec = np.asarray(face_normals[face_idx], dtype=np.float64)
-                centroid_vec = np.asarray(face_centroids[face_idx], dtype=np.float64)
+            if not detail:
+                bins["INTERIOR"].append(face_idx)
+                continue
+            area = float(detail.get("area", 0.0))
+            normal_vec = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
+            centroid_vec = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
             normal_len = np.linalg.norm(normal_vec)
             if area <= 0.0 or normal_len <= 1e-5:
                 bins["INTERIOR"].append(face_idx)
@@ -1236,21 +1159,73 @@ def _resolve_component_styles(
         faces_in_component = component["faces"]
         chosen_token: Optional[str] = None
         chosen_from_style = False
+        material_color: Optional[Tuple[float, float, float]] = None
         material_id = component["material_id"]
         direction_label = component.get("direction_label") or ""
-        component.pop("direction_label", None)
+        try:
+            if materials and 0 <= material_id < len(materials):
+                material_color = _color_from_material(materials[material_id])
+        except Exception:
+            material_color = None
 
-        def _assign_faces(token_value: Optional[str], faces_list: List[int]) -> None:
-            if token_value is None:
-                return
-            for face_idx in faces_list:
-                face_styles[face_idx] = token_value
-                face_directions[face_idx] = direction_label or "NA"
-
-        material_color = _material_color_for_id(material_id)
         preferred_token = material_style_lookup.get(material_id)
         material_brightness = _color_brightness(material_color)
 
+        style_presence_counts: Dict[str, int] = component.get("style_presence", {})
+        locked_style_token: Optional[str] = None
+        if faces_in_component:
+            dominant = None
+            if style_presence_counts:
+                dominant = max(style_presence_counts.items(), key=lambda item: item[1])
+                if dominant[1] >= len(faces_in_component):
+                    locked_style_token = dominant[0]
+            if locked_style_token is None:
+                subset_material_ids = {
+                    int(material_ids[face_idx])
+                    for face_idx in faces_in_component
+                    if 0 <= face_idx < len(material_ids)
+                }
+                if len(subset_material_ids) == 1:
+                    only_mid = next(iter(subset_material_ids))
+                    locked_style_token = material_style_lookup.get(only_mid)
+
+        if locked_style_token:
+            chosen_token = locked_style_token
+            chosen_from_style = True
+            for face_idx in faces_in_component:
+                face_styles[face_idx] = chosen_token
+            LOG.debug(
+                "Directional component locked to source style %s (dir=%s faces=%d)",
+                locked_style_token,
+                direction_label or "NA",
+                len(faces_in_component),
+            )
+            continue
+
+        if style_presence_counts:
+            chosen_token = max(style_presence_counts.items(), key=lambda item: item[1])[0]
+            chosen_from_style = True
+        elif component["neighbor_styles"]:
+            neighbor_area_threshold = 1.0
+            filtered_neighbors = [
+                (token, count)
+                for token, count in component["neighbor_styles"].items()
+                if style_area_map.get(token, 0.0) >= neighbor_area_threshold
+            ]
+            if filtered_neighbors:
+                chosen_token = max(filtered_neighbors, key=lambda item: item[1])[0]
+
+        if chosen_token is None:
+            fallback_token = _style_fallback_for_material(material_id)
+            chosen_token = fallback_token
+        if preferred_token and chosen_token is None:
+            chosen_token = preferred_token
+            chosen_from_style = True
+        if preferred_token and chosen_token == preferred_token:
+            chosen_from_style = True
+
+        direction_label = component.get("direction_label") or ""
+        component.pop("direction_label", None)
         component.pop("face_details", None)
 
         extents = component.get("extents", (0.0, 0.0, 0.0))
@@ -1303,7 +1278,8 @@ def _resolve_component_styles(
             handle_token = preferred_token or aluminium_style_token or neutral_token or chosen_token
             if handle_token:
                 chosen_token = handle_token
-                _assign_faces(chosen_token, faces_in_component)
+                for face_idx in faces_in_component:
+                    face_styles[face_idx] = chosen_token
                 LOG.debug("Handle forced -> %s", chosen_token)
                 continue
 
@@ -1316,7 +1292,8 @@ def _resolve_component_styles(
                 desired_token = neutral_style_token
             if desired_token:
                 chosen_token = desired_token
-                _assign_faces(chosen_token, faces_in_component)
+                for face_idx in faces_in_component:
+                    face_styles[face_idx] = chosen_token
                 continue
 
         is_bottom_trim = (
@@ -1545,30 +1522,18 @@ def _resolve_component_styles(
         )
 
         if chosen_token:
-            _assign_faces(chosen_token, faces_in_component)
+            for face_idx in faces_in_component:
+                face_styles[face_idx] = chosen_token
 
     mapping: Dict[str, List[int]] = defaultdict(list)
-    direction_counters: Dict[str, Counter[str]] = defaultdict(Counter)
     cluster_lookup: Dict[str, str] = {}
-    cluster_direction_map: Dict[str, str] = {}
     for idx, token in enumerate(face_styles):
-        if token is None:
-            continue
-        mapping[token].append(idx)
-        direction_value = face_directions[idx] or ""
-        direction_counters[token][direction_value] += 1
-
-    def _sanitize_direction_label(label: Optional[str]) -> str:
-        if not label:
-            return "NA"
-        return sanitize_name(label, fallback="NA")
-
-    for token, counter in direction_counters.items():
-        if counter:
-            cluster_direction_map[token] = _sanitize_direction_label(counter.most_common(1)[0][0])
+        if token is not None:
+            mapping[token].append(idx)
 
     if cluster_styles and points is not None and face_vertices is not None and len(mapping) > 1:
         face_set_adjacency = adjacency
+        pts_np = np.asarray(points, dtype=float)
 
         def _cluster_faces_by_plane(face_list: List[int]) -> List[List[int]]:
             if not face_list:
@@ -1600,12 +1565,15 @@ def _resolve_component_styles(
             for comp in components_local:
                 planes: List[Tuple[np.ndarray, float, List[int]]] = []
                 for fid in comp:
-                    n = np.asarray(face_normals[fid], dtype=float)
+                    verts = face_vertices[fid]
+                    _, normal = _face_area_and_normal(points, verts)
+                    n = np.asarray(normal, dtype=float)
                     norm = np.linalg.norm(n)
                     if norm < 1e-9:
                         continue
                     n /= norm
-                    d = float(face_plane_d[fid])
+                    cx, cy, cz = _face_centroid(points, verts)
+                    d = float(np.dot(n, np.asarray([cx, cy, cz], dtype=float)))
                     placed = False
                     for entry in planes:
                         ref_n, ref_d, lst = entry
@@ -1628,22 +1596,14 @@ def _resolve_component_styles(
             if len(clusters) <= 1:
                 clustered_mapping[token] = faces
             else:
-                cluster_direction_map.pop(token, None)
                 for ci, face_subset in enumerate(clusters):
-                    dir_counter = Counter(face_directions[f] or "" for f in face_subset)
-                    if dir_counter:
-                        dir_raw = dir_counter.most_common(1)[0][0]
-                    else:
-                        dir_raw = ""
-                    dir_label = _sanitize_direction_label(dir_raw)
-                    clustered_name = f"{token}_C{ci}_{dir_label}"
+                    clustered_name = f"{token}_C{ci}"
                     clustered_mapping[clustered_name] = face_subset
                     cluster_lookup[clustered_name] = token
-                    cluster_direction_map[clustered_name] = dir_label
         if clustered_mapping:
             mapping = clustered_mapping
 
-    return mapping, cluster_lookup, cluster_direction_map
+    return mapping, cluster_lookup
 
 
 def _ensure_material_subsets(
@@ -1674,17 +1634,6 @@ def _ensure_material_subsets(
         pass
 
     created_subsets = False
-    unique_material_ids: Set[int] = set()
-    if material_ids:
-        for mid in material_ids:
-            try:
-                mid_int = int(mid)
-            except Exception:
-                continue
-            if mid_int >= 0:
-                unique_material_ids.add(mid_int)
-    if use_component_classification and len(unique_material_ids) <= 1:
-        use_component_classification = False
     stats: List[Tuple[str, int]] = []
 
     if use_component_classification and material_ids and len(material_ids) == face_count and style_groups:
@@ -1759,7 +1708,7 @@ def _ensure_material_subsets(
         for key in style_groups:
             style_tokens[key] = _subset_token_for_material(key)
 
-        face_style_map, cluster_lookup, cluster_dir_map = _resolve_component_styles(
+        face_style_map, cluster_lookup = _resolve_component_styles(
             material_ids,
             style_groups,
             style_tokens,
@@ -1804,9 +1753,6 @@ def _ensure_material_subsets(
                 base_token = cluster_lookup.get(token)
                 if base_token:
                     subset.GetPrim().CreateAttribute("ifc:baseStyleToken", Sdf.ValueTypeNames.String).Set(base_token)
-                direction_label = cluster_dir_map.get(token)
-                if direction_label:
-                    subset.GetPrim().CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(direction_label)
                 try:
                     subset.CreateFamilyNameAttr().Set(family_name)
                 except Exception:
@@ -1884,21 +1830,6 @@ def _ensure_material_subsets(
                     PLANE_D_TOL = 0.005
                     N_DOT_TOL = 0.98
 
-                    def _direction_from_normal(vec: np.ndarray) -> str:
-                        if vec.size < 3:
-                            return "NA"
-                        axis = int(np.argmax(np.abs(vec)))
-                        label_axis = ("X", "Y", "Z")[axis]
-                        positive = vec[axis] >= 0.0
-                        if label_axis == "Z":
-                            return "TOP" if positive else "BOTTOM"
-                        return f"POS_{label_axis}" if positive else f"NEG_{label_axis}"
-
-                    def _sanitize_direction_label_sec(label: Optional[str]) -> str:
-                        if not label:
-                            return "NA"
-                        return sanitize_name(label, fallback="NA")
-
                     try:
                         _, local_adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
                     except Exception:
@@ -1959,25 +1890,20 @@ def _ensure_material_subsets(
                                         break
                                 if not placed:
                                     clusters.append([n, d, [f]])
-                            for ref_n, _, flist in clusters:
+                            for (_, _, flist) in clusters:
                                 if not flist:
                                     continue
-                                dir_label_raw = _direction_from_normal(ref_n)
-                                dir_label = _sanitize_direction_label_sec(dir_label_raw)
-                                authored_groups.append((mid, cluster_counter, dir_label, flist))
+                                authored_groups.append((mid, cluster_counter, flist))
                                 cluster_counter += 1
 
                     if authored_groups:
-                        for mid, ci, dir_label, faces in authored_groups:
+                        for mid, ci, faces in authored_groups:
                             subset_name = f"Material_{mid}_C{ci}"
-                            if dir_label:
-                                subset_name = f"{subset_name}_{dir_label}"
                             subset_path = mesh.GetPath().AppendChild(subset_name)
                             subset = UsdGeom.Subset.Define(stage, subset_path)
                             subset.CreateFamilyNameAttr().Set(family_name)
                             subset.CreateElementTypeAttr().Set(element_token)
                             subset.CreateIndicesAttr(Vt.IntArray([int(f) for f in faces]))
-                            subset.GetPrim().CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(dir_label or "NA")
                             created_subsets = True
                             stats.append((str(subset_path), len(faces)))
                         authored_geo = True
@@ -2147,90 +2073,6 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
     return mesh
 
 
-def _author_occ_detail_meshes(
-    stage: Usd.Stage,
-    detail_root_path: Sdf.Path,
-    detail_mesh: Any,
-    *,
-    meters_per_unit: float,
-) -> List[UsdGeom.Mesh]:
-    """Author one Mesh per OCC subshape beneath ``detail_root_path``."""
-    subshapes = getattr(detail_mesh, "subshapes", None) or []
-    faces = getattr(detail_mesh, "faces", None) or []
-    if not subshapes and faces:
-        subshapes = [
-            {"index": idx, "label": f"Face_{idx}", "shape_type": "FACE", "faces": [face]}
-            for idx, face in enumerate(faces)
-        ]
-    if not subshapes:
-        LOG.debug("Detail mesh authoring skipped: no subshapes or faces found for %s", detail_root_path)
-        return []
-
-    detail_root = UsdGeom.Xform.Define(stage, detail_root_path)
-    detail_root.ClearXformOpOrder()
-    authored: List[UsdGeom.Mesh] = []
-    used_names: Set[str] = set()
-
-    def _combine_faces(face_entries: List[Any]) -> Optional[Dict[str, Any]]:
-        verts_list: List[np.ndarray] = []
-        faces_list: List[np.ndarray] = []
-        offset = 0
-        for entry in face_entries:
-            verts = getattr(entry, "vertices", None)
-            tris = getattr(entry, "faces", None)
-            if verts is None or tris is None:
-                continue
-            verts_np = np.asarray(verts, dtype=np.float64)
-            tris_np = np.asarray(tris, dtype=np.int64)
-            if verts_np.size == 0 or tris_np.size == 0:
-                continue
-            verts_list.append(verts_np)
-            faces_list.append(tris_np + offset)
-            offset += verts_np.shape[0]
-        if not verts_list or not faces_list:
-            return None
-        return {
-            "vertices": np.vstack(verts_list),
-            "faces": np.vstack(faces_list),
-        }
-
-    for entry in subshapes:
-        faces_for_subshape = getattr(entry, "faces", None) or []
-        mesh_data = _combine_faces(faces_for_subshape)
-        if mesh_data is None:
-            LOG.debug(
-                "Detail mesh subshape %s produced no triangles (label=%s)",
-                getattr(entry, "index", len(authored)),
-                getattr(entry, "label", "<unnamed>"),
-            )
-            continue
-        label = getattr(entry, "label", None) or f"Subshape_{getattr(entry, 'index', len(authored))}"
-        sanitized = _sanitize_identifier(label, fallback="Subshape")
-        candidate = sanitized
-        counter = 1
-        while candidate in used_names:
-            candidate = f"{sanitized}_{counter}"
-            counter += 1
-        used_names.add(candidate)
-        mesh = write_usd_mesh(
-            stage,
-            detail_root_path,
-            candidate,
-            mesh_data,
-            stage_meters_per_unit=meters_per_unit,
-        )
-        verts_np = np.asarray(mesh_data.get("vertices"), dtype=np.float64)
-        faces_np = np.asarray(mesh_data.get("faces"), dtype=np.int64)
-        LOG.debug(
-            "Detail mesh: authored %s with %d vertices / %d faces",
-            detail_root_path.AppendChild(candidate),
-            verts_np.shape[0],
-            faces_np.shape[0],
-        )
-        authored.append(mesh)
-    return authored
-
-
 # ---------------- Prototype authoring ----------------
 
 def _name_for_repmap(proto: Any) -> str:
@@ -2310,20 +2152,6 @@ def _iter_prototypes(caches: PrototypeCaches) -> Iterable[Tuple[PrototypeKey, An
         yield PrototypeKey(kind="hash", identifier=digest), proto
 
 
-def _prototype_from_key(caches: PrototypeCaches, key: Optional[PrototypeKey]) -> Optional[Any]:
-    """Return the prototype record referenced by ``key``."""
-    if key is None:
-        return None
-    if key.kind == "repmap":
-        try:
-            identifier = int(key.identifier)
-        except Exception:
-            return None
-        return caches.repmaps.get(identifier)
-    identifier_str = str(key.identifier)
-    return caches.hashes.get(identifier_str)
-
-
 def author_prototype_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
@@ -2349,12 +2177,6 @@ def author_prototype_layer(
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
     used_names: Dict[str, int] = {}
     use_component_classification = getattr(options, "enable_material_classification", False)
-    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
-    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
-    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
-    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
-    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
-    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
     def _unique_name(base: str) -> str:
         c = used_names.get(base, 0)
@@ -2367,10 +2189,7 @@ def author_prototype_layer(
 
         for key, proto in _iter_prototypes(caches):
             mesh_payload = getattr(proto, "mesh", None)
-            detail_payload = getattr(proto, "detail_mesh", None)
-            has_detail = bool(detail_mode_enabled and detail_payload and getattr(detail_payload, "faces", None))
-
-            if not mesh_payload and not has_detail:
+            if not mesh_payload:
                 continue
 
             # Name the prototype Xform
@@ -2395,27 +2214,18 @@ def author_prototype_layer(
             full_style_groups = getattr(proto, "style_face_groups", None)
             full_materials = list(getattr(proto, "materials", []) or [])
 
-            if has_detail:
-                detail_parent = proto_path.AppendChild("Geom")
-                _author_occ_detail_meshes(
-                    stage,
-                    detail_parent,
-                    detail_payload,
-                    meters_per_unit=stage_meters_per_unit,
-                )
-            else:
-                write_usd_mesh(
-                    stage,
-                    proto_path,
-                    "Geom",
-                    mesh_payload,
-                    abs_mat=None,
-                    material_ids=full_material_ids,
-                    style_groups=full_style_groups,
-                    materials=full_materials,
-                    stage_meters_per_unit=stage_meters_per_unit,
-                    use_component_classification=use_component_classification,
-                )
+            write_usd_mesh(
+                stage,
+                proto_path,
+                "Geom",
+                mesh_payload,
+                abs_mat=None,
+                material_ids=full_material_ids,
+                style_groups=full_style_groups,
+                materials=full_materials,
+                stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
+                use_component_classification=use_component_classification,
+            )
 
     return proto_layer, proto_paths
 
@@ -2469,16 +2279,6 @@ class _MaterialProperties:
     display_color: Tuple[float, float, float]
     opacity: float
     emissive_color: Optional[Tuple[float, float, float]] = None
-
-
-@dataclass(frozen=True)
-class _FaceGeometry:
-    normals: np.ndarray       # (F, 3)
-    centroids: np.ndarray     # (F, 3)
-    areas: np.ndarray         # (F,)
-    plane_d: np.ndarray       # (F,)
-    bbox_min: np.ndarray      # (F, 3)
-    bbox_max: np.ndarray      # (F, 3)
 
 
 @dataclass
@@ -2585,9 +2385,6 @@ def _bind_materials_on_prototype_mesh(
         mesh_root = proto_paths.get(key)
         if not mesh_root:
             continue
-        detail_payload = getattr(proto, "detail_mesh", None)
-        if detail_payload and getattr(detail_payload, "faces", None):
-            continue
         mesh_path = mesh_root.AppendChild("Geom")
         mesh_prim = stage.GetPrimAtPath(mesh_path)
         if not mesh_prim:
@@ -2681,7 +2478,6 @@ def _bind_materials_on_prototype_mesh(
 
         cluster_binding: Dict[str, Sdf.Path] = {}
         for subset_token, material_path in style_token_to_material.items():
-            cluster_binding[subset_token] = material_path
             subset_path = mesh_path.AppendChild(subset_token)
             subset_prim = stage.GetPrimAtPath(subset_path)
             if not subset_prim:
@@ -2693,6 +2489,7 @@ def _bind_materials_on_prototype_mesh(
 
             UsdShade.MaterialBindingAPI(subset_prim).Bind(material)
             LOG.debug("Bound style subset %s -> %s", subset_path, material_path)
+            cluster_binding[subset_token] = material_path
 
         try:
             subsets = UsdGeom.Subset.GetGeomSubsets(
@@ -3244,8 +3041,6 @@ def author_instance_layer(
     hierarchy_nodes_by_label: Dict[Tuple[Sdf.Path, str], Sdf.Path] = {}
 
     use_component_classification = getattr(options, "enable_material_classification", False)
-    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
-    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
     def _unique_child_name(parent_path: Sdf.Path, base: str) -> str:
         used = name_counters[parent_path]
@@ -3321,35 +3116,6 @@ def author_instance_layer(
             )
             material_ids = list(record.material_ids or [])
 
-            detail_payload = getattr(record, "detail_mesh", None)
-            has_detail_mesh = bool(
-                detail_mode_enabled and detail_payload and getattr(detail_payload, "faces", None)
-            )
-            if has_detail_mesh:
-                detail_root = inst_path.AppendChild("Geom")
-                detail_meshes = _author_occ_detail_meshes(
-                    stage,
-                    detail_root,
-                    detail_payload,
-                    meters_per_unit=stage_meters_per_unit,
-                )
-                if resolved_materials:
-                    _apply_material_bindings_to_prim(
-                        stage,
-                        inst_prim,
-                        resolved_materials,
-                        style_groups=style_groups,
-                    )
-                if resolved_color is not None:
-                    _apply_display_color_to_prim(inst_prim, resolved_color)
-                    for mesh_geom in detail_meshes:
-                        try:
-                            mesh_gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
-                            mesh_gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
-                        except Exception:
-                            pass
-                continue
-
             # Per-instance mesh fallback (non-instanced geometry)
             if record.mesh:
                 mesh_geom = write_usd_mesh(
@@ -3360,7 +3126,7 @@ def author_instance_layer(
                     abs_mat=None,
                     material_ids=material_ids,
                     materials=list(getattr(record, "materials", []) or []),
-                    stage_meters_per_unit=stage_meters_per_unit,
+                    stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
                     style_groups=style_groups,
                     use_component_classification=use_component_classification,
                 )
@@ -3388,10 +3154,6 @@ def author_instance_layer(
             if proto_path is None:
                 continue
 
-            proto_detail = _prototype_from_key(caches, record.prototype)
-            proto_detail_mesh = getattr(proto_detail, "detail_mesh", None) if proto_detail else None
-            proto_has_detail = bool(proto_detail_mesh and getattr(proto_detail_mesh, "faces", None))
-
             ref_path = inst_path.AppendChild("Prototype")
             ref_prim = stage.DefinePrim(ref_path, "Xform")
             refs = ref_prim.GetReferences()
@@ -3413,7 +3175,7 @@ def author_instance_layer(
             UsdGeom.Imageable(mesh_child_override).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
 
             if resolved_materials:
-                proto_mesh_path = None if proto_has_detail else proto_path.AppendChild("Geom")
+                proto_mesh_path = proto_path.AppendChild("Geom")
                 _apply_material_bindings_to_prim(
                     stage,
                     inst_prim,
@@ -3748,12 +3510,7 @@ def author_geometry2d_layer(
 
             width_value = _resolved_curve_width(curve)
             if width_value is not None:
-                curve_count = max(1, len(counts))
-                widths = Vt.FloatArray(curve_count)
-                for idx in range(curve_count):
-                    widths[idx] = float(width_value)
-                basis.CreateWidthsAttr(widths)
-                basis.SetWidthsInterpolation(UsdGeom.Tokens.uniform)
+                basis.CreateWidthsAttr(Vt.FloatArray([float(width_value)]))
 
             prim = basis.GetPrim()
             try:
@@ -4101,3 +3858,4 @@ def update_federated_view(
         pass
     stage.GetRootLayer().Save()
     return stage.GetRootLayer()
+

@@ -60,5 +60,7 @@ _debug_style_area.py
 _debug_style_normals.py
 _debug_suelo_components.py
 _debug_*.py
+_tmp*
 container_material_debug.log
 patch/
+run_*.txt
