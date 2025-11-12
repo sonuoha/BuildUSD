@@ -1,4 +1,4 @@
-﻿"""IFC geometry inventory and prototype construction utilities.
+"""IFC geometry inventory and prototype construction utilities.
 
 This module wraps a single iterator-driven pass over an IFC file and produces the
 data needed by the USD writer.  It handles:
@@ -28,6 +28,7 @@ import hashlib
 
 from .ifc_visuals import PBRMaterial, build_material_for_product, extract_face_style_groups
 from . import occ_detail
+from .process_ifc_2d import AnnotationCurve, AnnotationHooks, extract_annotation_curves
 
 if TYPE_CHECKING:
     from .occ_detail import OCCDetailMesh
@@ -94,6 +95,7 @@ except Exception:  # pragma: no cover
     Gf = _GfShim()
 
 log = logging.getLogger(__name__)
+_OCC_WARNING_EMITTED = False
 
 # ---------------------------------
 # Thread count helper
@@ -164,6 +166,31 @@ def _apply_geom_settings(settings, overrides: Dict[str, Any]) -> None:
                 pass
 
 
+def _enable_occ(settings) -> bool:
+    """Best-effort helper to flip on OCCT-backed shape creation.
+
+    Returns True when the toggle succeeded, False when Python OpenCascade is unavailable.
+    """
+    global _OCC_WARNING_EMITTED
+    last_exc: Optional[Exception] = None
+    for key in ("use-python-opencascade", "USE_PYTHON_OPENCASCADE"):
+        try:
+            settings.set(key, True)
+            return True
+        except Exception as exc:
+            last_exc = exc
+            continue
+    if not _OCC_WARNING_EMITTED:
+        detail = f" ({last_exc})" if last_exc else ""
+        log.warning(
+            "Python OpenCascade bindings are unavailable; OCC detail meshes will be skipped%s. "
+            "Install pythonocc-core (e.g. pip install pythonocc-core==7.8.1) to enable detail mode.",
+            detail,
+        )
+        _OCC_WARNING_EMITTED = True
+    return False
+
+
 def _get_setting_float(settings, key: str, default: float) -> float:
     """Return a float setting value (with dash/underscore tolerance)."""
     if settings is None:
@@ -184,22 +211,362 @@ def _get_setting_float(settings, key: str, default: float) -> float:
         return float(default)
 
 
-def _build_detail_mesh_payload(shape_obj: Any, settings) -> Optional["OCCDetailMesh"]:
-    """Construct OCC face meshes for detail-mode geometry."""
-    if shape_obj is None or settings is None or not occ_detail.is_available():
+def _build_detail_mesh_payload(shape_obj: Any, settings, *, product=None) -> Optional["OCCDetailMesh"]:
+    """Construct OCC face meshes for detail-mode geometry.
+
+    When iterator geometry lacks embedded OCC data, fall back to the per-item
+    OpenCascade extraction validated in the pyocc test harness.
+    """
+    if settings is None or not occ_detail.is_available():
         return None
-    linear_def = _get_setting_float(settings, "mesher-linear-deflection", float(_BASE_GEOM_SETTINGS["mesher-linear-deflection"]))
-    angular_def = _get_setting_float(settings, "mesher-angular-deflection", float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"]))
+    if shape_obj is None and product is None:
+        return None
+    linear_def = _get_setting_float(
+        settings,
+        "mesher-linear-deflection",
+        float(_BASE_GEOM_SETTINGS["mesher-linear-deflection"]),
+    )
+    angular_def = _get_setting_float(
+        settings,
+        "mesher-angular-deflection",
+        float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"]),
+    )
     try:
         angular_rad = math.radians(float(angular_def))
     except Exception:
         angular_rad = math.radians(float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"]))
-    return occ_detail.build_detail_mesh(
-        shape_obj,
+
+    detail_mesh: Optional["OCCDetailMesh"] = None
+
+    def _run_occ_detail(source_obj, source_label: str) -> Optional["OCCDetailMesh"]:
+        if source_obj is None:
+            return None
+        detail = occ_detail.build_detail_mesh(
+            source_obj,
+            linear_deflection=float(linear_def),
+            angular_deflection_rad=angular_rad,
+            logger=log,
+        )
+        if detail is None:
+            log.debug(
+                "Detail mode: OCC meshing returned no faces for %s source of %s (guid=%s).",
+                source_label,
+                product_name(product) if product is not None else "<unknown>",
+                getattr(product, "GlobalId", None) if product is not None else "<n/a>",
+            )
+        return detail
+
+    if shape_obj is not None:
+        detail_mesh = _run_occ_detail(shape_obj, "iterator")
+
+    if detail_mesh is None and product is not None:
+        product_occ_shape = _create_occ_product_shape(settings, product)
+        detail_mesh = _run_occ_detail(product_occ_shape, "product")
+
+    if detail_mesh is None and product is not None:
+        detail_mesh = _build_representation_detail_mesh(
+            product,
+            settings,
+            float(linear_def),
+            angular_rad,
+        )
+        if detail_mesh is not None:
+            log.debug(
+                "OCC detail: fallback per-representation extraction succeeded for %s (guid=%s)",
+                getattr(product, "is_a", lambda: type(product).__name__)(),
+                getattr(product, "GlobalId", None),
+            )
+    if detail_mesh is None:
+        target_name = type(shape_obj).__name__ if shape_obj is not None else "IfcProduct"
+        log.debug("OCC detail: no mesh generated for %s", target_name)
+        return None
+
+    subshape_count = len(getattr(detail_mesh, "subshapes", []) or [])
+    face_total = detail_mesh.face_count if hasattr(detail_mesh, "face_count") else 0
+    log.debug(
+        "OCC detail: generated %d subshape mesh(es) totalling %s faces for %s",
+        subshape_count,
+        face_total,
+        type(shape_obj).__name__ if shape_obj is not None else "IfcProduct",
+    )
+    return detail_mesh
+
+
+def _build_representation_detail_mesh(product, settings, linear_def: float, angular_rad: float):
+    """Fallback OCC extraction that tessellates each representation item directly."""
+    representation = getattr(product, "Representation", None)
+    if representation is None:
+        return None
+    item_meshes: List["OCCDetailMesh"] = []
+    for rep_index, item_index, item in _iter_representation_items(product):
+        detail_mesh = _detail_mesh_for_item(
+            item,
+            settings,
+            linear_def,
+            angular_rad,
+            product=product,
+            rep_index=rep_index,
+            item_index=item_index,
+        )
+        if detail_mesh is None:
+            continue
+        _annotate_detail_subshapes(detail_mesh, product, rep_index, item_index, item)
+        item_meshes.append(detail_mesh)
+    if not item_meshes:
+        return None
+    if len(item_meshes) == 1:
+        _normalize_detail_indices(item_meshes[0])
+        return item_meshes[0]
+    return _merge_detail_meshes(item_meshes)
+
+
+def _iter_representation_items(product):
+    representation = getattr(product, "Representation", None)
+    if representation is None:
+        return
+    reps = getattr(representation, "Representations", None) or []
+    for rep_index, rep in enumerate(reps):
+        if rep is None:
+            continue
+        items = getattr(rep, "Items", None) or []
+        for item_index, item in enumerate(items):
+            if item is None:
+                continue
+            yield rep_index, item_index, item
+
+
+def _describe_rep_item(item) -> str:
+    if item is None:
+        return "<None>"
+    name = getattr(item, "Name", None)
+    type_name = item.is_a() if hasattr(item, "is_a") else type(item).__name__
+    try:
+        step_id = item.id()
+    except Exception:
+        step_id = getattr(item, "id", lambda: None)()
+    label = f"{type_name}"
+    if name:
+        label += f":{name}"
+    if step_id is not None:
+        label += f"#{step_id}"
+    return label
+
+
+def product_name(product) -> str:
+    if product is None:
+        return "<product>"
+    return getattr(product, "Name", None) or getattr(product, "GlobalId", None) or (
+        product.is_a() if hasattr(product, "is_a") else "<product>"
+    )
+
+
+def _detail_mesh_for_item(
+    item,
+    settings,
+    linear_def: float,
+    angular_rad: float,
+    *,
+    product=None,
+    rep_index: Optional[int] = None,
+    item_index: Optional[int] = None,
+):
+    if item is None:
+        return None
+    occ_source = _create_occ_shape(
+        settings,
+        item,
+        product=product,
+        rep_index=rep_index,
+        item_index=item_index,
+    )
+    if occ_source is None:
+        return None
+    detail_mesh = occ_detail.build_detail_mesh(
+        occ_source,
         linear_deflection=float(linear_def),
-        angular_deflection_rad=angular_rad,
+        angular_deflection_rad=float(angular_rad),
         logger=log,
     )
+    if detail_mesh is None:
+        log.debug(
+            "Detail mode: OCC tessellation yielded no faces for product=%s step=%s item=%s rep=%s/%s",
+            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+            getattr(product, "id", lambda: None)(),
+            _describe_rep_item(item),
+            rep_index,
+            item_index,
+        )
+    else:
+        subshape_count = len(getattr(detail_mesh, "subshapes", None) or [])
+        log.debug(
+            "Detail mode: OCC tessellation succeeded for product=%s step=%s item=%s rep=%s/%s subshapes=%d",
+            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+            getattr(product, "id", lambda: None)(),
+            _describe_rep_item(item),
+            rep_index,
+            item_index,
+            subshape_count,
+        )
+    return detail_mesh
+
+
+def _create_occ_shape(
+    settings,
+    element,
+    *,
+    product=None,
+    rep_index: Optional[int] = None,
+    item_index: Optional[int] = None,
+):
+    try:
+        shape_obj = ifcopenshell.geom.create_shape(settings, element)
+    except Exception as exc:
+        step_id = None
+        try:
+            step_id = element.id()
+        except Exception:
+            step_id = getattr(element, "id", lambda: None)()
+        log.debug(
+            "Detail OCC fallback: create_shape failed for product=%s step=%s item=%s rep=%s/%s error=%s",
+            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+            getattr(product, "id", lambda: None)(),
+            _describe_rep_item(element),
+            rep_index,
+            item_index,
+            exc,
+        )
+        return None
+    geometry = getattr(shape_obj, "geometry", shape_obj)
+    if not geometry:
+        log.debug(
+            "Detail OCC fallback: create_shape returned empty geometry for product=%s item=%s rep=%s/%s",
+            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+            _describe_rep_item(element),
+            rep_index,
+            item_index,
+        )
+    return geometry or shape_obj
+
+
+def _create_occ_product_shape(settings, product):
+    try:
+        shape_obj = ifcopenshell.geom.create_shape(
+            settings,
+            product,
+        )
+    except Exception as exc:
+        log.debug(
+            "Detail OCC product fallback failed for guid=%s: %s",
+            getattr(product, "GlobalId", None),
+            exc,
+        )
+        return None
+    geometry = getattr(shape_obj, "geometry", shape_obj)
+    if not geometry:
+        log.debug(
+            "Detail OCC product fallback returned empty geometry for guid=%s",
+            getattr(product, "GlobalId", None),
+        )
+    return geometry or shape_obj
+
+
+def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index: int, item):
+    """Tag OCC subshape labels so downstream USD meshes remain traceable."""
+    subshapes = getattr(detail_mesh, "subshapes", None) or []
+    if not subshapes:
+        return
+    product_label = getattr(product, "GlobalId", None) or getattr(product, "Name", None) or product.is_a()
+    item_name = getattr(item, "Name", None) or (item.is_a() if hasattr(item, "is_a") else f"Item{item_index}")
+    prefix = f"{product_label}_rep{rep_index}_item{item_index}_{item_name}"
+    for local_index, subshape in enumerate(subshapes):
+        current = getattr(subshape, "label", f"Subshape_{local_index}")
+        subshape.label = f"{prefix}_{current}"
+
+
+def _normalize_detail_indices(detail_mesh):
+    subshapes = getattr(detail_mesh, "subshapes", None) or []
+    for idx, subshape in enumerate(subshapes):
+        subshape.index = idx
+
+
+def _merge_detail_meshes(meshes: List["OCCDetailMesh"]) -> Optional["OCCDetailMesh"]:
+    combined: List["occ_detail.OCCSubshapeMesh"] = []
+    for mesh in meshes:
+        for subshape in getattr(mesh, "subshapes", None) or []:
+            label = getattr(subshape, "label", None) or f"Subshape_{len(combined)}"
+            combined.append(
+                occ_detail.OCCSubshapeMesh(
+                    index=len(combined),
+                    label=label,
+                    shape_type=getattr(subshape, "shape_type", "UNKNOWN"),
+                    faces=list(getattr(subshape, "faces", []) or []),
+                )
+            )
+    if not combined:
+        return None
+    return occ_detail.OCCDetailMesh(shape=None, subshapes=combined)
+
+
+def _mesh_from_detail_mesh(detail_mesh: Optional["OCCDetailMesh"]) -> Optional[Dict[str, Any]]:
+    """Flatten OCC detail meshes into the standard vertex/face dict used by proto pipeline."""
+    if detail_mesh is None:
+        return None
+    faces = getattr(detail_mesh, "faces", None) or []
+    if not faces:
+        subshapes = getattr(detail_mesh, "subshapes", None) or []
+        for entry in subshapes:
+            faces.extend(getattr(entry, "faces", None) or [])
+        if not faces:
+            return None
+    vert_arrays: List[np.ndarray] = []
+    face_arrays: List[np.ndarray] = []
+    offset = 0
+    for face in faces:
+        verts = np.asarray(getattr(face, "vertices", None), dtype=np.float64)
+        tris = np.asarray(getattr(face, "faces", None), dtype=np.int64)
+        if verts.size == 0 or tris.size == 0:
+            continue
+        vert_arrays.append(verts)
+        face_arrays.append(tris + offset)
+        offset += verts.shape[0]
+    if not vert_arrays or not face_arrays:
+        return None
+    try:
+        vertices = np.vstack(vert_arrays)
+        faces_arr = np.vstack(face_arrays)
+    except Exception:
+        return None
+    return {"vertices": vertices, "faces": faces_arr}
+
+
+def _precompute_detail_meshes(ifc, settings) -> Dict[int, "OCCDetailMesh"]:
+    """Precompute OCC detail meshes for every product (detail-mode prepass)."""
+    cache: Dict[int, "OCCDetailMesh"] = {}
+    if settings is None or not occ_detail.is_available():
+        return cache
+    products = ifc.by_type("IfcProduct") or []
+    total = 0
+    for product in products:
+        total += 1
+        try:
+            product_id = int(product.id())
+        except Exception:
+            product_id = None
+        if product_id is None:
+            continue
+        detail_mesh = _build_detail_mesh_payload(
+            None,
+            settings,
+            product=product,
+        )
+        if detail_mesh is not None:
+            cache[product_id] = detail_mesh
+    log.info(
+        "Detail prepass: cached OCC meshes for %d / %d product(s).",
+        len(cache),
+        total,
+    )
+    return cache
 
 
 def _settings_fingerprint(settings) -> str:
@@ -443,13 +810,6 @@ class InstanceRecord:
     detail_mesh: Optional["OCCDetailMesh"] = None
 
 @dataclass
-class AnnotationCurve:
-    step_id: int
-    name: str
-    points: List[Tuple[float, float, float]]
-    hierarchy: Tuple[Tuple[str, Optional[int]], ...] = field(default_factory=tuple)
-
-@dataclass
 class PrototypeCaches:
     repmaps: Dict[int, MeshProto]
     repmap_counts: Counter
@@ -458,6 +818,96 @@ class PrototypeCaches:
     instances: Dict[int, InstanceRecord]
     annotations: Dict[int, AnnotationCurve] = field(default_factory=dict)
     map_conversion: Optional[MapConversionData] = None
+
+
+@dataclass
+class PrototypeBuildContext:
+    """Hold mutable state and shared settings for a single IFC traversal."""
+
+    ifc_file: Any
+    options: ConversionOptions
+    settings: Any
+    settings_fp_base: str
+    settings_fp_high: str
+    settings_fp_brep: str
+    enable_high_detail: bool
+    high_detail_settings: Optional[Any] = None
+    detail_mesh_cache: Dict[int, "OCCDetailMesh"] = field(default_factory=dict)
+    repmaps: Dict[int, MeshProto] = field(default_factory=dict)
+    repmap_counts: Counter = field(default_factory=Counter)
+    hashes: Dict[str, HashProto] = field(default_factory=dict)
+    step_keys: Dict[int, PrototypeKey] = field(default_factory=dict)
+    instances: Dict[int, InstanceRecord] = field(default_factory=dict)
+    hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]] = field(default_factory=dict)
+    annotation_hooks: AnnotationHooks = field()
+
+    @classmethod
+    def build(cls, ifc_file, options: Optional[ConversionOptions]) -> "PrototypeBuildContext":
+        if options is None:
+            options = ConversionOptions()
+
+        enable_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
+        if not enable_high_detail:
+            log.info("High-detail remeshing is DISABLED; using iterator tessellation only.")
+
+        settings = ifcopenshell.geom.settings()
+        _apply_geom_settings(settings, _BASE_GEOM_SETTINGS)
+
+        if enable_high_detail and not _enable_occ(settings):
+            log.info(
+                "High-detail remeshing disabled: Python OpenCascade unavailable. Using iterator tessellation only."
+            )
+            enable_high_detail = False
+
+        high_detail_settings = None
+        if enable_high_detail:
+            high_detail_settings = ifcopenshell.geom.settings()
+            high_overrides = dict(_BASE_GEOM_SETTINGS)
+            high_overrides.update(_HIGH_DETAIL_OVERRIDES)
+            _apply_geom_settings(high_detail_settings, high_overrides)
+            if not _enable_occ(high_detail_settings):
+                log.info(
+                    "High-detail overrides disabled: Python OpenCascade unavailable. Using iterator tessellation only."
+                )
+                high_detail_settings = None
+                enable_high_detail = False
+
+        detail_mesh_cache: Dict[int, "OCCDetailMesh"] = {}
+        if enable_high_detail and occ_detail.is_available():
+            detail_prepass_settings = high_detail_settings or settings
+            detail_mesh_cache = _precompute_detail_meshes(ifc_file, detail_prepass_settings)
+
+        settings_fp_base = _settings_fingerprint(settings)
+        if enable_high_detail and high_detail_settings is not None:
+            settings_fp_high = _settings_fingerprint(high_detail_settings)
+            settings_fp_brep = hashlib.md5(f"{settings_fp_high}|brep".encode("utf-8")).hexdigest()
+        else:
+            settings_fp_high = settings_fp_base
+            settings_fp_brep = settings_fp_base
+
+        annotation_hooks = AnnotationHooks(
+            entity_on_hidden_layer=_entity_on_hidden_layer,
+            collect_spatial_hierarchy=_collect_spatial_hierarchy,
+            entity_label=_entity_label,
+            object_placement_to_np=_object_placement_to_np,
+            context_to_np=_context_to_np,
+            mapping_item_transform=_mapping_item_transform,
+            extract_curve_points=_extract_curve_points,
+            transform_points=_transform_points,
+        )
+
+        return cls(
+            ifc_file=ifc_file,
+            options=options,
+            settings=settings,
+            settings_fp_base=settings_fp_base,
+            settings_fp_high=settings_fp_high,
+            settings_fp_brep=settings_fp_brep,
+            enable_high_detail=enable_high_detail,
+            high_detail_settings=high_detail_settings,
+            detail_mesh_cache=detail_mesh_cache,
+            annotation_hooks=annotation_hooks,
+        )
 
 # ---------------------------------
 # IFC helpers used by the pipeline
@@ -580,10 +1030,12 @@ def triangulated_to_dict(geom) -> Dict[str, Any]:
     g = getattr(geom, "geometry", geom)
     if hasattr(g, "verts"): v = np.array(g.verts, dtype=float).reshape(-1,3)
     elif hasattr(g, "coordinates"): v = np.array(g.coordinates, dtype=float).reshape(-1,3)
-    else: raise AttributeError("No verts/coordinates found")
+    elif hasattr(g, "vertices"): v = np.array(g.vertices, dtype=float).reshape(-1,3)
+    else: raise AttributeError("No verts/coordinates/vertices found")
     if hasattr(g, "faces"): f = np.array(g.faces, dtype=int).reshape(-1,3)
     elif hasattr(g, "triangles"): f = np.array(g.triangles, dtype=int).reshape(-1,3)
-    else: raise AttributeError("No faces/triangles found")
+    elif hasattr(g, "indices"): f = np.array(g.indices, dtype=int).reshape(-1,3)
+    else: raise AttributeError("No faces/triangles/indices found")
     payload: Dict[str, Any] = {"vertices": v, "faces": f}
     normals = getattr(g, "normals", None)
     if normals is not None:
@@ -667,6 +1119,497 @@ def _collect_spatial_hierarchy(product) -> Tuple[Tuple[str, Optional[int]], ...]
     return tuple(hierarchy)
 
 # Minimal map conversion (same signature as before)
+
+def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Return the preferred coordinate operation (map conversion or rigid)."""
+
+    def _map_data_from_conversion(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "Eastings", 0.0), 0.0),
+            northings=_as_float(getattr(op, "Northings", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "OrthogonalHeight", 0.0), 0.0),
+            x_axis_abscissa=_as_float(getattr(op, "XAxisAbscissa", 1.0), 1.0),
+            x_axis_ordinate=_as_float(getattr(op, "XAxisOrdinate", 0.0), 0.0),
+            scale=_as_float(getattr(op, "Scale", 1.0), 1.0) or 1.0,
+        )
+
+    def _map_data_from_rigid(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "FirstCoordinate", 0.0), 0.0),
+            northings=_as_float(getattr(op, "SecondCoordinate", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "Height", 0.0), 0.0),
+            x_axis_abscissa=1.0,
+            x_axis_ordinate=0.0,
+            scale=1.0,
+        )
+
+    best_data: Optional[MapConversionData] = None
+    for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            data: Optional[MapConversionData] = None
+            if op.is_a("IfcMapConversion"):
+                data = _map_data_from_conversion(op)
+            elif op.is_a("IfcRigidOperation"):
+                data = _map_data_from_rigid(op)
+            if data is None:
+                continue
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return data
+            if best_data is None:
+                best_data = data
+    return best_data
+
+
+
+# Absolute/world transform resolver (same signature used by process_usd)
+
+def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
+    """Return the absolute/world 4×4 for the iterator result.
+
+    Priority:
+      1) iterator's per-piece matrix (covers MappingTarget × MappingOrigin × placements)
+      2) ifcopenshell.util.shape.get_shape_matrix(shape) (robust fallback)
+      3) composed IfcLocalPlacement (last resort)
+
+    The order mirrors ifcopenshell's behaviour and keeps instancing stable even
+    when representation maps are nested.  Identity matrices are left intact so
+    USD always has an explicit transform op.
+    """
+    # 1) iterator-provided per-piece matrix
+    tr = getattr(shape, "transformation", None)
+    if tr is not None and hasattr(tr, "matrix"):
+        return tuple(tr.matrix)  # keep even if identity
+
+    # 2) robust util fallback
+    try:
+        from ifcopenshell.util import shape as ifc_shape_util
+        gm = ifc_shape_util.get_shape_matrix(shape)
+        gm = np.array(gm, dtype=float).reshape(4, 4)
+        return tuple(gm.flatten().tolist())   # keep even if identity
+    except Exception:
+        pass
+
+    # 3) composed local placement
+    if element is not None:
+        try:
+            place = getattr(element, "ObjectPlacement", None)
+            gf = compose_object_placement(place, length_to_m=1.0)
+            return gf_to_tuple16(gf)          # keep even if identity
+        except Exception:
+            pass
+
+    return None
+
+
+def _gf_matrix_to_np(matrix) -> np.ndarray:
+    """Convert a pxr.Gf matrix or sequence into a 4x4 numpy array."""
+    if matrix is None:
+        return np.eye(4, dtype=float)
+    if isinstance(matrix, np.ndarray):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    if isinstance(matrix, (list, tuple)):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    try:
+        return np.array([[float(matrix[i][j]) for j in range(4)] for i in range(4)], dtype=float)
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _tuple16_to_np(mat16) -> Optional[np.ndarray]:
+    """Return a 4x4 numpy array for a flattened matrix tuple, or None if invalid."""
+    if mat16 is None:
+        return None
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return arr
+
+
+def _is_affine_invertible_tuple(mat16, *, atol: float = 1e-9) -> bool:
+    """Heuristic check that a flattened 4x4 matrix represents an invertible affine transform."""
+    arr = _tuple16_to_np(mat16)
+    if arr is None:
+        return False
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0], dtype=float), atol=atol):
+        return False
+    try:
+        det = float(np.linalg.det(arr[:3, :3]))
+    except Exception:
+        return False
+    return abs(det) > atol
+
+def _axis_placement_to_np(axis_placement) -> np.ndarray:
+    """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
+    if axis_placement is None:
+        return np.eye(4, dtype=float)
+    try:
+        return _gf_matrix_to_np(axis2placement_to_matrix(axis_placement, length_to_m=1.0))
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _is_identity16(mat16, atol=1e-10):
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4,4)
+        return np.allclose(arr, np.eye(4), atol=atol)
+    except Exception:
+        return False
+
+# Dummy 2D curves extraction kept (no change to signature)
+
+
+def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
+    coords = list(getattr(point, "Coordinates", []) or [])
+    x = _as_float(coords[0] if len(coords) > 0 else 0.0)
+    y = _as_float(coords[1] if len(coords) > 1 else 0.0)
+    z = _as_float(coords[2] if len(coords) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _point_list_entry_to_tuple(entry) -> Tuple[float, float, float]:
+    """Best-effort conversion for CoordList tuples (supports 2D/3D lists)."""
+    if entry is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(entry, (list, tuple)):
+        seq = entry
+    else:
+        if hasattr(entry, "wrappedValue"):
+            seq = entry.wrappedValue
+        elif hasattr(entry, "CoordList"):
+            seq = getattr(entry, "CoordList") or []
+        elif hasattr(entry, "Coordinates"):
+            seq = getattr(entry, "Coordinates") or []
+        else:
+            try:
+                seq = list(entry)
+            except Exception:
+                seq = []
+    x = _as_float(seq[0] if len(seq) > 0 else 0.0)
+    y = _as_float(seq[1] if len(seq) > 1 else 0.0)
+    z = _as_float(seq[2] if len(seq) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _indexed_polycurve_points(curve) -> List[Tuple[float, float, float]]:
+    """Expand an IfcIndexedPolyCurve into explicit XYZ points."""
+    point_list = getattr(curve, "Points", None)
+    if point_list is None:
+        return []
+    coord_list = getattr(point_list, "CoordList", None)
+    if coord_list is None:
+        coord_list = getattr(point_list, "CoordinatesList", None)
+    coords: List[Tuple[float, float, float]] = []
+    if coord_list:
+        for entry in coord_list:
+            coords.append(_point_list_entry_to_tuple(entry))
+    if not coords:
+        return []
+
+    segments = list(getattr(curve, "Segments", None) or [])
+    if not segments:
+        return coords
+
+    result: List[Tuple[float, float, float]] = []
+
+    def _append_index(raw_index) -> None:
+        try:
+            idx = int(raw_index)
+        except Exception:
+            return
+        idx -= 1  # IfcPositiveInteger is 1-based
+        if idx < 0 or idx >= len(coords):
+            return
+        point = coords[idx]
+        if result and result[-1] == point:
+            return
+        result.append(point)
+
+    for segment in segments:
+        if segment is None:
+            continue
+        if hasattr(segment, "wrappedValue"):
+            indices = segment.wrappedValue
+        elif hasattr(segment, "Points"):
+            indices = getattr(segment, "Points", None) or ()
+        elif isinstance(segment, (list, tuple)):
+            indices = segment
+        else:
+            try:
+                indices = list(segment)
+            except Exception:
+                indices = (segment,)
+        if not indices:
+            continue
+        # Some representations wrap the tuple once more (e.g. [(1,2,3)]).
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            indices = indices[0]
+        for raw_index in indices:
+            if isinstance(raw_index, (list, tuple)):
+                for nested in raw_index:
+                    _append_index(nested)
+            else:
+                _append_index(raw_index)
+
+    return result if result else coords
+
+
+def _object_placement_to_np(obj_placement) -> np.ndarray:
+    """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
+    try:
+        gf_matrix = compose_object_placement(obj_placement, length_to_m=1.0)
+    except Exception:
+        return np.eye(4, dtype=float)
+    return _gf_matrix_to_np(gf_matrix)
+def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
+    """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
+    if op is None:
+        return np.eye(4, dtype=float)
+
+    try:
+        origin_src = getattr(getattr(op, "LocalOrigin", None), "Coordinates", None) or (0.0, 0.0, 0.0)
+        origin_tuple = tuple(origin_src) + (0.0, 0.0, 0.0)
+        origin = np.array([_as_float(c) for c in origin_tuple[:3]], dtype=float)
+    except Exception:
+        origin = np.zeros(3, dtype=float)
+
+    def _vec(data, fallback):
+        if not data:
+            return np.array(fallback, dtype=float)
+        return np.array([_as_float(c) for c in data], dtype=float)
+
+    x_axis = _vec(getattr(getattr(op, "Axis1", None), "DirectionRatios", None), (1.0, 0.0, 0.0))
+    y_axis = _vec(getattr(getattr(op, "Axis2", None), "DirectionRatios", None), (0.0, 1.0, 0.0))
+    z_data = getattr(getattr(op, "Axis3", None), "DirectionRatios", None)
+    z_axis = _vec(z_data, (0.0, 0.0, 1.0)) if z_data else np.cross(x_axis, y_axis)
+
+    def _norm(vec: np.ndarray) -> np.ndarray:
+        length = np.linalg.norm(vec)
+        return vec if length <= 1e-12 else vec / length
+
+    x_axis = _norm(x_axis)
+    y_axis = _norm(y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    z_axis = _norm(z_axis)
+
+    if abs(float(np.dot(x_axis, y_axis))) > 0.9999:
+        y_axis = _norm(np.cross(z_axis, x_axis))
+    x_axis = _norm(np.cross(y_axis, z_axis))
+
+    scale = _as_float(getattr(op, "Scale", 1.0) or 1.0, 1.0)
+    sx = scale
+    sy = _as_float(getattr(op, "Scale2", scale) or scale, scale)
+    sz = _as_float(getattr(op, "Scale3", scale) or scale, scale)
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 0] = x_axis * sx
+    transform[:3, 1] = y_axis * sy
+    transform[:3, 2] = z_axis * sz
+    transform[:3, 3] = origin
+    return transform
+
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingTarget ∘ MappingOrigin (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return target_np @ origin_np
+
+
+def _mapping_item_transform(product, mapped_item) -> np.ndarray:
+    """R->W for a mapped item: placement (P->W) composed with map (R->P)."""
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+    map_np = _repmap_rt_matrix(mapped_item)
+    return placement_np @ map_np
+
+
+def _map_conversion_to_np(conv) -> np.ndarray:
+    """Build a 4x4 from IfcMapConversion parameters."""
+    scale = _as_float(getattr(conv, "Scale", 1.0) or 1.0, 1.0)
+    east = _as_float(getattr(conv, "Eastings", 0.0), 0.0)
+    north = _as_float(getattr(conv, "Northings", 0.0), 0.0)
+    height = _as_float(getattr(conv, "OrthogonalHeight", 0.0), 0.0)
+    ax = _as_float(getattr(conv, "XAxisAbscissa", 1.0), 1.0)
+    ay = _as_float(getattr(conv, "XAxisOrdinate", 0.0), 0.0)
+    norm = math.hypot(ax, ay) or 1.0
+    cos = ax / norm
+    sin = ay / norm
+    mat = np.eye(4, dtype=float)
+    mat[0, 0] = cos * scale
+    mat[0, 1] = -sin * scale
+    mat[1, 0] = sin * scale
+    mat[1, 1] = cos * scale
+    mat[0, 3] = east
+    mat[1, 3] = north
+    mat[2, 3] = height
+    return mat
+
+
+def _rigid_operation_to_np(op) -> np.ndarray:
+    """Build a 4x4 translation matrix from an IfcRigidOperation."""
+    tx = _as_float(getattr(op, "FirstCoordinate", 0.0), 0.0)
+    ty = _as_float(getattr(op, "SecondCoordinate", 0.0), 0.0)
+    tz = _as_float(getattr(op, "Height", 0.0), 0.0)
+    mat = np.eye(4, dtype=float)
+    mat[0, 3] = tx
+    mat[1, 3] = ty
+    mat[2, 3] = tz
+    return mat
+
+def _context_to_np(ctx) -> np.ndarray:
+    """Compose nested representation contexts into a single matrix."""
+    transform = np.eye(4, dtype=float)
+    visited = set()
+    current = ctx
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        wcs = getattr(current, "WorldCoordinateSystem", None)
+        if wcs is not None:
+            transform = transform @ _axis_placement_to_np(wcs)
+        for op in getattr(current, "HasCoordinateOperation", None) or []:
+            if op is None:
+                continue
+            try:
+                if op.is_a("IfcMapConversion"):
+                    transform = transform @ _map_conversion_to_np(op)
+                elif op.is_a("IfcRigidOperation"):
+                    transform = transform @ _rigid_operation_to_np(op)
+            except Exception:
+                continue
+        current = getattr(current, "ParentContext", None)
+    return transform
+
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if text in {"F", "FALSE", "NO", "0"}:
+        return False
+    if text in {"T", "TRUE", "YES", "1"}:
+        return True
+    return None
+
+
+def _layer_is_hidden(layer) -> bool:
+    if layer is None:
+        return False
+    for attr in ("LayerOn", "LayerVisible", "LayerVisibility"):
+        if _to_bool(getattr(layer, attr, None)) is False:
+            return True
+    for attr in ("LayerFrozen", "LayerBlocked"):
+        if _to_bool(getattr(layer, attr, None)) is True:
+            return True
+    return False
+
+
+def _entity_on_hidden_layer(entity) -> bool:
+    """Return True if the entity or any of its representations are hidden."""
+    seen: set[int] = set()
+
+    def _collect(obj):
+        if obj is None:
+            return
+        for layer in getattr(obj, "LayerAssignments", None) or []:
+            if layer is None:
+                continue
+            try:
+                lid = int(layer.id())
+            except Exception:
+                lid = id(layer)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            yield layer
+
+    for layer in _collect(entity):
+        if _layer_is_hidden(layer):
+            return True
+
+    rep = getattr(entity, "Representation", None)
+    if rep is not None:
+        for layer in _collect(rep):
+            if _layer_is_hidden(layer):
+                return True
+        for representation in getattr(rep, "Representations", []) or []:
+            for layer in _collect(representation):
+                if _layer_is_hidden(layer):
+                    return True
+            for item in getattr(representation, "Items", []) or []:
+                for layer in _collect(item):
+                    if _layer_is_hidden(layer):
+                        return True
+    return False
+
+def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    """Traverse curve/curve-set items and gather 3D points."""
+    if item is None:
+        return []
+    if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
+        pts: List[Tuple[float, float, float]] = []
+        for p in getattr(item, "Points", []) or []:
+            try:
+                pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
+            pts.extend(_extract_curve_points(parent))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        return _extract_curve_points(getattr(item, "BasisCurve", None))
+    if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
+    if hasattr(item, "is_a") and item.is_a("IfcIndexedPolyCurve"):
+        return _indexed_polycurve_points(item)
+    return []
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
+
 
 def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
     """Return the preferred coordinate operation (map conversion or rigid)."""
@@ -1281,67 +2224,75 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     function also records per-instance transforms, attribute dictionaries, 2-D
     annotation curves, and optional map conversion metadata.
     """
+    options = options or ConversionOptions()
     if options.enable_hash_dedup:
         log.info(
             "Hash-based prototype de-duplication is ENABLED (experimental). "
             "Identical tessellated occurrences will share hashed prototypes; "
             "set enable_hash_dedup=False to opt out if issues arise."
         )
-    enable_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
-    if not enable_high_detail:
-        log.info("High-detail remeshing is DISABLED; using iterator tessellation only.")
-    settings = ifcopenshell.geom.settings()
-    _apply_geom_settings(settings, _BASE_GEOM_SETTINGS)
-    high_detail_settings = None
-    if enable_high_detail:
-        high_detail_settings = ifcopenshell.geom.settings()
-        high_overrides = dict(_BASE_GEOM_SETTINGS)
-        high_overrides.update(_HIGH_DETAIL_OVERRIDES)
-        _apply_geom_settings(high_detail_settings, high_overrides)
-    repmaps: Dict[int, MeshProto] = {}
-    repmap_counts: Counter = Counter()
-    hashes: Dict[str, HashProto] = {}
-    step_keys: Dict[int, PrototypeKey] = {}
-    instances: Dict[int, InstanceRecord] = {}
-    hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]] = {}
+    ctx = PrototypeBuildContext.build(ifc_file, options)
 
-    settings_fp_base = _settings_fingerprint(settings)
-    if enable_high_detail and high_detail_settings is not None:
-        settings_fp_high = _settings_fingerprint(high_detail_settings)
-        settings_fp_brep = hashlib.md5(f"{settings_fp_high}|brep".encode("utf-8")).hexdigest()
-    else:
-        settings_fp_high = settings_fp_base
-        settings_fp_brep = settings_fp_base
+    settings = ctx.settings
+    high_detail_settings = ctx.high_detail_settings
+    enable_high_detail = ctx.enable_high_detail
+    detail_mesh_cache = ctx.detail_mesh_cache
+    repmaps = ctx.repmaps
+    repmap_counts = ctx.repmap_counts
+    hashes = ctx.hashes
+    step_keys = ctx.step_keys
+    instances = ctx.instances
+    hierarchy_cache = ctx.hierarchy_cache
+    settings_fp_base = ctx.settings_fp_base
+    settings_fp_high = ctx.settings_fp_high
+    settings_fp_brep = ctx.settings_fp_brep
+    annotation_hooks = ctx.annotation_hooks
+
     iterator = ifcopenshell.geom.iterator(settings, ifc_file, threads)
     if not iterator.initialize():
         # Fallback: still return caches for downstream authoring (empty)
         return PrototypeCaches(
-            repmaps=repmaps, repmap_counts=repmap_counts, hashes=hashes,
-            step_keys=step_keys, instances=instances,
-            annotations=extract_annotation_curves(ifc_file, hierarchy_cache),
+            repmaps=repmaps,
+            repmap_counts=repmap_counts,
+            hashes=hashes,
+            step_keys=step_keys,
+            instances=instances,
+            annotations=extract_annotation_curves(ifc_file, hierarchy_cache, annotation_hooks),
             map_conversion=extract_map_conversion(ifc_file),
         )
 
-    while True:
+    while iterator.next():
         shape = iterator.get()
-        if shape is None: break
+        if shape is None:
+            continue
+        try:
+            step_id = int(getattr(shape, "id"))
+        except Exception:
+            data = getattr(shape, "data", None)
+            step_id = getattr(data, "id", None) if data is not None else None
+            if step_id is None and hasattr(shape, "geometry"):
+                step_id = getattr(shape.geometry, "id", None)
+            if step_id is not None:
+                try:
+                    step_id = int(step_id)
+                except Exception:
+                    step_id = None
+        if step_id is None:
+            log.debug("Iterator returned shape without step id; skipping.")
+            continue
 
-        product = ifc_file.by_id(shape.id)
+        product = ifc_file.by_id(step_id)
         if product is None:
-            if not iterator.next(): break
             continue
 
         if hasattr(product, "is_a") and product.is_a("IfcOpeningElement"):
-            if not iterator.next(): break
             continue
 
         if _entity_on_hidden_layer(product):
-            if not iterator.next(): break
             continue
 
         geom = getattr(shape, "geometry", None)
         if geom is None:
-            if not iterator.next(): break
             continue
 
         materials = _clone_materials(getattr(geom, "materials", None))
@@ -1355,6 +2306,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
 
         product_class = product.is_a() if hasattr(product, "is_a") else None
         product_class_upper = product_class.upper() if isinstance(product_class, str) else None
+        product_name = getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<unnamed>"
+
+        try:
+            product_id_int = int(product.id())
+        except Exception:
+            product_id_int = None
 
         def _mesh_from_geom(candidate_geom):
             try:
@@ -1384,7 +2341,11 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             )
         detail_reasons: List[str] = []
         detail_mode = "base"
-        detail_mesh_data: Optional["OCCDetailMesh"] = None
+        detail_mesh_data: Optional["OCCDetailMesh"] = (
+            detail_mesh_cache.get(product_id_int) if product_id_int is not None else None
+        )
+        detail_source_obj: Any = shape
+        detail_settings_obj = None
 
         needs_high_detail = False
         allow_brep_fallback = False
@@ -1421,7 +2382,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     materials = _clone_materials(getattr(remeshed, "materials", materials) or materials)
                     material_ids = list(getattr(remeshed, "material_ids", material_ids) or material_ids)
                     detail_mode = "high"
-                    detail_mesh_data = _build_detail_mesh_payload(remeshed, high_detail_settings)
+                    detail_source_obj = remeshed
                 else:
                     mesh_dict = mesh_dict_base
                     mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
@@ -1445,7 +2406,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     materials = _clone_materials(getattr(remeshed_brep, "materials", materials) or materials)
                     material_ids = list(getattr(remeshed_brep, "material_ids", material_ids) or material_ids)
                     detail_mode = "brep"
-                    detail_mesh_data = _build_detail_mesh_payload(remeshed_brep, high_detail_settings)
+                    detail_source_obj = remeshed_brep
                 else:
                     detail_reasons.append("brep_fallback_empty_geometry")
                     mesh_dict = mesh_dict_base
@@ -1455,14 +2416,64 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 mesh_dict = mesh_dict_base
                 mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
 
+        if enable_high_detail and detail_mesh_data is None:
+            detail_settings_obj = high_detail_settings or settings
+            detail_mesh_data = _build_detail_mesh_payload(
+                detail_source_obj,
+                detail_settings_obj,
+                product=product,
+            )
+            if detail_mesh_data is None:
+                log.debug(
+                    "Detail mode: OCC mesh unavailable for %s guid=%s step=%s name=%s",
+                    product_class_upper or product_class or "<unknown>",
+                    getattr(product, "GlobalId", None),
+                    step_id,
+                    product_name,
+                )
+
+        if detail_mesh_data is not None:
+            subshape_entries = getattr(detail_mesh_data, "subshapes", None) or []
+            subshape_count = len(subshape_entries)
+            face_total = getattr(detail_mesh_data, "face_count", None)
+            log.debug(
+                "Detail mode: OCC mesh ready for %s guid=%s step=%s name=%s | subshapes=%d faces=%s",
+                product_class_upper or product_class or "<unknown>",
+                getattr(product, "GlobalId", None),
+                step_id,
+                product_name,
+                subshape_count,
+                face_total if face_total is not None else "n/a",
+            )
+            if subshape_entries:
+                for entry in subshape_entries:
+                    label = getattr(entry, "label", "<subshape>")
+                    shape_type = getattr(entry, "shape_type", "<unknown>")
+                    faces_list = getattr(entry, "faces", None) or []
+                    log.debug(
+                        "  ↳ Subshape %s (%s) faces=%d",
+                        label,
+                        shape_type,
+                        len(faces_list),
+                    )
+            occ_mesh_dict = _mesh_from_detail_mesh(detail_mesh_data)
+            if occ_mesh_dict is not None and (
+                mesh_dict is None
+                or "faces" not in mesh_dict
+                or mesh_dict["faces"].size == 0
+            ):
+                mesh_dict = occ_mesh_dict
+                mesh_dict_base = occ_mesh_dict
+                mesh_stats = _mesh_stats(occ_mesh_dict)
+                if detail_settings_obj is high_detail_settings and high_detail_settings is not None:
+                    settings_fp_current = settings_fp_high
+
         if mesh_dict is None:
-            if not iterator.next(): break
             continue
 
         try:
             mesh_hash = stable_mesh_hash(mesh_dict["vertices"], mesh_dict["faces"])
         except Exception:
-            if not iterator.next(): break
             continue
 
         guid_for_log = getattr(product, "GlobalId", None)
@@ -1599,7 +2610,6 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             detail_mesh_for_instance = detail_mesh_data
 
         if primary_key is None and instance_mesh is None:
-            if not iterator.next(): break
             continue
 
         # Build InstanceRecord
@@ -1674,14 +2684,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             detail_mesh=detail_mesh_for_instance,
         )
 
-        if not iterator.next(): break
-
     return PrototypeCaches(
         repmaps=repmaps,
         repmap_counts=repmap_counts,
         hashes=hashes,
         step_keys=step_keys,
         instances=instances,
-        annotations=extract_annotation_curves(ifc_file, hierarchy_cache),
+        annotations=extract_annotation_curves(ifc_file, hierarchy_cache, annotation_hooks),
         map_conversion=extract_map_conversion(ifc_file),
     )

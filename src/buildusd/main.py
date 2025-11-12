@@ -509,6 +509,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable component-level material classification to reconcile IFC style colours.",
     )
+    parser.add_argument(
+        "--detail-mode",
+        dest="detail_mode",
+        action="store_true",
+        help="Forward the conversion through the OCC detail pipeline (enables high-detail remeshing).",
+    )
     return parser.parse_args(argv)
 # ------------- helpers -------------
 def _strip_quotes(value: str) -> str:
@@ -1512,6 +1518,9 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     if getattr(args, "enable_material_classification", False):
         LOG.info("Material classification enabled: running component-based style reconciliation.")
         options_override = replace(options_override, enable_material_classification=True)
+    if getattr(args, "detail_mode", False):
+        LOG.info("Detail mode enabled: forwarding to OCC high-detail conversion path.")
+        options_override = replace(options_override, enable_high_detail_remesh=True)
     try:
         results = convert(
             args.input_path,
