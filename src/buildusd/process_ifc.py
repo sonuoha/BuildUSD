@@ -22,11 +22,11 @@ import ifcopenshell
 import os
 import math
 import re
-from typing import Dict, Optional, Union, Literal, List, Tuple, Any, TYPE_CHECKING, Iterable
+from typing import Dict, Optional, Union, Literal, List, Tuple, Any, TYPE_CHECKING, Iterable, Set
 from dataclasses import dataclass, field
 import hashlib
 
-from .ifc_visuals import PBRMaterial, build_material_for_product, extract_face_style_groups
+from .ifc_visuals import PBRMaterial, build_material_for_product, extract_face_style_groups, get_face_styles
 from . import occ_detail
 from .process_ifc_2d import AnnotationCurve, AnnotationHooks, extract_annotation_curves
 
@@ -61,7 +61,87 @@ def _clone_style_groups(groups):
         material = entry.get("material")
         faces = [int(idx) for idx in entry.get("faces", [])]
         cloned[key] = {"material": material, "faces": faces}
+        if "style_id" in entry:
+            cloned[key]["style_id"] = entry["style_id"]
     return cloned
+
+
+def _build_object_scope_detail_mesh(
+    ctx: PrototypeBuildContext,
+    product,
+    *,
+    material_resolver,
+) -> Optional["OCCDetailMesh"]:
+    if ctx.object_scope_settings is None:
+        return None
+    log.info(
+        "Detail scope object: building OCC mesh for %s name=%s guid=%s",
+        product.is_a() if hasattr(product, "is_a") else "<product>",
+        getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<unnamed>",
+        getattr(product, "GlobalId", None),
+    )
+    try:
+        shape_obj = ifcopenshell.geom.create_shape(ctx.object_scope_settings, product)
+    except Exception as exc:
+        log.warning(
+            "Object-scope detail: failed to create OCC shape for %s guid=%s: %s",
+            product.is_a() if hasattr(product, "is_a") else "<product>",
+            getattr(product, "GlobalId", None),
+            exc,
+        )
+        return None
+    geometry = getattr(shape_obj, "geometry", shape_obj)
+    if geometry is None:
+        log.warning(
+            "Object-scope detail: OCC geometry empty for %s guid=%s",
+            product.is_a() if hasattr(product, "is_a") else "<product>",
+            getattr(product, "GlobalId", None),
+        )
+        return None
+    return occ_detail.build_detail_mesh_payload(
+        geometry,
+        ctx.object_scope_settings,
+        product=product,
+        default_linear_def=_DEFAULT_LINEAR_DEF,
+        default_angular_def=_DEFAULT_ANGULAR_DEF,
+        logger=log,
+        detail_level=ctx.detail_level,
+        material_resolver=material_resolver,
+    )
+
+
+def _build_detail_material_resolver(
+    ifc_file,
+    product,
+    style_token_by_style_id: Dict[int, str],
+    has_instance_style: bool,
+    default_material_key: Optional[Any],
+):
+    face_styles_cache: Optional[Dict[int, List[Any]]] = None
+
+    def _resolver(item) -> Optional[Any]:
+        nonlocal face_styles_cache
+        if face_styles_cache is None:
+            try:
+                face_styles_cache = get_face_styles(ifc_file, product) or {}
+            except Exception:
+                face_styles_cache = {}
+        styles = face_styles_cache.get(id(item)) if face_styles_cache else None
+        if styles:
+            for style in styles:
+                try:
+                    style_id = int(style.id())
+                except Exception:
+                    style_id = None
+                if style_id is not None:
+                    token = style_token_by_style_id.get(style_id)
+                    if token:
+                        return token
+        if has_instance_style:
+            return "__style__instance"
+        return default_material_key
+
+    return _resolver
 
 # USD-lite vector/matrix shim for placement helpers
 try:
@@ -349,6 +429,10 @@ class ConversionOptions:
     anchor_mode: Optional[Literal["local", "site"]] = None
     split_topology_by_material: bool = False
     enable_material_classification: bool = False
+    detail_scope: Literal["none", "all", "object"] = "none"
+    detail_level: Literal["subshape", "face"] = "subshape"
+    detail_object_ids: Tuple[int, ...] = tuple()
+    detail_object_guids: Tuple[str, ...] = tuple()
 
 @dataclass(frozen=True)
 class PrototypeKey:
@@ -431,14 +515,40 @@ class PrototypeBuildContext:
     step_keys: Dict[int, PrototypeKey] = field(default_factory=dict)
     instances: Dict[int, InstanceRecord] = field(default_factory=dict)
     hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]] = field(default_factory=dict)
-    annotation_hooks: AnnotationHooks = field()
+    annotation_hooks: Optional[AnnotationHooks] = field(default=None)
+    detail_scope: Literal["none", "all", "object"] = "none"
+    detail_level: Literal["subshape", "face"] = "subshape"
+    detail_object_ids: Set[int] = field(default_factory=set)
+    detail_object_guids: Set[str] = field(default_factory=set)
+    user_high_detail: bool = False
+    object_scope_settings: Optional[Any] = None
 
     @classmethod
     def build(cls, ifc_file, options: Optional[ConversionOptions]) -> "PrototypeBuildContext":
         if options is None:
             options = ConversionOptions()
 
-        enable_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
+        detail_scope = getattr(options, "detail_scope", "none") or "none"
+        if detail_scope not in ("none", "all", "object"):
+            detail_scope = "none"
+        detail_level = getattr(options, "detail_level", "subshape") or "subshape"
+        if detail_level not in ("subshape", "face"):
+            detail_level = "subshape"
+        detail_object_ids: Set[int] = set()
+        for value in getattr(options, "detail_object_ids", tuple()) or tuple():
+            try:
+                detail_object_ids.add(int(value))
+            except Exception:
+                continue
+        detail_object_guids: Set[str] = {
+            str(value).strip().upper()
+            for value in (getattr(options, "detail_object_guids", tuple()) or tuple())
+            if str(value).strip()
+        }
+
+        detail_mode_requested = detail_scope in ("all", "object")
+        user_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
+        enable_high_detail = user_high_detail or detail_mode_requested
         if not enable_high_detail:
             log.info("High-detail remeshing is DISABLED; using iterator tessellation only.")
 
@@ -465,13 +575,18 @@ class PrototypeBuildContext:
                 enable_high_detail = False
 
         detail_mesh_cache: Dict[int, "OCCDetailMesh"] = {}
-        if enable_high_detail and occ_detail.is_available():
+        if (
+            enable_high_detail
+            and detail_scope == "all"
+            and occ_detail.is_available()
+        ):
             detail_prepass_settings = high_detail_settings or settings
             detail_mesh_cache = occ_detail.precompute_detail_meshes(
                 ifc_file,
                 detail_prepass_settings,
                 default_linear_def=_DEFAULT_LINEAR_DEF,
                 default_angular_def=_DEFAULT_ANGULAR_DEF,
+                detail_level=detail_level,
                 logger=log,
             )
 
@@ -494,6 +609,16 @@ class PrototypeBuildContext:
             transform_points=_transform_points,
         )
 
+        object_scope_settings = None
+        if detail_scope == "object":
+            try:
+                object_scope_settings = ifcopenshell.geom.settings()
+                _apply_geom_settings(object_scope_settings, _BASE_GEOM_SETTINGS)
+                if not _enable_occ(object_scope_settings):
+                    object_scope_settings = None
+            except Exception:
+                object_scope_settings = None
+
         return cls(
             ifc_file=ifc_file,
             options=options,
@@ -505,7 +630,24 @@ class PrototypeBuildContext:
             high_detail_settings=high_detail_settings,
             detail_mesh_cache=detail_mesh_cache,
             annotation_hooks=annotation_hooks,
+            detail_scope=detail_scope,
+            detail_level=detail_level,
+            detail_object_ids=detail_object_ids,
+            detail_object_guids=detail_object_guids,
+            user_high_detail=user_high_detail,
+            object_scope_settings=object_scope_settings,
         )
+
+    def wants_detail_for_product(self, step_id: Optional[int], guid: Optional[str]) -> bool:
+        if self.detail_scope != "object":
+            return False
+        if step_id is not None and step_id in self.detail_object_ids:
+            return True
+        if guid:
+            guid_upper = str(guid).strip().upper()
+            if guid_upper and guid_upper in self.detail_object_guids:
+                return True
+        return False
 
 # ---------------------------------
 # IFC helpers used by the pipeline
@@ -1700,103 +1842,2950 @@ def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, fl
     ]
 
 
-def extract_annotation_curves(
-    ifc_file,
-    hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]],
-) -> Dict[int, AnnotationCurve]:
-    """Harvest annotation curves (alignment strings, polylines, etc.)."""
-    annotations: Dict[int, AnnotationCurve] = {}
+def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Return the preferred coordinate operation (map conversion or rigid)."""
+
+    def _map_data_from_conversion(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "Eastings", 0.0), 0.0),
+            northings=_as_float(getattr(op, "Northings", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "OrthogonalHeight", 0.0), 0.0),
+            x_axis_abscissa=_as_float(getattr(op, "XAxisAbscissa", 1.0), 1.0),
+            x_axis_ordinate=_as_float(getattr(op, "XAxisOrdinate", 0.0), 0.0),
+            scale=_as_float(getattr(op, "Scale", 1.0), 1.0) or 1.0,
+        )
+
+    def _map_data_from_rigid(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "FirstCoordinate", 0.0), 0.0),
+            northings=_as_float(getattr(op, "SecondCoordinate", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "Height", 0.0), 0.0),
+            x_axis_abscissa=1.0,
+            x_axis_ordinate=0.0,
+            scale=1.0,
+        )
+
+    best_data: Optional[MapConversionData] = None
+    for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            data: Optional[MapConversionData] = None
+            if op.is_a("IfcMapConversion"):
+                data = _map_data_from_conversion(op)
+            elif op.is_a("IfcRigidOperation"):
+                data = _map_data_from_rigid(op)
+            if data is None:
+                continue
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return data
+            if best_data is None:
+                best_data = data
+    return best_data
+
+
+
+# Absolute/world transform resolver (same signature used by process_usd)
+
+def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
+    """Return the absolute/world 4×4 for the iterator result.
+
+    Priority:
+      1) iterator's per-piece matrix (covers MappingTarget × MappingOrigin × placements)
+      2) ifcopenshell.util.shape.get_shape_matrix(shape) (robust fallback)
+      3) composed IfcLocalPlacement (last resort)
+
+    The order mirrors ifcopenshell's behaviour and keeps instancing stable even
+    when representation maps are nested.  Identity matrices are left intact so
+    USD always has an explicit transform op.
+    """
+    # 1) iterator-provided per-piece matrix
+    tr = getattr(shape, "transformation", None)
+    if tr is not None and hasattr(tr, "matrix"):
+        return tuple(tr.matrix)  # keep even if identity
+
+    # 2) robust util fallback
     try:
-        contexts = [
-            ctx for ctx in (ifc_file.by_type("IfcGeometricRepresentationContext") or [])
-            if str(getattr(ctx, "ContextType", "") or "").strip().lower() == "annotation"
-            or str(getattr(ctx, "ContextIdentifier", "") or "").strip().lower() == "annotation"
-        ]
+        from ifcopenshell.util import shape as ifc_shape_util
+        gm = ifc_shape_util.get_shape_matrix(shape)
+        gm = np.array(gm, dtype=float).reshape(4, 4)
+        return tuple(gm.flatten().tolist())   # keep even if identity
     except Exception:
-        contexts = []
-    context_ids = {ctx.id() for ctx in contexts}
+        pass
 
-    annotation_rep_types = {"annotation","annotation2d","curve","curve2d","curve3d","geometriccurveset","geometricset"}
-    annotation_ident_tokens = {"annotation","alignment"}
-
-    def _hierarchy_for(ent) -> Tuple[Tuple[str, Optional[int]], ...]:
-        try: key = ent.id()
-        except Exception: key = id(ent)
-        cached = hierarchy_cache.get(key)
-        if cached is None:
-            cached = _collect_spatial_hierarchy(ent)
-            hierarchy_cache[key] = cached
-        return cached
-
-    for product in ifc_file.by_type("IfcProduct") or []:
-        if _entity_on_hidden_layer(product):
-            continue
-        rep = getattr(product, "Representation", None)
-        if not rep:
-            continue
-        hierarchy = _hierarchy_for(product)
-        name = _entity_label(product)
+    # 3) composed local placement
+    if element is not None:
         try:
-            placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+            place = getattr(element, "ObjectPlacement", None)
+            gf = compose_object_placement(place, length_to_m=1.0)
+            return gf_to_tuple16(gf)          # keep even if identity
         except Exception:
-            placement_np = np.eye(4, dtype=float)
+            pass
 
-        for rep_ctx in getattr(rep, "Representations", []) or []:
-            ctx = getattr(rep_ctx, "ContextOfItems", None)
-            rep_type = str(getattr(rep_ctx, "RepresentationType", "") or "").strip().lower()
-            rep_ident = str(getattr(rep_ctx, "RepresentationIdentifier", "") or "").strip().lower()
-            ctx_is_ann = ctx is not None and ctx.id() in context_ids
-            rep_is_ann = (rep_type in annotation_rep_types) or any(t in rep_ident for t in annotation_ident_tokens)
+    return None
 
-            for item in getattr(rep_ctx, "Items", []) or []:
-                if not hasattr(item, "is_a"):
-                    continue
 
-                item_ann = ctx_is_ann or rep_is_ann
-                context_np = _context_to_np(ctx) if ctx is not None else np.eye(4, dtype=float)
-                transform = context_np @ placement_np
-                item_type = str(item.is_a() if hasattr(item, "is_a") else "").lower()
+def _gf_matrix_to_np(matrix) -> np.ndarray:
+    """Convert a pxr.Gf matrix or sequence into a 4x4 numpy array."""
+    if matrix is None:
+        return np.eye(4, dtype=float)
+    if isinstance(matrix, np.ndarray):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    if isinstance(matrix, (list, tuple)):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    try:
+        return np.array([[float(matrix[i][j]) for j in range(4)] for i in range(4)], dtype=float)
+    except Exception:
+        return np.eye(4, dtype=float)
 
-                if item.is_a("IfcMappedItem"):
-                    src = getattr(item, "MappingSource", None)
-                    mapped = getattr(src, "MappedRepresentation", None) if src else None
-                    mapped_type = str(getattr(mapped, "RepresentationType", "") or "").strip().lower() if mapped else ""
-                    mapped_ident = str(getattr(mapped, "RepresentationIdentifier", "") or "").strip().lower() if mapped else ""
-                    mapped_ctx = getattr(mapped, "ContextOfItems", None) if mapped else None
-                    mapped_ctx_np = _context_to_np(mapped_ctx) if mapped_ctx is not None else np.eye(4, dtype=float)
-                    if mapped_ctx is not None and mapped_ctx.id() in context_ids:
-                        item_ann = True
-                    if mapped_type in annotation_rep_types or any(t in mapped_ident for t in annotation_ident_tokens):
-                        item_ann = True
-                    try:
-                        transform = context_np @ (mapped_ctx_np @ _mapping_item_transform(product, item))
-                    except Exception:
-                        transform = context_np @ (mapped_ctx_np @ placement_np)
-                else:
-                    if item.is_a("IfcGeometricSet") or item.is_a("IfcGeometricCurveSet") or item.is_a("IfcPolyline"):
-                        item_ann = True
-                    elif "curve" in item_type and "surface" not in item_type:
-                        item_ann = True
 
-                if not item_ann:
-                    continue
+def _tuple16_to_np(mat16) -> Optional[np.ndarray]:
+    """Return a 4x4 numpy array for a flattened matrix tuple, or None if invalid."""
+    if mat16 is None:
+        return None
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return arr
 
-                pts = _extract_curve_points(item)
-                if len(pts) < 2:
-                    continue
-                try:
-                    pts_world = _transform_points(pts, transform)
-                except Exception:
-                    pts_world = pts
-                if len(pts_world) < 2:
-                    continue
 
-                try: step_id = item.id()
-                except Exception: step_id = id(item)
-                annotations[step_id] = AnnotationCurve(
-                    step_id=step_id, name=name, points=pts_world, hierarchy=hierarchy
-                )
-    return annotations
+def _is_affine_invertible_tuple(mat16, *, atol: float = 1e-9) -> bool:
+    """Heuristic check that a flattened 4x4 matrix represents an invertible affine transform."""
+    arr = _tuple16_to_np(mat16)
+    if arr is None:
+        return False
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0], dtype=float), atol=atol):
+        return False
+    try:
+        det = float(np.linalg.det(arr[:3, :3]))
+    except Exception:
+        return False
+    return abs(det) > atol
+
+def _axis_placement_to_np(axis_placement) -> np.ndarray:
+    """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
+    if axis_placement is None:
+        return np.eye(4, dtype=float)
+    try:
+        return _gf_matrix_to_np(axis2placement_to_matrix(axis_placement, length_to_m=1.0))
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _is_identity16(mat16, atol=1e-10):
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4,4)
+        return np.allclose(arr, np.eye(4), atol=atol)
+    except Exception:
+        return False
+
+# Dummy 2D curves extraction kept (no change to signature)
+
+
+def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
+    coords = list(getattr(point, "Coordinates", []) or [])
+    x = _as_float(coords[0] if len(coords) > 0 else 0.0)
+    y = _as_float(coords[1] if len(coords) > 1 else 0.0)
+    z = _as_float(coords[2] if len(coords) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _point_list_entry_to_tuple(entry) -> Tuple[float, float, float]:
+    """Best-effort conversion for CoordList tuples (supports 2D/3D lists)."""
+    if entry is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(entry, (list, tuple)):
+        seq = entry
+    else:
+        if hasattr(entry, "wrappedValue"):
+            seq = entry.wrappedValue
+        elif hasattr(entry, "CoordList"):
+            seq = getattr(entry, "CoordList") or []
+        elif hasattr(entry, "Coordinates"):
+            seq = getattr(entry, "Coordinates") or []
+        else:
+            try:
+                seq = list(entry)
+            except Exception:
+                seq = []
+    x = _as_float(seq[0] if len(seq) > 0 else 0.0)
+    y = _as_float(seq[1] if len(seq) > 1 else 0.0)
+    z = _as_float(seq[2] if len(seq) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _indexed_polycurve_points(curve) -> List[Tuple[float, float, float]]:
+    """Expand an IfcIndexedPolyCurve into explicit XYZ points."""
+    point_list = getattr(curve, "Points", None)
+    if point_list is None:
+        return []
+    coord_list = getattr(point_list, "CoordList", None)
+    if coord_list is None:
+        coord_list = getattr(point_list, "CoordinatesList", None)
+    coords: List[Tuple[float, float, float]] = []
+    if coord_list:
+        for entry in coord_list:
+            coords.append(_point_list_entry_to_tuple(entry))
+    if not coords:
+        return []
+
+    segments = list(getattr(curve, "Segments", None) or [])
+    if not segments:
+        return coords
+
+    result: List[Tuple[float, float, float]] = []
+
+    def _append_index(raw_index) -> None:
+        try:
+            idx = int(raw_index)
+        except Exception:
+            return
+        idx -= 1  # IfcPositiveInteger is 1-based
+        if idx < 0 or idx >= len(coords):
+            return
+        point = coords[idx]
+        if result and result[-1] == point:
+            return
+        result.append(point)
+
+    for segment in segments:
+        if segment is None:
+            continue
+        if hasattr(segment, "wrappedValue"):
+            indices = segment.wrappedValue
+        elif hasattr(segment, "Points"):
+            indices = getattr(segment, "Points", None) or ()
+        elif isinstance(segment, (list, tuple)):
+            indices = segment
+        else:
+            try:
+                indices = list(segment)
+            except Exception:
+                indices = (segment,)
+        if not indices:
+            continue
+        # Some representations wrap the tuple once more (e.g. [(1,2,3)]).
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            indices = indices[0]
+        for raw_index in indices:
+            if isinstance(raw_index, (list, tuple)):
+                for nested in raw_index:
+                    _append_index(nested)
+            else:
+                _append_index(raw_index)
+
+    return result if result else coords
+
+
+def _object_placement_to_np(obj_placement) -> np.ndarray:
+    """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
+    try:
+        gf_matrix = compose_object_placement(obj_placement, length_to_m=1.0)
+    except Exception:
+        return np.eye(4, dtype=float)
+    return _gf_matrix_to_np(gf_matrix)
+def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
+    """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
+    if op is None:
+        return np.eye(4, dtype=float)
+
+    try:
+        origin_src = getattr(getattr(op, "LocalOrigin", None), "Coordinates", None) or (0.0, 0.0, 0.0)
+        origin_tuple = tuple(origin_src) + (0.0, 0.0, 0.0)
+        origin = np.array([_as_float(c) for c in origin_tuple[:3]], dtype=float)
+    except Exception:
+        origin = np.zeros(3, dtype=float)
+
+    def _vec(data, fallback):
+        if not data:
+            return np.array(fallback, dtype=float)
+        return np.array([_as_float(c) for c in data], dtype=float)
+
+    x_axis = _vec(getattr(getattr(op, "Axis1", None), "DirectionRatios", None), (1.0, 0.0, 0.0))
+    y_axis = _vec(getattr(getattr(op, "Axis2", None), "DirectionRatios", None), (0.0, 1.0, 0.0))
+    z_data = getattr(getattr(op, "Axis3", None), "DirectionRatios", None)
+    z_axis = _vec(z_data, (0.0, 0.0, 1.0)) if z_data else np.cross(x_axis, y_axis)
+
+    def _norm(vec: np.ndarray) -> np.ndarray:
+        length = np.linalg.norm(vec)
+        return vec if length <= 1e-12 else vec / length
+
+    x_axis = _norm(x_axis)
+    y_axis = _norm(y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    z_axis = _norm(z_axis)
+
+    if abs(float(np.dot(x_axis, y_axis))) > 0.9999:
+        y_axis = _norm(np.cross(z_axis, x_axis))
+    x_axis = _norm(np.cross(y_axis, z_axis))
+
+    scale = _as_float(getattr(op, "Scale", 1.0) or 1.0, 1.0)
+    sx = scale
+    sy = _as_float(getattr(op, "Scale2", scale) or scale, scale)
+    sz = _as_float(getattr(op, "Scale3", scale) or scale, scale)
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 0] = x_axis * sx
+    transform[:3, 1] = y_axis * sy
+    transform[:3, 2] = z_axis * sz
+    transform[:3, 3] = origin
+    return transform
+
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingTarget ∘ MappingOrigin (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return target_np @ origin_np
+
+
+def _mapping_item_transform(product, mapped_item) -> np.ndarray:
+    """R->W for a mapped item: placement (P->W) composed with map (R->P)."""
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+    map_np = _repmap_rt_matrix(mapped_item)
+    return placement_np @ map_np
+
+
+def _map_conversion_to_np(conv) -> np.ndarray:
+    """Build a 4x4 from IfcMapConversion parameters."""
+    scale = _as_float(getattr(conv, "Scale", 1.0) or 1.0, 1.0)
+    east = _as_float(getattr(conv, "Eastings", 0.0), 0.0)
+    north = _as_float(getattr(conv, "Northings", 0.0), 0.0)
+    height = _as_float(getattr(conv, "OrthogonalHeight", 0.0), 0.0)
+    ax = _as_float(getattr(conv, "XAxisAbscissa", 1.0), 1.0)
+    ay = _as_float(getattr(conv, "XAxisOrdinate", 0.0), 0.0)
+    norm = math.hypot(ax, ay) or 1.0
+    cos = ax / norm
+    sin = ay / norm
+    mat = np.eye(4, dtype=float)
+    mat[0, 0] = cos * scale
+    mat[0, 1] = -sin * scale
+    mat[1, 0] = sin * scale
+    mat[1, 1] = cos * scale
+    mat[0, 3] = east
+    mat[1, 3] = north
+    mat[2, 3] = height
+    return mat
+
+
+def _rigid_operation_to_np(op) -> np.ndarray:
+    """Build a 4x4 translation matrix from an IfcRigidOperation."""
+    tx = _as_float(getattr(op, "FirstCoordinate", 0.0), 0.0)
+    ty = _as_float(getattr(op, "SecondCoordinate", 0.0), 0.0)
+    tz = _as_float(getattr(op, "Height", 0.0), 0.0)
+    mat = np.eye(4, dtype=float)
+    mat[0, 3] = tx
+    mat[1, 3] = ty
+    mat[2, 3] = tz
+    return mat
+
+def _context_to_np(ctx) -> np.ndarray:
+    """Compose nested representation contexts into a single matrix."""
+    transform = np.eye(4, dtype=float)
+    visited = set()
+    current = ctx
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        wcs = getattr(current, "WorldCoordinateSystem", None)
+        if wcs is not None:
+            transform = transform @ _axis_placement_to_np(wcs)
+        for op in getattr(current, "HasCoordinateOperation", None) or []:
+            if op is None:
+                continue
+            try:
+                if op.is_a("IfcMapConversion"):
+                    transform = transform @ _map_conversion_to_np(op)
+                elif op.is_a("IfcRigidOperation"):
+                    transform = transform @ _rigid_operation_to_np(op)
+            except Exception:
+                continue
+        current = getattr(current, "ParentContext", None)
+    return transform
+
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if text in {"F", "FALSE", "NO", "0"}:
+        return False
+    if text in {"T", "TRUE", "YES", "1"}:
+        return True
+    return None
+
+
+def _layer_is_hidden(layer) -> bool:
+    if layer is None:
+        return False
+    for attr in ("LayerOn", "LayerVisible", "LayerVisibility"):
+        if _to_bool(getattr(layer, attr, None)) is False:
+            return True
+    for attr in ("LayerFrozen", "LayerBlocked"):
+        if _to_bool(getattr(layer, attr, None)) is True:
+            return True
+    return False
+
+
+def _entity_on_hidden_layer(entity) -> bool:
+    """Return True if the entity or any of its representations are hidden."""
+    seen: set[int] = set()
+
+    def _collect(obj):
+        if obj is None:
+            return
+        for layer in getattr(obj, "LayerAssignments", None) or []:
+            if layer is None:
+                continue
+            try:
+                lid = int(layer.id())
+            except Exception:
+                lid = id(layer)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            yield layer
+
+    for layer in _collect(entity):
+        if _layer_is_hidden(layer):
+            return True
+
+    rep = getattr(entity, "Representation", None)
+    if rep is not None:
+        for layer in _collect(rep):
+            if _layer_is_hidden(layer):
+                return True
+        for representation in getattr(rep, "Representations", []) or []:
+            for layer in _collect(representation):
+                if _layer_is_hidden(layer):
+                    return True
+            for item in getattr(representation, "Items", []) or []:
+                for layer in _collect(item):
+                    if _layer_is_hidden(layer):
+                        return True
+    return False
+
+def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    """Traverse curve/curve-set items and gather 3D points."""
+    if item is None:
+        return []
+    if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
+        pts: List[Tuple[float, float, float]] = []
+        for p in getattr(item, "Points", []) or []:
+            try:
+                pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
+            pts.extend(_extract_curve_points(parent))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        return _extract_curve_points(getattr(item, "BasisCurve", None))
+    if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
+    if hasattr(item, "is_a") and item.is_a("IfcIndexedPolyCurve"):
+        return _indexed_polycurve_points(item)
+    return []
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
+
+
+def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Return the preferred coordinate operation (map conversion or rigid)."""
+
+    def _map_data_from_conversion(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "Eastings", 0.0), 0.0),
+            northings=_as_float(getattr(op, "Northings", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "OrthogonalHeight", 0.0), 0.0),
+            x_axis_abscissa=_as_float(getattr(op, "XAxisAbscissa", 1.0), 1.0),
+            x_axis_ordinate=_as_float(getattr(op, "XAxisOrdinate", 0.0), 0.0),
+            scale=_as_float(getattr(op, "Scale", 1.0), 1.0) or 1.0,
+        )
+
+    def _map_data_from_rigid(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "FirstCoordinate", 0.0), 0.0),
+            northings=_as_float(getattr(op, "SecondCoordinate", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "Height", 0.0), 0.0),
+            x_axis_abscissa=1.0,
+            x_axis_ordinate=0.0,
+            scale=1.0,
+        )
+
+    best_data: Optional[MapConversionData] = None
+    for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            data: Optional[MapConversionData] = None
+            if op.is_a("IfcMapConversion"):
+                data = _map_data_from_conversion(op)
+            elif op.is_a("IfcRigidOperation"):
+                data = _map_data_from_rigid(op)
+            if data is None:
+                continue
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return data
+            if best_data is None:
+                best_data = data
+    return best_data
+
+
+
+# Absolute/world transform resolver (same signature used by process_usd)
+
+def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
+    """Return the absolute/world 4×4 for the iterator result.
+
+    Priority:
+      1) iterator's per-piece matrix (covers MappingTarget × MappingOrigin × placements)
+      2) ifcopenshell.util.shape.get_shape_matrix(shape) (robust fallback)
+      3) composed IfcLocalPlacement (last resort)
+
+    The order mirrors ifcopenshell's behaviour and keeps instancing stable even
+    when representation maps are nested.  Identity matrices are left intact so
+    USD always has an explicit transform op.
+    """
+    # 1) iterator-provided per-piece matrix
+    tr = getattr(shape, "transformation", None)
+    if tr is not None and hasattr(tr, "matrix"):
+        return tuple(tr.matrix)  # keep even if identity
+
+    # 2) robust util fallback
+    try:
+        from ifcopenshell.util import shape as ifc_shape_util
+        gm = ifc_shape_util.get_shape_matrix(shape)
+        gm = np.array(gm, dtype=float).reshape(4, 4)
+        return tuple(gm.flatten().tolist())   # keep even if identity
+    except Exception:
+        pass
+
+    # 3) composed local placement
+    if element is not None:
+        try:
+            place = getattr(element, "ObjectPlacement", None)
+            gf = compose_object_placement(place, length_to_m=1.0)
+            return gf_to_tuple16(gf)          # keep even if identity
+        except Exception:
+            pass
+
+    return None
+
+
+def _gf_matrix_to_np(matrix) -> np.ndarray:
+    """Convert a pxr.Gf matrix or sequence into a 4x4 numpy array."""
+    if matrix is None:
+        return np.eye(4, dtype=float)
+    if isinstance(matrix, np.ndarray):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    if isinstance(matrix, (list, tuple)):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    try:
+        return np.array([[float(matrix[i][j]) for j in range(4)] for i in range(4)], dtype=float)
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _tuple16_to_np(mat16) -> Optional[np.ndarray]:
+    """Return a 4x4 numpy array for a flattened matrix tuple, or None if invalid."""
+    if mat16 is None:
+        return None
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return arr
+
+
+def _is_affine_invertible_tuple(mat16, *, atol: float = 1e-9) -> bool:
+    """Heuristic check that a flattened 4x4 matrix represents an invertible affine transform."""
+    arr = _tuple16_to_np(mat16)
+    if arr is None:
+        return False
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0], dtype=float), atol=atol):
+        return False
+    try:
+        det = float(np.linalg.det(arr[:3, :3]))
+    except Exception:
+        return False
+    return abs(det) > atol
+
+def _axis_placement_to_np(axis_placement) -> np.ndarray:
+    """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
+    if axis_placement is None:
+        return np.eye(4, dtype=float)
+    try:
+        return _gf_matrix_to_np(axis2placement_to_matrix(axis_placement, length_to_m=1.0))
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _is_identity16(mat16, atol=1e-10):
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4,4)
+        return np.allclose(arr, np.eye(4), atol=atol)
+    except Exception:
+        return False
+
+# Dummy 2D curves extraction kept (no change to signature)
+
+
+def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
+    coords = list(getattr(point, "Coordinates", []) or [])
+    x = _as_float(coords[0] if len(coords) > 0 else 0.0)
+    y = _as_float(coords[1] if len(coords) > 1 else 0.0)
+    z = _as_float(coords[2] if len(coords) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _point_list_entry_to_tuple(entry) -> Tuple[float, float, float]:
+    """Best-effort conversion for CoordList tuples (supports 2D/3D lists)."""
+    if entry is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(entry, (list, tuple)):
+        seq = entry
+    else:
+        if hasattr(entry, "wrappedValue"):
+            seq = entry.wrappedValue
+        elif hasattr(entry, "CoordList"):
+            seq = getattr(entry, "CoordList") or []
+        elif hasattr(entry, "Coordinates"):
+            seq = getattr(entry, "Coordinates") or []
+        else:
+            try:
+                seq = list(entry)
+            except Exception:
+                seq = []
+    x = _as_float(seq[0] if len(seq) > 0 else 0.0)
+    y = _as_float(seq[1] if len(seq) > 1 else 0.0)
+    z = _as_float(seq[2] if len(seq) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _indexed_polycurve_points(curve) -> List[Tuple[float, float, float]]:
+    """Expand an IfcIndexedPolyCurve into explicit XYZ points."""
+    point_list = getattr(curve, "Points", None)
+    if point_list is None:
+        return []
+    coord_list = getattr(point_list, "CoordList", None)
+    if coord_list is None:
+        coord_list = getattr(point_list, "CoordinatesList", None)
+    coords: List[Tuple[float, float, float]] = []
+    if coord_list:
+        for entry in coord_list:
+            coords.append(_point_list_entry_to_tuple(entry))
+    if not coords:
+        return []
+
+    segments = list(getattr(curve, "Segments", None) or [])
+    if not segments:
+        return coords
+
+    result: List[Tuple[float, float, float]] = []
+
+    def _append_index(raw_index) -> None:
+        try:
+            idx = int(raw_index)
+        except Exception:
+            return
+        idx -= 1  # IfcPositiveInteger is 1-based
+        if idx < 0 or idx >= len(coords):
+            return
+        point = coords[idx]
+        if result and result[-1] == point:
+            return
+        result.append(point)
+
+    for segment in segments:
+        if segment is None:
+            continue
+        if hasattr(segment, "wrappedValue"):
+            indices = segment.wrappedValue
+        elif hasattr(segment, "Points"):
+            indices = getattr(segment, "Points", None) or ()
+        elif isinstance(segment, (list, tuple)):
+            indices = segment
+        else:
+            try:
+                indices = list(segment)
+            except Exception:
+                indices = (segment,)
+        if not indices:
+            continue
+        # Some representations wrap the tuple once more (e.g. [(1,2,3)]).
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            indices = indices[0]
+        for raw_index in indices:
+            if isinstance(raw_index, (list, tuple)):
+                for nested in raw_index:
+                    _append_index(nested)
+            else:
+                _append_index(raw_index)
+
+    return result if result else coords
+
+
+def _object_placement_to_np(obj_placement) -> np.ndarray:
+    """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
+    try:
+        gf_matrix = compose_object_placement(obj_placement, length_to_m=1.0)
+    except Exception:
+        return np.eye(4, dtype=float)
+    return _gf_matrix_to_np(gf_matrix)
+def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
+    """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
+    if op is None:
+        return np.eye(4, dtype=float)
+
+    try:
+        origin_src = getattr(getattr(op, "LocalOrigin", None), "Coordinates", None) or (0.0, 0.0, 0.0)
+        origin_tuple = tuple(origin_src) + (0.0, 0.0, 0.0)
+        origin = np.array([_as_float(c) for c in origin_tuple[:3]], dtype=float)
+    except Exception:
+        origin = np.zeros(3, dtype=float)
+
+    def _vec(data, fallback):
+        if not data:
+            return np.array(fallback, dtype=float)
+        return np.array([_as_float(c) for c in data], dtype=float)
+
+    x_axis = _vec(getattr(getattr(op, "Axis1", None), "DirectionRatios", None), (1.0, 0.0, 0.0))
+    y_axis = _vec(getattr(getattr(op, "Axis2", None), "DirectionRatios", None), (0.0, 1.0, 0.0))
+    z_data = getattr(getattr(op, "Axis3", None), "DirectionRatios", None)
+    z_axis = _vec(z_data, (0.0, 0.0, 1.0)) if z_data else np.cross(x_axis, y_axis)
+
+    def _norm(vec: np.ndarray) -> np.ndarray:
+        length = np.linalg.norm(vec)
+        return vec if length <= 1e-12 else vec / length
+
+    x_axis = _norm(x_axis)
+    y_axis = _norm(y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    z_axis = _norm(z_axis)
+
+    if abs(float(np.dot(x_axis, y_axis))) > 0.9999:
+        y_axis = _norm(np.cross(z_axis, x_axis))
+    x_axis = _norm(np.cross(y_axis, z_axis))
+
+    scale = _as_float(getattr(op, "Scale", 1.0) or 1.0, 1.0)
+    sx = scale
+    sy = _as_float(getattr(op, "Scale2", scale) or scale, scale)
+    sz = _as_float(getattr(op, "Scale3", scale) or scale, scale)
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 0] = x_axis * sx
+    transform[:3, 1] = y_axis * sy
+    transform[:3, 2] = z_axis * sz
+    transform[:3, 3] = origin
+    return transform
+
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingTarget ∘ MappingOrigin (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return target_np @ origin_np
+
+
+def _mapping_item_transform(product, mapped_item) -> np.ndarray:
+    """R->W for a mapped item: placement (P->W) composed with map (R->P)."""
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+    map_np = _repmap_rt_matrix(mapped_item)
+    return placement_np @ map_np
+
+
+def _map_conversion_to_np(conv) -> np.ndarray:
+    """Build a 4x4 from IfcMapConversion parameters."""
+    scale = _as_float(getattr(conv, "Scale", 1.0) or 1.0, 1.0)
+    east = _as_float(getattr(conv, "Eastings", 0.0), 0.0)
+    north = _as_float(getattr(conv, "Northings", 0.0), 0.0)
+    height = _as_float(getattr(conv, "OrthogonalHeight", 0.0), 0.0)
+    ax = _as_float(getattr(conv, "XAxisAbscissa", 1.0), 1.0)
+    ay = _as_float(getattr(conv, "XAxisOrdinate", 0.0), 0.0)
+    norm = math.hypot(ax, ay) or 1.0
+    cos = ax / norm
+    sin = ay / norm
+    mat = np.eye(4, dtype=float)
+    mat[0, 0] = cos * scale
+    mat[0, 1] = -sin * scale
+    mat[1, 0] = sin * scale
+    mat[1, 1] = cos * scale
+    mat[0, 3] = east
+    mat[1, 3] = north
+    mat[2, 3] = height
+    return mat
+
+
+def _rigid_operation_to_np(op) -> np.ndarray:
+    """Build a 4x4 translation matrix from an IfcRigidOperation."""
+    tx = _as_float(getattr(op, "FirstCoordinate", 0.0), 0.0)
+    ty = _as_float(getattr(op, "SecondCoordinate", 0.0), 0.0)
+    tz = _as_float(getattr(op, "Height", 0.0), 0.0)
+    mat = np.eye(4, dtype=float)
+    mat[0, 3] = tx
+    mat[1, 3] = ty
+    mat[2, 3] = tz
+    return mat
+
+def _context_to_np(ctx) -> np.ndarray:
+    """Compose nested representation contexts into a single matrix."""
+    transform = np.eye(4, dtype=float)
+    visited = set()
+    current = ctx
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        wcs = getattr(current, "WorldCoordinateSystem", None)
+        if wcs is not None:
+            transform = transform @ _axis_placement_to_np(wcs)
+        for op in getattr(current, "HasCoordinateOperation", None) or []:
+            if op is None:
+                continue
+            try:
+                if op.is_a("IfcMapConversion"):
+                    transform = transform @ _map_conversion_to_np(op)
+                elif op.is_a("IfcRigidOperation"):
+                    transform = transform @ _rigid_operation_to_np(op)
+            except Exception:
+                continue
+        current = getattr(current, "ParentContext", None)
+    return transform
+
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if text in {"F", "FALSE", "NO", "0"}:
+        return False
+    if text in {"T", "TRUE", "YES", "1"}:
+        return True
+    return None
+
+
+def _layer_is_hidden(layer) -> bool:
+    if layer is None:
+        return False
+    for attr in ("LayerOn", "LayerVisible", "LayerVisibility"):
+        if _to_bool(getattr(layer, attr, None)) is False:
+            return True
+    for attr in ("LayerFrozen", "LayerBlocked"):
+        if _to_bool(getattr(layer, attr, None)) is True:
+            return True
+    return False
+
+
+def _entity_on_hidden_layer(entity) -> bool:
+    """Return True if the entity or any of its representations are hidden."""
+    seen: set[int] = set()
+
+    def _collect(obj):
+        if obj is None:
+            return
+        for layer in getattr(obj, "LayerAssignments", None) or []:
+            if layer is None:
+                continue
+            try:
+                lid = int(layer.id())
+            except Exception:
+                lid = id(layer)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            yield layer
+
+    for layer in _collect(entity):
+        if _layer_is_hidden(layer):
+            return True
+
+    rep = getattr(entity, "Representation", None)
+    if rep is not None:
+        for layer in _collect(rep):
+            if _layer_is_hidden(layer):
+                return True
+        for representation in getattr(rep, "Representations", []) or []:
+            for layer in _collect(representation):
+                if _layer_is_hidden(layer):
+                    return True
+            for item in getattr(representation, "Items", []) or []:
+                for layer in _collect(item):
+                    if _layer_is_hidden(layer):
+                        return True
+    return False
+
+def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    """Traverse curve/curve-set items and gather 3D points."""
+    if item is None:
+        return []
+    if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
+        pts: List[Tuple[float, float, float]] = []
+        for p in getattr(item, "Points", []) or []:
+            try:
+                pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
+            pts.extend(_extract_curve_points(parent))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        return _extract_curve_points(getattr(item, "BasisCurve", None))
+    if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
+    if hasattr(item, "is_a") and item.is_a("IfcIndexedPolyCurve"):
+        return _indexed_polycurve_points(item)
+    return []
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
+
+
+def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Return the preferred coordinate operation (map conversion or rigid)."""
+
+    def _map_data_from_conversion(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "Eastings", 0.0), 0.0),
+            northings=_as_float(getattr(op, "Northings", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "OrthogonalHeight", 0.0), 0.0),
+            x_axis_abscissa=_as_float(getattr(op, "XAxisAbscissa", 1.0), 1.0),
+            x_axis_ordinate=_as_float(getattr(op, "XAxisOrdinate", 0.0), 0.0),
+            scale=_as_float(getattr(op, "Scale", 1.0), 1.0) or 1.0,
+        )
+
+    def _map_data_from_rigid(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "FirstCoordinate", 0.0), 0.0),
+            northings=_as_float(getattr(op, "SecondCoordinate", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "Height", 0.0), 0.0),
+            x_axis_abscissa=1.0,
+            x_axis_ordinate=0.0,
+            scale=1.0,
+        )
+
+    best_data: Optional[MapConversionData] = None
+    for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            data: Optional[MapConversionData] = None
+            if op.is_a("IfcMapConversion"):
+                data = _map_data_from_conversion(op)
+            elif op.is_a("IfcRigidOperation"):
+                data = _map_data_from_rigid(op)
+            if data is None:
+                continue
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return data
+            if best_data is None:
+                best_data = data
+    return best_data
+
+
+
+# Absolute/world transform resolver (same signature used by process_usd)
+
+def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
+    """Return the absolute/world 4×4 for the iterator result.
+
+    Priority:
+      1) iterator's per-piece matrix (covers MappingTarget × MappingOrigin × placements)
+      2) ifcopenshell.util.shape.get_shape_matrix(shape) (robust fallback)
+      3) composed IfcLocalPlacement (last resort)
+
+    The order mirrors ifcopenshell's behaviour and keeps instancing stable even
+    when representation maps are nested.  Identity matrices are left intact so
+    USD always has an explicit transform op.
+    """
+    # 1) iterator-provided per-piece matrix
+    tr = getattr(shape, "transformation", None)
+    if tr is not None and hasattr(tr, "matrix"):
+        return tuple(tr.matrix)  # keep even if identity
+
+    # 2) robust util fallback
+    try:
+        from ifcopenshell.util import shape as ifc_shape_util
+        gm = ifc_shape_util.get_shape_matrix(shape)
+        gm = np.array(gm, dtype=float).reshape(4, 4)
+        return tuple(gm.flatten().tolist())   # keep even if identity
+    except Exception:
+        pass
+
+    # 3) composed local placement
+    if element is not None:
+        try:
+            place = getattr(element, "ObjectPlacement", None)
+            gf = compose_object_placement(place, length_to_m=1.0)
+            return gf_to_tuple16(gf)          # keep even if identity
+        except Exception:
+            pass
+
+    return None
+
+
+def _gf_matrix_to_np(matrix) -> np.ndarray:
+    """Convert a pxr.Gf matrix or sequence into a 4x4 numpy array."""
+    if matrix is None:
+        return np.eye(4, dtype=float)
+    if isinstance(matrix, np.ndarray):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    if isinstance(matrix, (list, tuple)):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    try:
+        return np.array([[float(matrix[i][j]) for j in range(4)] for i in range(4)], dtype=float)
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _tuple16_to_np(mat16) -> Optional[np.ndarray]:
+    """Return a 4x4 numpy array for a flattened matrix tuple, or None if invalid."""
+    if mat16 is None:
+        return None
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return arr
+
+
+def _is_affine_invertible_tuple(mat16, *, atol: float = 1e-9) -> bool:
+    """Heuristic check that a flattened 4x4 matrix represents an invertible affine transform."""
+    arr = _tuple16_to_np(mat16)
+    if arr is None:
+        return False
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0], dtype=float), atol=atol):
+        return False
+    try:
+        det = float(np.linalg.det(arr[:3, :3]))
+    except Exception:
+        return False
+    return abs(det) > atol
+
+def _axis_placement_to_np(axis_placement) -> np.ndarray:
+    """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
+    if axis_placement is None:
+        return np.eye(4, dtype=float)
+    try:
+        return _gf_matrix_to_np(axis2placement_to_matrix(axis_placement, length_to_m=1.0))
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _is_identity16(mat16, atol=1e-10):
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4,4)
+        return np.allclose(arr, np.eye(4), atol=atol)
+    except Exception:
+        return False
+
+# Dummy 2D curves extraction kept (no change to signature)
+
+
+def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
+    coords = list(getattr(point, "Coordinates", []) or [])
+    x = _as_float(coords[0] if len(coords) > 0 else 0.0)
+    y = _as_float(coords[1] if len(coords) > 1 else 0.0)
+    z = _as_float(coords[2] if len(coords) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _point_list_entry_to_tuple(entry) -> Tuple[float, float, float]:
+    """Best-effort conversion for CoordList tuples (supports 2D/3D lists)."""
+    if entry is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(entry, (list, tuple)):
+        seq = entry
+    else:
+        if hasattr(entry, "wrappedValue"):
+            seq = entry.wrappedValue
+        elif hasattr(entry, "CoordList"):
+            seq = getattr(entry, "CoordList") or []
+        elif hasattr(entry, "Coordinates"):
+            seq = getattr(entry, "Coordinates") or []
+        else:
+            try:
+                seq = list(entry)
+            except Exception:
+                seq = []
+    x = _as_float(seq[0] if len(seq) > 0 else 0.0)
+    y = _as_float(seq[1] if len(seq) > 1 else 0.0)
+    z = _as_float(seq[2] if len(seq) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _indexed_polycurve_points(curve) -> List[Tuple[float, float, float]]:
+    """Expand an IfcIndexedPolyCurve into explicit XYZ points."""
+    point_list = getattr(curve, "Points", None)
+    if point_list is None:
+        return []
+    coord_list = getattr(point_list, "CoordList", None)
+    if coord_list is None:
+        coord_list = getattr(point_list, "CoordinatesList", None)
+    coords: List[Tuple[float, float, float]] = []
+    if coord_list:
+        for entry in coord_list:
+            coords.append(_point_list_entry_to_tuple(entry))
+    if not coords:
+        return []
+
+    segments = list(getattr(curve, "Segments", None) or [])
+    if not segments:
+        return coords
+
+    result: List[Tuple[float, float, float]] = []
+
+    def _append_index(raw_index) -> None:
+        try:
+            idx = int(raw_index)
+        except Exception:
+            return
+        idx -= 1  # IfcPositiveInteger is 1-based
+        if idx < 0 or idx >= len(coords):
+            return
+        point = coords[idx]
+        if result and result[-1] == point:
+            return
+        result.append(point)
+
+    for segment in segments:
+        if segment is None:
+            continue
+        if hasattr(segment, "wrappedValue"):
+            indices = segment.wrappedValue
+        elif hasattr(segment, "Points"):
+            indices = getattr(segment, "Points", None) or ()
+        elif isinstance(segment, (list, tuple)):
+            indices = segment
+        else:
+            try:
+                indices = list(segment)
+            except Exception:
+                indices = (segment,)
+        if not indices:
+            continue
+        # Some representations wrap the tuple once more (e.g. [(1,2,3)]).
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            indices = indices[0]
+        for raw_index in indices:
+            if isinstance(raw_index, (list, tuple)):
+                for nested in raw_index:
+                    _append_index(nested)
+            else:
+                _append_index(raw_index)
+
+    return result if result else coords
+
+
+def _object_placement_to_np(obj_placement) -> np.ndarray:
+    """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
+    try:
+        gf_matrix = compose_object_placement(obj_placement, length_to_m=1.0)
+    except Exception:
+        return np.eye(4, dtype=float)
+    return _gf_matrix_to_np(gf_matrix)
+def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
+    """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
+    if op is None:
+        return np.eye(4, dtype=float)
+
+    try:
+        origin_src = getattr(getattr(op, "LocalOrigin", None), "Coordinates", None) or (0.0, 0.0, 0.0)
+        origin_tuple = tuple(origin_src) + (0.0, 0.0, 0.0)
+        origin = np.array([_as_float(c) for c in origin_tuple[:3]], dtype=float)
+    except Exception:
+        origin = np.zeros(3, dtype=float)
+
+    def _vec(data, fallback):
+        if not data:
+            return np.array(fallback, dtype=float)
+        return np.array([_as_float(c) for c in data], dtype=float)
+
+    x_axis = _vec(getattr(getattr(op, "Axis1", None), "DirectionRatios", None), (1.0, 0.0, 0.0))
+    y_axis = _vec(getattr(getattr(op, "Axis2", None), "DirectionRatios", None), (0.0, 1.0, 0.0))
+    z_data = getattr(getattr(op, "Axis3", None), "DirectionRatios", None)
+    z_axis = _vec(z_data, (0.0, 0.0, 1.0)) if z_data else np.cross(x_axis, y_axis)
+
+    def _norm(vec: np.ndarray) -> np.ndarray:
+        length = np.linalg.norm(vec)
+        return vec if length <= 1e-12 else vec / length
+
+    x_axis = _norm(x_axis)
+    y_axis = _norm(y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    z_axis = _norm(z_axis)
+
+    if abs(float(np.dot(x_axis, y_axis))) > 0.9999:
+        y_axis = _norm(np.cross(z_axis, x_axis))
+    x_axis = _norm(np.cross(y_axis, z_axis))
+
+    scale = _as_float(getattr(op, "Scale", 1.0) or 1.0, 1.0)
+    sx = scale
+    sy = _as_float(getattr(op, "Scale2", scale) or scale, scale)
+    sz = _as_float(getattr(op, "Scale3", scale) or scale, scale)
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 0] = x_axis * sx
+    transform[:3, 1] = y_axis * sy
+    transform[:3, 2] = z_axis * sz
+    transform[:3, 3] = origin
+    return transform
+
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingTarget ∘ MappingOrigin (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return target_np @ origin_np
+
+
+def _mapping_item_transform(product, mapped_item) -> np.ndarray:
+    """R->W for a mapped item: placement (P->W) composed with map (R->P)."""
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+    map_np = _repmap_rt_matrix(mapped_item)
+    return placement_np @ map_np
+
+
+def _map_conversion_to_np(conv) -> np.ndarray:
+    """Build a 4x4 from IfcMapConversion parameters."""
+    scale = _as_float(getattr(conv, "Scale", 1.0) or 1.0, 1.0)
+    east = _as_float(getattr(conv, "Eastings", 0.0), 0.0)
+    north = _as_float(getattr(conv, "Northings", 0.0), 0.0)
+    height = _as_float(getattr(conv, "OrthogonalHeight", 0.0), 0.0)
+    ax = _as_float(getattr(conv, "XAxisAbscissa", 1.0), 1.0)
+    ay = _as_float(getattr(conv, "XAxisOrdinate", 0.0), 0.0)
+    norm = math.hypot(ax, ay) or 1.0
+    cos = ax / norm
+    sin = ay / norm
+    mat = np.eye(4, dtype=float)
+    mat[0, 0] = cos * scale
+    mat[0, 1] = -sin * scale
+    mat[1, 0] = sin * scale
+    mat[1, 1] = cos * scale
+    mat[0, 3] = east
+    mat[1, 3] = north
+    mat[2, 3] = height
+    return mat
+
+
+def _rigid_operation_to_np(op) -> np.ndarray:
+    """Build a 4x4 translation matrix from an IfcRigidOperation."""
+    tx = _as_float(getattr(op, "FirstCoordinate", 0.0), 0.0)
+    ty = _as_float(getattr(op, "SecondCoordinate", 0.0), 0.0)
+    tz = _as_float(getattr(op, "Height", 0.0), 0.0)
+    mat = np.eye(4, dtype=float)
+    mat[0, 3] = tx
+    mat[1, 3] = ty
+    mat[2, 3] = tz
+    return mat
+
+def _context_to_np(ctx) -> np.ndarray:
+    """Compose nested representation contexts into a single matrix."""
+    transform = np.eye(4, dtype=float)
+    visited = set()
+    current = ctx
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        wcs = getattr(current, "WorldCoordinateSystem", None)
+        if wcs is not None:
+            transform = transform @ _axis_placement_to_np(wcs)
+        for op in getattr(current, "HasCoordinateOperation", None) or []:
+            if op is None:
+                continue
+            try:
+                if op.is_a("IfcMapConversion"):
+                    transform = transform @ _map_conversion_to_np(op)
+                elif op.is_a("IfcRigidOperation"):
+                    transform = transform @ _rigid_operation_to_np(op)
+            except Exception:
+                continue
+        current = getattr(current, "ParentContext", None)
+    return transform
+
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if text in {"F", "FALSE", "NO", "0"}:
+        return False
+    if text in {"T", "TRUE", "YES", "1"}:
+        return True
+    return None
+
+
+def _layer_is_hidden(layer) -> bool:
+    if layer is None:
+        return False
+    for attr in ("LayerOn", "LayerVisible", "LayerVisibility"):
+        if _to_bool(getattr(layer, attr, None)) is False:
+            return True
+    for attr in ("LayerFrozen", "LayerBlocked"):
+        if _to_bool(getattr(layer, attr, None)) is True:
+            return True
+    return False
+
+
+def _entity_on_hidden_layer(entity) -> bool:
+    """Return True if the entity or any of its representations are hidden."""
+    seen: set[int] = set()
+
+    def _collect(obj):
+        if obj is None:
+            return
+        for layer in getattr(obj, "LayerAssignments", None) or []:
+            if layer is None:
+                continue
+            try:
+                lid = int(layer.id())
+            except Exception:
+                lid = id(layer)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            yield layer
+
+    for layer in _collect(entity):
+        if _layer_is_hidden(layer):
+            return True
+
+    rep = getattr(entity, "Representation", None)
+    if rep is not None:
+        for layer in _collect(rep):
+            if _layer_is_hidden(layer):
+                return True
+        for representation in getattr(rep, "Representations", []) or []:
+            for layer in _collect(representation):
+                if _layer_is_hidden(layer):
+                    return True
+            for item in getattr(representation, "Items", []) or []:
+                for layer in _collect(item):
+                    if _layer_is_hidden(layer):
+                        return True
+    return False
+
+def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    """Traverse curve/curve-set items and gather 3D points."""
+    if item is None:
+        return []
+    if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
+        pts: List[Tuple[float, float, float]] = []
+        for p in getattr(item, "Points", []) or []:
+            try:
+                pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
+            pts.extend(_extract_curve_points(parent))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        return _extract_curve_points(getattr(item, "BasisCurve", None))
+    if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
+    if hasattr(item, "is_a") and item.is_a("IfcIndexedPolyCurve"):
+        return _indexed_polycurve_points(item)
+    return []
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
+
+
+def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Return the preferred coordinate operation (map conversion or rigid)."""
+
+    def _map_data_from_conversion(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "Eastings", 0.0), 0.0),
+            northings=_as_float(getattr(op, "Northings", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "OrthogonalHeight", 0.0), 0.0),
+            x_axis_abscissa=_as_float(getattr(op, "XAxisAbscissa", 1.0), 1.0),
+            x_axis_ordinate=_as_float(getattr(op, "XAxisOrdinate", 0.0), 0.0),
+            scale=_as_float(getattr(op, "Scale", 1.0), 1.0) or 1.0,
+        )
+
+    def _map_data_from_rigid(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "FirstCoordinate", 0.0), 0.0),
+            northings=_as_float(getattr(op, "SecondCoordinate", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "Height", 0.0), 0.0),
+            x_axis_abscissa=1.0,
+            x_axis_ordinate=0.0,
+            scale=1.0,
+        )
+
+    best_data: Optional[MapConversionData] = None
+    for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            data: Optional[MapConversionData] = None
+            if op.is_a("IfcMapConversion"):
+                data = _map_data_from_conversion(op)
+            elif op.is_a("IfcRigidOperation"):
+                data = _map_data_from_rigid(op)
+            if data is None:
+                continue
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return data
+            if best_data is None:
+                best_data = data
+    return best_data
+
+
+
+# Absolute/world transform resolver (same signature used by process_usd)
+
+def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
+    """Return the absolute/world 4×4 for the iterator result.
+
+    Priority:
+      1) iterator's per-piece matrix (covers MappingTarget × MappingOrigin × placements)
+      2) ifcopenshell.util.shape.get_shape_matrix(shape) (robust fallback)
+      3) composed IfcLocalPlacement (last resort)
+
+    The order mirrors ifcopenshell's behaviour and keeps instancing stable even
+    when representation maps are nested.  Identity matrices are left intact so
+    USD always has an explicit transform op.
+    """
+    # 1) iterator-provided per-piece matrix
+    tr = getattr(shape, "transformation", None)
+    if tr is not None and hasattr(tr, "matrix"):
+        return tuple(tr.matrix)  # keep even if identity
+
+    # 2) robust util fallback
+    try:
+        from ifcopenshell.util import shape as ifc_shape_util
+        gm = ifc_shape_util.get_shape_matrix(shape)
+        gm = np.array(gm, dtype=float).reshape(4, 4)
+        return tuple(gm.flatten().tolist())   # keep even if identity
+    except Exception:
+        pass
+
+    # 3) composed local placement
+    if element is not None:
+        try:
+            place = getattr(element, "ObjectPlacement", None)
+            gf = compose_object_placement(place, length_to_m=1.0)
+            return gf_to_tuple16(gf)          # keep even if identity
+        except Exception:
+            pass
+
+    return None
+
+
+def _gf_matrix_to_np(matrix) -> np.ndarray:
+    """Convert a pxr.Gf matrix or sequence into a 4x4 numpy array."""
+    if matrix is None:
+        return np.eye(4, dtype=float)
+    if isinstance(matrix, np.ndarray):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    if isinstance(matrix, (list, tuple)):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    try:
+        return np.array([[float(matrix[i][j]) for j in range(4)] for i in range(4)], dtype=float)
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _tuple16_to_np(mat16) -> Optional[np.ndarray]:
+    """Return a 4x4 numpy array for a flattened matrix tuple, or None if invalid."""
+    if mat16 is None:
+        return None
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return arr
+
+
+def _is_affine_invertible_tuple(mat16, *, atol: float = 1e-9) -> bool:
+    """Heuristic check that a flattened 4x4 matrix represents an invertible affine transform."""
+    arr = _tuple16_to_np(mat16)
+    if arr is None:
+        return False
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0], dtype=float), atol=atol):
+        return False
+    try:
+        det = float(np.linalg.det(arr[:3, :3]))
+    except Exception:
+        return False
+    return abs(det) > atol
+
+def _axis_placement_to_np(axis_placement) -> np.ndarray:
+    """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
+    if axis_placement is None:
+        return np.eye(4, dtype=float)
+    try:
+        return _gf_matrix_to_np(axis2placement_to_matrix(axis_placement, length_to_m=1.0))
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _is_identity16(mat16, atol=1e-10):
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4,4)
+        return np.allclose(arr, np.eye(4), atol=atol)
+    except Exception:
+        return False
+
+# Dummy 2D curves extraction kept (no change to signature)
+
+
+def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
+    coords = list(getattr(point, "Coordinates", []) or [])
+    x = _as_float(coords[0] if len(coords) > 0 else 0.0)
+    y = _as_float(coords[1] if len(coords) > 1 else 0.0)
+    z = _as_float(coords[2] if len(coords) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _point_list_entry_to_tuple(entry) -> Tuple[float, float, float]:
+    """Best-effort conversion for CoordList tuples (supports 2D/3D lists)."""
+    if entry is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(entry, (list, tuple)):
+        seq = entry
+    else:
+        if hasattr(entry, "wrappedValue"):
+            seq = entry.wrappedValue
+        elif hasattr(entry, "CoordList"):
+            seq = getattr(entry, "CoordList") or []
+        elif hasattr(entry, "Coordinates"):
+            seq = getattr(entry, "Coordinates") or []
+        else:
+            try:
+                seq = list(entry)
+            except Exception:
+                seq = []
+    x = _as_float(seq[0] if len(seq) > 0 else 0.0)
+    y = _as_float(seq[1] if len(seq) > 1 else 0.0)
+    z = _as_float(seq[2] if len(seq) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _indexed_polycurve_points(curve) -> List[Tuple[float, float, float]]:
+    """Expand an IfcIndexedPolyCurve into explicit XYZ points."""
+    point_list = getattr(curve, "Points", None)
+    if point_list is None:
+        return []
+    coord_list = getattr(point_list, "CoordList", None)
+    if coord_list is None:
+        coord_list = getattr(point_list, "CoordinatesList", None)
+    coords: List[Tuple[float, float, float]] = []
+    if coord_list:
+        for entry in coord_list:
+            coords.append(_point_list_entry_to_tuple(entry))
+    if not coords:
+        return []
+
+    segments = list(getattr(curve, "Segments", None) or [])
+    if not segments:
+        return coords
+
+    result: List[Tuple[float, float, float]] = []
+
+    def _append_index(raw_index) -> None:
+        try:
+            idx = int(raw_index)
+        except Exception:
+            return
+        idx -= 1  # IfcPositiveInteger is 1-based
+        if idx < 0 or idx >= len(coords):
+            return
+        point = coords[idx]
+        if result and result[-1] == point:
+            return
+        result.append(point)
+
+    for segment in segments:
+        if segment is None:
+            continue
+        if hasattr(segment, "wrappedValue"):
+            indices = segment.wrappedValue
+        elif hasattr(segment, "Points"):
+            indices = getattr(segment, "Points", None) or ()
+        elif isinstance(segment, (list, tuple)):
+            indices = segment
+        else:
+            try:
+                indices = list(segment)
+            except Exception:
+                indices = (segment,)
+        if not indices:
+            continue
+        # Some representations wrap the tuple once more (e.g. [(1,2,3)]).
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            indices = indices[0]
+        for raw_index in indices:
+            if isinstance(raw_index, (list, tuple)):
+                for nested in raw_index:
+                    _append_index(nested)
+            else:
+                _append_index(raw_index)
+
+    return result if result else coords
+
+
+def _object_placement_to_np(obj_placement) -> np.ndarray:
+    """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
+    try:
+        gf_matrix = compose_object_placement(obj_placement, length_to_m=1.0)
+    except Exception:
+        return np.eye(4, dtype=float)
+    return _gf_matrix_to_np(gf_matrix)
+def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
+    """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
+    if op is None:
+        return np.eye(4, dtype=float)
+
+    try:
+        origin_src = getattr(getattr(op, "LocalOrigin", None), "Coordinates", None) or (0.0, 0.0, 0.0)
+        origin_tuple = tuple(origin_src) + (0.0, 0.0, 0.0)
+        origin = np.array([_as_float(c) for c in origin_tuple[:3]], dtype=float)
+    except Exception:
+        origin = np.zeros(3, dtype=float)
+
+    def _vec(data, fallback):
+        if not data:
+            return np.array(fallback, dtype=float)
+        return np.array([_as_float(c) for c in data], dtype=float)
+
+    x_axis = _vec(getattr(getattr(op, "Axis1", None), "DirectionRatios", None), (1.0, 0.0, 0.0))
+    y_axis = _vec(getattr(getattr(op, "Axis2", None), "DirectionRatios", None), (0.0, 1.0, 0.0))
+    z_data = getattr(getattr(op, "Axis3", None), "DirectionRatios", None)
+    z_axis = _vec(z_data, (0.0, 0.0, 1.0)) if z_data else np.cross(x_axis, y_axis)
+
+    def _norm(vec: np.ndarray) -> np.ndarray:
+        length = np.linalg.norm(vec)
+        return vec if length <= 1e-12 else vec / length
+
+    x_axis = _norm(x_axis)
+    y_axis = _norm(y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    z_axis = _norm(z_axis)
+
+    if abs(float(np.dot(x_axis, y_axis))) > 0.9999:
+        y_axis = _norm(np.cross(z_axis, x_axis))
+    x_axis = _norm(np.cross(y_axis, z_axis))
+
+    scale = _as_float(getattr(op, "Scale", 1.0) or 1.0, 1.0)
+    sx = scale
+    sy = _as_float(getattr(op, "Scale2", scale) or scale, scale)
+    sz = _as_float(getattr(op, "Scale3", scale) or scale, scale)
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 0] = x_axis * sx
+    transform[:3, 1] = y_axis * sy
+    transform[:3, 2] = z_axis * sz
+    transform[:3, 3] = origin
+    return transform
+
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingTarget ∘ MappingOrigin (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return target_np @ origin_np
+
+
+def _mapping_item_transform(product, mapped_item) -> np.ndarray:
+    """R->W for a mapped item: placement (P->W) composed with map (R->P)."""
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+    map_np = _repmap_rt_matrix(mapped_item)
+    return placement_np @ map_np
+
+
+def _map_conversion_to_np(conv) -> np.ndarray:
+    """Build a 4x4 from IfcMapConversion parameters."""
+    scale = _as_float(getattr(conv, "Scale", 1.0) or 1.0, 1.0)
+    east = _as_float(getattr(conv, "Eastings", 0.0), 0.0)
+    north = _as_float(getattr(conv, "Northings", 0.0), 0.0)
+    height = _as_float(getattr(conv, "OrthogonalHeight", 0.0), 0.0)
+    ax = _as_float(getattr(conv, "XAxisAbscissa", 1.0), 1.0)
+    ay = _as_float(getattr(conv, "XAxisOrdinate", 0.0), 0.0)
+    norm = math.hypot(ax, ay) or 1.0
+    cos = ax / norm
+    sin = ay / norm
+    mat = np.eye(4, dtype=float)
+    mat[0, 0] = cos * scale
+    mat[0, 1] = -sin * scale
+    mat[1, 0] = sin * scale
+    mat[1, 1] = cos * scale
+    mat[0, 3] = east
+    mat[1, 3] = north
+    mat[2, 3] = height
+    return mat
+
+
+def _rigid_operation_to_np(op) -> np.ndarray:
+    """Build a 4x4 translation matrix from an IfcRigidOperation."""
+    tx = _as_float(getattr(op, "FirstCoordinate", 0.0), 0.0)
+    ty = _as_float(getattr(op, "SecondCoordinate", 0.0), 0.0)
+    tz = _as_float(getattr(op, "Height", 0.0), 0.0)
+    mat = np.eye(4, dtype=float)
+    mat[0, 3] = tx
+    mat[1, 3] = ty
+    mat[2, 3] = tz
+    return mat
+
+def _context_to_np(ctx) -> np.ndarray:
+    """Compose nested representation contexts into a single matrix."""
+    transform = np.eye(4, dtype=float)
+    visited = set()
+    current = ctx
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        wcs = getattr(current, "WorldCoordinateSystem", None)
+        if wcs is not None:
+            transform = transform @ _axis_placement_to_np(wcs)
+        for op in getattr(current, "HasCoordinateOperation", None) or []:
+            if op is None:
+                continue
+            try:
+                if op.is_a("IfcMapConversion"):
+                    transform = transform @ _map_conversion_to_np(op)
+                elif op.is_a("IfcRigidOperation"):
+                    transform = transform @ _rigid_operation_to_np(op)
+            except Exception:
+                continue
+        current = getattr(current, "ParentContext", None)
+    return transform
+
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if text in {"F", "FALSE", "NO", "0"}:
+        return False
+    if text in {"T", "TRUE", "YES", "1"}:
+        return True
+    return None
+
+
+def _layer_is_hidden(layer) -> bool:
+    if layer is None:
+        return False
+    for attr in ("LayerOn", "LayerVisible", "LayerVisibility"):
+        if _to_bool(getattr(layer, attr, None)) is False:
+            return True
+    for attr in ("LayerFrozen", "LayerBlocked"):
+        if _to_bool(getattr(layer, attr, None)) is True:
+            return True
+    return False
+
+
+def _entity_on_hidden_layer(entity) -> bool:
+    """Return True if the entity or any of its representations are hidden."""
+    seen: set[int] = set()
+
+    def _collect(obj):
+        if obj is None:
+            return
+        for layer in getattr(obj, "LayerAssignments", None) or []:
+            if layer is None:
+                continue
+            try:
+                lid = int(layer.id())
+            except Exception:
+                lid = id(layer)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            yield layer
+
+    for layer in _collect(entity):
+        if _layer_is_hidden(layer):
+            return True
+
+    rep = getattr(entity, "Representation", None)
+    if rep is not None:
+        for layer in _collect(rep):
+            if _layer_is_hidden(layer):
+                return True
+        for representation in getattr(rep, "Representations", []) or []:
+            for layer in _collect(representation):
+                if _layer_is_hidden(layer):
+                    return True
+            for item in getattr(representation, "Items", []) or []:
+                for layer in _collect(item):
+                    if _layer_is_hidden(layer):
+                        return True
+    return False
+
+def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    """Traverse curve/curve-set items and gather 3D points."""
+    if item is None:
+        return []
+    if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
+        pts: List[Tuple[float, float, float]] = []
+        for p in getattr(item, "Points", []) or []:
+            try:
+                pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
+            pts.extend(_extract_curve_points(parent))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        return _extract_curve_points(getattr(item, "BasisCurve", None))
+    if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
+    if hasattr(item, "is_a") and item.is_a("IfcIndexedPolyCurve"):
+        return _indexed_polycurve_points(item)
+    return []
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
+
+
+def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Return the preferred coordinate operation (map conversion or rigid)."""
+
+    def _map_data_from_conversion(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "Eastings", 0.0), 0.0),
+            northings=_as_float(getattr(op, "Northings", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "OrthogonalHeight", 0.0), 0.0),
+            x_axis_abscissa=_as_float(getattr(op, "XAxisAbscissa", 1.0), 1.0),
+            x_axis_ordinate=_as_float(getattr(op, "XAxisOrdinate", 0.0), 0.0),
+            scale=_as_float(getattr(op, "Scale", 1.0), 1.0) or 1.0,
+        )
+
+    def _map_data_from_rigid(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "FirstCoordinate", 0.0), 0.0),
+            northings=_as_float(getattr(op, "SecondCoordinate", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "Height", 0.0), 0.0),
+            x_axis_abscissa=1.0,
+            x_axis_ordinate=0.0,
+            scale=1.0,
+        )
+
+    best_data: Optional[MapConversionData] = None
+    for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            data: Optional[MapConversionData] = None
+            if op.is_a("IfcMapConversion"):
+                data = _map_data_from_conversion(op)
+            elif op.is_a("IfcRigidOperation"):
+                data = _map_data_from_rigid(op)
+            if data is None:
+                continue
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return data
+            if best_data is None:
+                best_data = data
+    return best_data
+
+
+
+# Absolute/world transform resolver (same signature used by process_usd)
+
+def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
+    """Return the absolute/world 4×4 for the iterator result.
+
+    Priority:
+      1) iterator's per-piece matrix (covers MappingTarget × MappingOrigin × placements)
+      2) ifcopenshell.util.shape.get_shape_matrix(shape) (robust fallback)
+      3) composed IfcLocalPlacement (last resort)
+
+    The order mirrors ifcopenshell's behaviour and keeps instancing stable even
+    when representation maps are nested.  Identity matrices are left intact so
+    USD always has an explicit transform op.
+    """
+    # 1) iterator-provided per-piece matrix
+    tr = getattr(shape, "transformation", None)
+    if tr is not None and hasattr(tr, "matrix"):
+        return tuple(tr.matrix)  # keep even if identity
+
+    # 2) robust util fallback
+    try:
+        from ifcopenshell.util import shape as ifc_shape_util
+        gm = ifc_shape_util.get_shape_matrix(shape)
+        gm = np.array(gm, dtype=float).reshape(4, 4)
+        return tuple(gm.flatten().tolist())   # keep even if identity
+    except Exception:
+        pass
+
+    # 3) composed local placement
+    if element is not None:
+        try:
+            place = getattr(element, "ObjectPlacement", None)
+            gf = compose_object_placement(place, length_to_m=1.0)
+            return gf_to_tuple16(gf)          # keep even if identity
+        except Exception:
+            pass
+
+    return None
+
+
+def _gf_matrix_to_np(matrix) -> np.ndarray:
+    """Convert a pxr.Gf matrix or sequence into a 4x4 numpy array."""
+    if matrix is None:
+        return np.eye(4, dtype=float)
+    if isinstance(matrix, np.ndarray):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    if isinstance(matrix, (list, tuple)):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    try:
+        return np.array([[float(matrix[i][j]) for j in range(4)] for i in range(4)], dtype=float)
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _tuple16_to_np(mat16) -> Optional[np.ndarray]:
+    """Return a 4x4 numpy array for a flattened matrix tuple, or None if invalid."""
+    if mat16 is None:
+        return None
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return arr
+
+
+def _is_affine_invertible_tuple(mat16, *, atol: float = 1e-9) -> bool:
+    """Heuristic check that a flattened 4x4 matrix represents an invertible affine transform."""
+    arr = _tuple16_to_np(mat16)
+    if arr is None:
+        return False
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0], dtype=float), atol=atol):
+        return False
+    try:
+        det = float(np.linalg.det(arr[:3, :3]))
+    except Exception:
+        return False
+    return abs(det) > atol
+
+def _axis_placement_to_np(axis_placement) -> np.ndarray:
+    """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
+    if axis_placement is None:
+        return np.eye(4, dtype=float)
+    try:
+        return _gf_matrix_to_np(axis2placement_to_matrix(axis_placement, length_to_m=1.0))
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _is_identity16(mat16, atol=1e-10):
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4,4)
+        return np.allclose(arr, np.eye(4), atol=atol)
+    except Exception:
+        return False
+
+# Dummy 2D curves extraction kept (no change to signature)
+
+
+def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
+    coords = list(getattr(point, "Coordinates", []) or [])
+    x = _as_float(coords[0] if len(coords) > 0 else 0.0)
+    y = _as_float(coords[1] if len(coords) > 1 else 0.0)
+    z = _as_float(coords[2] if len(coords) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _point_list_entry_to_tuple(entry) -> Tuple[float, float, float]:
+    """Best-effort conversion for CoordList tuples (supports 2D/3D lists)."""
+    if entry is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(entry, (list, tuple)):
+        seq = entry
+    else:
+        if hasattr(entry, "wrappedValue"):
+            seq = entry.wrappedValue
+        elif hasattr(entry, "CoordList"):
+            seq = getattr(entry, "CoordList") or []
+        elif hasattr(entry, "Coordinates"):
+            seq = getattr(entry, "Coordinates") or []
+        else:
+            try:
+                seq = list(entry)
+            except Exception:
+                seq = []
+    x = _as_float(seq[0] if len(seq) > 0 else 0.0)
+    y = _as_float(seq[1] if len(seq) > 1 else 0.0)
+    z = _as_float(seq[2] if len(seq) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _indexed_polycurve_points(curve) -> List[Tuple[float, float, float]]:
+    """Expand an IfcIndexedPolyCurve into explicit XYZ points."""
+    point_list = getattr(curve, "Points", None)
+    if point_list is None:
+        return []
+    coord_list = getattr(point_list, "CoordList", None)
+    if coord_list is None:
+        coord_list = getattr(point_list, "CoordinatesList", None)
+    coords: List[Tuple[float, float, float]] = []
+    if coord_list:
+        for entry in coord_list:
+            coords.append(_point_list_entry_to_tuple(entry))
+    if not coords:
+        return []
+
+    segments = list(getattr(curve, "Segments", None) or [])
+    if not segments:
+        return coords
+
+    result: List[Tuple[float, float, float]] = []
+
+    def _append_index(raw_index) -> None:
+        try:
+            idx = int(raw_index)
+        except Exception:
+            return
+        idx -= 1  # IfcPositiveInteger is 1-based
+        if idx < 0 or idx >= len(coords):
+            return
+        point = coords[idx]
+        if result and result[-1] == point:
+            return
+        result.append(point)
+
+    for segment in segments:
+        if segment is None:
+            continue
+        if hasattr(segment, "wrappedValue"):
+            indices = segment.wrappedValue
+        elif hasattr(segment, "Points"):
+            indices = getattr(segment, "Points", None) or ()
+        elif isinstance(segment, (list, tuple)):
+            indices = segment
+        else:
+            try:
+                indices = list(segment)
+            except Exception:
+                indices = (segment,)
+        if not indices:
+            continue
+        # Some representations wrap the tuple once more (e.g. [(1,2,3)]).
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            indices = indices[0]
+        for raw_index in indices:
+            if isinstance(raw_index, (list, tuple)):
+                for nested in raw_index:
+                    _append_index(nested)
+            else:
+                _append_index(raw_index)
+
+    return result if result else coords
+
+
+def _object_placement_to_np(obj_placement) -> np.ndarray:
+    """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
+    try:
+        gf_matrix = compose_object_placement(obj_placement, length_to_m=1.0)
+    except Exception:
+        return np.eye(4, dtype=float)
+    return _gf_matrix_to_np(gf_matrix)
+def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
+    """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
+    if op is None:
+        return np.eye(4, dtype=float)
+
+    try:
+        origin_src = getattr(getattr(op, "LocalOrigin", None), "Coordinates", None) or (0.0, 0.0, 0.0)
+        origin_tuple = tuple(origin_src) + (0.0, 0.0, 0.0)
+        origin = np.array([_as_float(c) for c in origin_tuple[:3]], dtype=float)
+    except Exception:
+        origin = np.zeros(3, dtype=float)
+
+    def _vec(data, fallback):
+        if not data:
+            return np.array(fallback, dtype=float)
+        return np.array([_as_float(c) for c in data], dtype=float)
+
+    x_axis = _vec(getattr(getattr(op, "Axis1", None), "DirectionRatios", None), (1.0, 0.0, 0.0))
+    y_axis = _vec(getattr(getattr(op, "Axis2", None), "DirectionRatios", None), (0.0, 1.0, 0.0))
+    z_data = getattr(getattr(op, "Axis3", None), "DirectionRatios", None)
+    z_axis = _vec(z_data, (0.0, 0.0, 1.0)) if z_data else np.cross(x_axis, y_axis)
+
+    def _norm(vec: np.ndarray) -> np.ndarray:
+        length = np.linalg.norm(vec)
+        return vec if length <= 1e-12 else vec / length
+
+    x_axis = _norm(x_axis)
+    y_axis = _norm(y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    z_axis = _norm(z_axis)
+
+    if abs(float(np.dot(x_axis, y_axis))) > 0.9999:
+        y_axis = _norm(np.cross(z_axis, x_axis))
+    x_axis = _norm(np.cross(y_axis, z_axis))
+
+    scale = _as_float(getattr(op, "Scale", 1.0) or 1.0, 1.0)
+    sx = scale
+    sy = _as_float(getattr(op, "Scale2", scale) or scale, scale)
+    sz = _as_float(getattr(op, "Scale3", scale) or scale, scale)
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 0] = x_axis * sx
+    transform[:3, 1] = y_axis * sy
+    transform[:3, 2] = z_axis * sz
+    transform[:3, 3] = origin
+    return transform
+
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingTarget ∘ MappingOrigin (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return target_np @ origin_np
+
+
+def _mapping_item_transform(product, mapped_item) -> np.ndarray:
+    """R->W for a mapped item: placement (P->W) composed with map (R->P)."""
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+    map_np = _repmap_rt_matrix(mapped_item)
+    return placement_np @ map_np
+
+
+def _map_conversion_to_np(conv) -> np.ndarray:
+    """Build a 4x4 from IfcMapConversion parameters."""
+    scale = _as_float(getattr(conv, "Scale", 1.0) or 1.0, 1.0)
+    east = _as_float(getattr(conv, "Eastings", 0.0), 0.0)
+    north = _as_float(getattr(conv, "Northings", 0.0), 0.0)
+    height = _as_float(getattr(conv, "OrthogonalHeight", 0.0), 0.0)
+    ax = _as_float(getattr(conv, "XAxisAbscissa", 1.0), 1.0)
+    ay = _as_float(getattr(conv, "XAxisOrdinate", 0.0), 0.0)
+    norm = math.hypot(ax, ay) or 1.0
+    cos = ax / norm
+    sin = ay / norm
+    mat = np.eye(4, dtype=float)
+    mat[0, 0] = cos * scale
+    mat[0, 1] = -sin * scale
+    mat[1, 0] = sin * scale
+    mat[1, 1] = cos * scale
+    mat[0, 3] = east
+    mat[1, 3] = north
+    mat[2, 3] = height
+    return mat
+
+
+def _rigid_operation_to_np(op) -> np.ndarray:
+    """Build a 4x4 translation matrix from an IfcRigidOperation."""
+    tx = _as_float(getattr(op, "FirstCoordinate", 0.0), 0.0)
+    ty = _as_float(getattr(op, "SecondCoordinate", 0.0), 0.0)
+    tz = _as_float(getattr(op, "Height", 0.0), 0.0)
+    mat = np.eye(4, dtype=float)
+    mat[0, 3] = tx
+    mat[1, 3] = ty
+    mat[2, 3] = tz
+    return mat
+
+def _context_to_np(ctx) -> np.ndarray:
+    """Compose nested representation contexts into a single matrix."""
+    transform = np.eye(4, dtype=float)
+    visited = set()
+    current = ctx
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        wcs = getattr(current, "WorldCoordinateSystem", None)
+        if wcs is not None:
+            transform = transform @ _axis_placement_to_np(wcs)
+        for op in getattr(current, "HasCoordinateOperation", None) or []:
+            if op is None:
+                continue
+            try:
+                if op.is_a("IfcMapConversion"):
+                    transform = transform @ _map_conversion_to_np(op)
+                elif op.is_a("IfcRigidOperation"):
+                    transform = transform @ _rigid_operation_to_np(op)
+            except Exception:
+                continue
+        current = getattr(current, "ParentContext", None)
+    return transform
+
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if text in {"F", "FALSE", "NO", "0"}:
+        return False
+    if text in {"T", "TRUE", "YES", "1"}:
+        return True
+    return None
+
+
+def _layer_is_hidden(layer) -> bool:
+    if layer is None:
+        return False
+    for attr in ("LayerOn", "LayerVisible", "LayerVisibility"):
+        if _to_bool(getattr(layer, attr, None)) is False:
+            return True
+    for attr in ("LayerFrozen", "LayerBlocked"):
+        if _to_bool(getattr(layer, attr, None)) is True:
+            return True
+    return False
+
+
+def _entity_on_hidden_layer(entity) -> bool:
+    """Return True if the entity or any of its representations are hidden."""
+    seen: set[int] = set()
+
+    def _collect(obj):
+        if obj is None:
+            return
+        for layer in getattr(obj, "LayerAssignments", None) or []:
+            if layer is None:
+                continue
+            try:
+                lid = int(layer.id())
+            except Exception:
+                lid = id(layer)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            yield layer
+
+    for layer in _collect(entity):
+        if _layer_is_hidden(layer):
+            return True
+
+    rep = getattr(entity, "Representation", None)
+    if rep is not None:
+        for layer in _collect(rep):
+            if _layer_is_hidden(layer):
+                return True
+        for representation in getattr(rep, "Representations", []) or []:
+            for layer in _collect(representation):
+                if _layer_is_hidden(layer):
+                    return True
+            for item in getattr(representation, "Items", []) or []:
+                for layer in _collect(item):
+                    if _layer_is_hidden(layer):
+                        return True
+    return False
+
+def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    """Traverse curve/curve-set items and gather 3D points."""
+    if item is None:
+        return []
+    if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
+        pts: List[Tuple[float, float, float]] = []
+        for p in getattr(item, "Points", []) or []:
+            try:
+                pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
+            pts.extend(_extract_curve_points(parent))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        return _extract_curve_points(getattr(item, "BasisCurve", None))
+    if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
+    if hasattr(item, "is_a") and item.is_a("IfcIndexedPolyCurve"):
+        return _indexed_polycurve_points(item)
+    return []
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
+
+
+def extract_map_conversion(ifc_file) -> Optional[MapConversionData]:
+    """Return the preferred coordinate operation (map conversion or rigid)."""
+
+    def _map_data_from_conversion(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "Eastings", 0.0), 0.0),
+            northings=_as_float(getattr(op, "Northings", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "OrthogonalHeight", 0.0), 0.0),
+            x_axis_abscissa=_as_float(getattr(op, "XAxisAbscissa", 1.0), 1.0),
+            x_axis_ordinate=_as_float(getattr(op, "XAxisOrdinate", 0.0), 0.0),
+            scale=_as_float(getattr(op, "Scale", 1.0), 1.0) or 1.0,
+        )
+
+    def _map_data_from_rigid(op) -> MapConversionData:
+        return MapConversionData(
+            eastings=_as_float(getattr(op, "FirstCoordinate", 0.0), 0.0),
+            northings=_as_float(getattr(op, "SecondCoordinate", 0.0), 0.0),
+            orthogonal_height=_as_float(getattr(op, "Height", 0.0), 0.0),
+            x_axis_abscissa=1.0,
+            x_axis_ordinate=0.0,
+            scale=1.0,
+        )
+
+    best_data: Optional[MapConversionData] = None
+    for ctx in ifc_file.by_type("IfcGeometricRepresentationContext") or []:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            data: Optional[MapConversionData] = None
+            if op.is_a("IfcMapConversion"):
+                data = _map_data_from_conversion(op)
+            elif op.is_a("IfcRigidOperation"):
+                data = _map_data_from_rigid(op)
+            if data is None:
+                continue
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return data
+            if best_data is None:
+                best_data = data
+    return best_data
+
+
+
+# Absolute/world transform resolver (same signature used by process_usd)
+
+def resolve_absolute_matrix(shape, element) -> Optional[Tuple[float, ...]]:
+    """Return the absolute/world 4×4 for the iterator result.
+
+    Priority:
+      1) iterator's per-piece matrix (covers MappingTarget × MappingOrigin × placements)
+      2) ifcopenshell.util.shape.get_shape_matrix(shape) (robust fallback)
+      3) composed IfcLocalPlacement (last resort)
+
+    The order mirrors ifcopenshell's behaviour and keeps instancing stable even
+    when representation maps are nested.  Identity matrices are left intact so
+    USD always has an explicit transform op.
+    """
+    # 1) iterator-provided per-piece matrix
+    tr = getattr(shape, "transformation", None)
+    if tr is not None and hasattr(tr, "matrix"):
+        return tuple(tr.matrix)  # keep even if identity
+
+    # 2) robust util fallback
+    try:
+        from ifcopenshell.util import shape as ifc_shape_util
+        gm = ifc_shape_util.get_shape_matrix(shape)
+        gm = np.array(gm, dtype=float).reshape(4, 4)
+        return tuple(gm.flatten().tolist())   # keep even if identity
+    except Exception:
+        pass
+
+    # 3) composed local placement
+    if element is not None:
+        try:
+            place = getattr(element, "ObjectPlacement", None)
+            gf = compose_object_placement(place, length_to_m=1.0)
+            return gf_to_tuple16(gf)          # keep even if identity
+        except Exception:
+            pass
+
+    return None
+
+
+def _gf_matrix_to_np(matrix) -> np.ndarray:
+    """Convert a pxr.Gf matrix or sequence into a 4x4 numpy array."""
+    if matrix is None:
+        return np.eye(4, dtype=float)
+    if isinstance(matrix, np.ndarray):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    if isinstance(matrix, (list, tuple)):
+        arr = np.array(matrix, dtype=float)
+        return arr.reshape(4, 4)
+    try:
+        return np.array([[float(matrix[i][j]) for j in range(4)] for i in range(4)], dtype=float)
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _tuple16_to_np(mat16) -> Optional[np.ndarray]:
+    """Return a 4x4 numpy array for a flattened matrix tuple, or None if invalid."""
+    if mat16 is None:
+        return None
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return arr
+
+
+def _is_affine_invertible_tuple(mat16, *, atol: float = 1e-9) -> bool:
+    """Heuristic check that a flattened 4x4 matrix represents an invertible affine transform."""
+    arr = _tuple16_to_np(mat16)
+    if arr is None:
+        return False
+    if not np.allclose(arr[3], np.array([0.0, 0.0, 0.0, 1.0], dtype=float), atol=atol):
+        return False
+    try:
+        det = float(np.linalg.det(arr[:3, :3]))
+    except Exception:
+        return False
+    return abs(det) > atol
+
+def _axis_placement_to_np(axis_placement) -> np.ndarray:
+    """Convert an IfcAxis2Placement into a numpy 4x4 matrix."""
+    if axis_placement is None:
+        return np.eye(4, dtype=float)
+    try:
+        return _gf_matrix_to_np(axis2placement_to_matrix(axis_placement, length_to_m=1.0))
+    except Exception:
+        return np.eye(4, dtype=float)
+
+
+def _is_identity16(mat16, atol=1e-10):
+    try:
+        arr = np.array(mat16, dtype=float).reshape(4,4)
+        return np.allclose(arr, np.eye(4), atol=atol)
+    except Exception:
+        return False
+
+# Dummy 2D curves extraction kept (no change to signature)
+
+
+def _cartesian_point_to_tuple(point) -> Tuple[float, float, float]:
+    coords = list(getattr(point, "Coordinates", []) or [])
+    x = _as_float(coords[0] if len(coords) > 0 else 0.0)
+    y = _as_float(coords[1] if len(coords) > 1 else 0.0)
+    z = _as_float(coords[2] if len(coords) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _point_list_entry_to_tuple(entry) -> Tuple[float, float, float]:
+    """Best-effort conversion for CoordList tuples (supports 2D/3D lists)."""
+    if entry is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(entry, (list, tuple)):
+        seq = entry
+    else:
+        if hasattr(entry, "wrappedValue"):
+            seq = entry.wrappedValue
+        elif hasattr(entry, "CoordList"):
+            seq = getattr(entry, "CoordList") or []
+        elif hasattr(entry, "Coordinates"):
+            seq = getattr(entry, "Coordinates") or []
+        else:
+            try:
+                seq = list(entry)
+            except Exception:
+                seq = []
+    x = _as_float(seq[0] if len(seq) > 0 else 0.0)
+    y = _as_float(seq[1] if len(seq) > 1 else 0.0)
+    z = _as_float(seq[2] if len(seq) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _indexed_polycurve_points(curve) -> List[Tuple[float, float, float]]:
+    """Expand an IfcIndexedPolyCurve into explicit XYZ points."""
+    point_list = getattr(curve, "Points", None)
+    if point_list is None:
+        return []
+    coord_list = getattr(point_list, "CoordList", None)
+    if coord_list is None:
+        coord_list = getattr(point_list, "CoordinatesList", None)
+    coords: List[Tuple[float, float, float]] = []
+    if coord_list:
+        for entry in coord_list:
+            coords.append(_point_list_entry_to_tuple(entry))
+    if not coords:
+        return []
+
+    segments = list(getattr(curve, "Segments", None) or [])
+    if not segments:
+        return coords
+
+    result: List[Tuple[float, float, float]] = []
+
+    def _append_index(raw_index) -> None:
+        try:
+            idx = int(raw_index)
+        except Exception:
+            return
+        idx -= 1  # IfcPositiveInteger is 1-based
+        if idx < 0 or idx >= len(coords):
+            return
+        point = coords[idx]
+        if result and result[-1] == point:
+            return
+        result.append(point)
+
+    for segment in segments:
+        if segment is None:
+            continue
+        if hasattr(segment, "wrappedValue"):
+            indices = segment.wrappedValue
+        elif hasattr(segment, "Points"):
+            indices = getattr(segment, "Points", None) or ()
+        elif isinstance(segment, (list, tuple)):
+            indices = segment
+        else:
+            try:
+                indices = list(segment)
+            except Exception:
+                indices = (segment,)
+        if not indices:
+            continue
+        # Some representations wrap the tuple once more (e.g. [(1,2,3)]).
+        if len(indices) == 1 and isinstance(indices[0], (list, tuple)):
+            indices = indices[0]
+        for raw_index in indices:
+            if isinstance(raw_index, (list, tuple)):
+                for nested in raw_index:
+                    _append_index(nested)
+            else:
+                _append_index(raw_index)
+
+    return result if result else coords
+
+
+def _object_placement_to_np(obj_placement) -> np.ndarray:
+    """Compose an IfcObjectPlacement into a numpy 4x4 matrix."""
+    try:
+        gf_matrix = compose_object_placement(obj_placement, length_to_m=1.0)
+    except Exception:
+        return np.eye(4, dtype=float)
+    return _gf_matrix_to_np(gf_matrix)
+def _cartesian_transform_to_np(op) -> np.ndarray:
+    """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
+    """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
+    if op is None:
+        return np.eye(4, dtype=float)
+
+    try:
+        origin_src = getattr(getattr(op, "LocalOrigin", None), "Coordinates", None) or (0.0, 0.0, 0.0)
+        origin_tuple = tuple(origin_src) + (0.0, 0.0, 0.0)
+        origin = np.array([_as_float(c) for c in origin_tuple[:3]], dtype=float)
+    except Exception:
+        origin = np.zeros(3, dtype=float)
+
+    def _vec(data, fallback):
+        if not data:
+            return np.array(fallback, dtype=float)
+        return np.array([_as_float(c) for c in data], dtype=float)
+
+    x_axis = _vec(getattr(getattr(op, "Axis1", None), "DirectionRatios", None), (1.0, 0.0, 0.0))
+    y_axis = _vec(getattr(getattr(op, "Axis2", None), "DirectionRatios", None), (0.0, 1.0, 0.0))
+    z_data = getattr(getattr(op, "Axis3", None), "DirectionRatios", None)
+    z_axis = _vec(z_data, (0.0, 0.0, 1.0)) if z_data else np.cross(x_axis, y_axis)
+
+    def _norm(vec: np.ndarray) -> np.ndarray:
+        length = np.linalg.norm(vec)
+        return vec if length <= 1e-12 else vec / length
+
+    x_axis = _norm(x_axis)
+    y_axis = _norm(y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) <= 1e-12:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=float)
+    z_axis = _norm(z_axis)
+
+    if abs(float(np.dot(x_axis, y_axis))) > 0.9999:
+        y_axis = _norm(np.cross(z_axis, x_axis))
+    x_axis = _norm(np.cross(y_axis, z_axis))
+
+    scale = _as_float(getattr(op, "Scale", 1.0) or 1.0, 1.0)
+    sx = scale
+    sy = _as_float(getattr(op, "Scale2", scale) or scale, scale)
+    sz = _as_float(getattr(op, "Scale3", scale) or scale, scale)
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, 0] = x_axis * sx
+    transform[:3, 1] = y_axis * sy
+    transform[:3, 2] = z_axis * sz
+    transform[:3, 3] = origin
+    return transform
+
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingTarget ∘ MappingOrigin (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return target_np @ origin_np
+
+
+def _mapping_item_transform(product, mapped_item) -> np.ndarray:
+    """R->W for a mapped item: placement (P->W) composed with map (R->P)."""
+    placement_np = _object_placement_to_np(getattr(product, "ObjectPlacement", None))
+    map_np = _repmap_rt_matrix(mapped_item)
+    return placement_np @ map_np
+
+
+def _map_conversion_to_np(conv) -> np.ndarray:
+    """Build a 4x4 from IfcMapConversion parameters."""
+    scale = _as_float(getattr(conv, "Scale", 1.0) or 1.0, 1.0)
+    east = _as_float(getattr(conv, "Eastings", 0.0), 0.0)
+    north = _as_float(getattr(conv, "Northings", 0.0), 0.0)
+    height = _as_float(getattr(conv, "OrthogonalHeight", 0.0), 0.0)
+    ax = _as_float(getattr(conv, "XAxisAbscissa", 1.0), 1.0)
+    ay = _as_float(getattr(conv, "XAxisOrdinate", 0.0), 0.0)
+    norm = math.hypot(ax, ay) or 1.0
+    cos = ax / norm
+    sin = ay / norm
+    mat = np.eye(4, dtype=float)
+    mat[0, 0] = cos * scale
+    mat[0, 1] = -sin * scale
+    mat[1, 0] = sin * scale
+    mat[1, 1] = cos * scale
+    mat[0, 3] = east
+    mat[1, 3] = north
+    mat[2, 3] = height
+    return mat
+
+
+def _rigid_operation_to_np(op) -> np.ndarray:
+    """Build a 4x4 translation matrix from an IfcRigidOperation."""
+    tx = _as_float(getattr(op, "FirstCoordinate", 0.0), 0.0)
+    ty = _as_float(getattr(op, "SecondCoordinate", 0.0), 0.0)
+    tz = _as_float(getattr(op, "Height", 0.0), 0.0)
+    mat = np.eye(4, dtype=float)
+    mat[0, 3] = tx
+    mat[1, 3] = ty
+    mat[2, 3] = tz
+    return mat
+
+def _context_to_np(ctx) -> np.ndarray:
+    """Compose nested representation contexts into a single matrix."""
+    transform = np.eye(4, dtype=float)
+    visited = set()
+    current = ctx
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        wcs = getattr(current, "WorldCoordinateSystem", None)
+        if wcs is not None:
+            transform = transform @ _axis_placement_to_np(wcs)
+        for op in getattr(current, "HasCoordinateOperation", None) or []:
+            if op is None:
+                continue
+            try:
+                if op.is_a("IfcMapConversion"):
+                    transform = transform @ _map_conversion_to_np(op)
+                elif op.is_a("IfcRigidOperation"):
+                    transform = transform @ _rigid_operation_to_np(op)
+            except Exception:
+                continue
+        current = getattr(current, "ParentContext", None)
+    return transform
+
+
+def _to_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    try:
+        text = str(value).strip().upper()
+    except Exception:
+        return None
+    if text in {"F", "FALSE", "NO", "0"}:
+        return False
+    if text in {"T", "TRUE", "YES", "1"}:
+        return True
+    return None
+
+
+def _layer_is_hidden(layer) -> bool:
+    if layer is None:
+        return False
+    for attr in ("LayerOn", "LayerVisible", "LayerVisibility"):
+        if _to_bool(getattr(layer, attr, None)) is False:
+            return True
+    for attr in ("LayerFrozen", "LayerBlocked"):
+        if _to_bool(getattr(layer, attr, None)) is True:
+            return True
+    return False
+
+
+def _entity_on_hidden_layer(entity) -> bool:
+    """Return True if the entity or any of its representations are hidden."""
+    seen: set[int] = set()
+
+    def _collect(obj):
+        if obj is None:
+            return
+        for layer in getattr(obj, "LayerAssignments", None) or []:
+            if layer is None:
+                continue
+            try:
+                lid = int(layer.id())
+            except Exception:
+                lid = id(layer)
+            if lid in seen:
+                continue
+            seen.add(lid)
+            yield layer
+
+    for layer in _collect(entity):
+        if _layer_is_hidden(layer):
+            return True
+
+    rep = getattr(entity, "Representation", None)
+    if rep is not None:
+        for layer in _collect(rep):
+            if _layer_is_hidden(layer):
+                return True
+        for representation in getattr(rep, "Representations", []) or []:
+            for layer in _collect(representation):
+                if _layer_is_hidden(layer):
+                    return True
+            for item in getattr(representation, "Items", []) or []:
+                for layer in _collect(item):
+                    if _layer_is_hidden(layer):
+                        return True
+    return False
+
+def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
+    """Traverse curve/curve-set items and gather 3D points."""
+    if item is None:
+        return []
+    if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
+        pts: List[Tuple[float, float, float]] = []
+        for p in getattr(item, "Points", []) or []:
+            try:
+                pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
+        pts: List[Tuple[float, float, float]] = []
+        for segment in getattr(item, "Segments", []) or []:
+            parent = getattr(segment, "ParentCurve", None)
+            pts.extend(_extract_curve_points(parent))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        return _extract_curve_points(getattr(item, "BasisCurve", None))
+    if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
+        pts: List[Tuple[float, float, float]] = []
+        for element in getattr(item, "Elements", []) or []:
+            pts.extend(_extract_curve_points(element))
+        return pts
+    if hasattr(item, "is_a") and item.is_a("IfcMappedItem"):
+        source = getattr(item, "MappingSource", None)
+        if source is not None:
+            mapped = getattr(source, "MappedRepresentation", None)
+            if mapped is not None:
+                pts: List[Tuple[float, float, float]] = []
+                for sub in getattr(mapped, "Items", []) or []:
+                    pts.extend(_extract_curve_points(sub))
+                return pts
+    if hasattr(item, "is_a") and item.is_a("IfcIndexedPolyCurve"):
+        return _indexed_polycurve_points(item)
+    return []
+
+def _transform_points(points, matrix: np.ndarray) -> List[Tuple[float, float, float]]:
+    """Apply a homogeneous transform to a sequence of (x, y, z) points."""
+    if not points:
+        return []
+    arr = np.asarray(points, dtype=float).reshape(-1, 3)
+    ones = np.ones((arr.shape[0], 1), dtype=float)
+    homo = np.hstack((arr, ones))
+    mat = np.asarray(matrix, dtype=float).reshape(4, 4)
+    transformed = homo @ mat
+    return [
+        (float(x), float(y), float(z))
+        for x, y, z in transformed[:, :3]
+    ]
 
 
 
@@ -1830,6 +4819,13 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             "set enable_hash_dedup=False to opt out if issues arise."
         )
     ctx = PrototypeBuildContext.build(ifc_file, options)
+    log.info(
+        "Detail configuration: scope=%s level=%s object_ids=%d object_guids=%d",
+        ctx.detail_scope,
+        ctx.detail_level,
+        len(ctx.detail_object_ids),
+        len(ctx.detail_object_guids),
+    )
 
     settings = ctx.settings
     high_detail_settings = ctx.high_detail_settings
@@ -1900,11 +4896,29 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         except Exception:
             style_material = None
         face_style_groups = extract_face_style_groups(product) or {}
+        style_token_by_style_id: Dict[int, str] = {}
+        for token, entry in face_style_groups.items():
+            style_id = entry.get("style_id")
+            if style_id is None:
+                continue
+            try:
+                style_token_by_style_id[int(style_id)] = token
+            except Exception:
+                continue
+        default_material_key = material_ids[0] if material_ids else None
+        detail_material_resolver = _build_detail_material_resolver(
+            ifc_file,
+            product,
+            style_token_by_style_id,
+            bool(style_material),
+            default_material_key,
+        )
         settings_fp_current = settings_fp_base
 
         product_class = product.is_a() if hasattr(product, "is_a") else None
         product_class_upper = product_class.upper() if isinstance(product_class, str) else None
         product_name = getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<unnamed>"
+        guid_for_log = getattr(product, "GlobalId", None)
 
         try:
             product_id_int = int(product.id())
@@ -1919,6 +4933,9 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 return tri
             except Exception:
                 return None
+
+        detail_object_match = ctx.wants_detail_for_product(product_id_int, guid_for_log)
+        detail_mesh = detail_mesh_cache.get(product_id_int) if product_id_int is not None else None
 
         mesh_hash = None
         mesh_dict_base = _mesh_from_geom(geom)
@@ -1939,99 +4956,128 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             )
         detail_reasons: List[str] = []
         detail_mode = "base"
-        detail_mesh_data: Optional["OCCDetailMesh"] = (
-            detail_mesh_cache.get(product_id_int) if product_id_int is not None else None
-        )
+        detail_mesh_data: Optional["OCCDetailMesh"] = detail_mesh
         detail_source_obj: Any = shape
         detail_settings_obj = None
 
         needs_high_detail = False
         allow_brep_fallback = False
-        needs_high_detail = (
-            enable_high_detail and product_class_upper in _HIGH_DETAIL_CLASSES if product_class_upper else False
-        )
-        if needs_high_detail:
-            detail_reasons.append("class_match")
-        allow_brep_fallback = (
-            enable_high_detail and product_class_upper in _BREP_FALLBACK_CLASSES if product_class_upper else False
-        )
 
-        if (
-            enable_high_detail
-            and not needs_high_detail
-            and product_class_upper == "IFCBUILDINGELEMENTPROXY"
-            and mesh_stats is not None
-        ):
-            proxy_needs_high_detail, proxy_reasons = occ_detail.proxy_requires_high_detail(mesh_stats)
-            if proxy_needs_high_detail:
-                needs_high_detail = True
-                detail_reasons.extend(proxy_reasons)
-
-        if needs_high_detail and high_detail_settings is not None:
-            remeshed = _remesh_product_geometry(product, high_detail_settings)
-            if remeshed is not None:
-                high_geom = getattr(remeshed, "geometry", remeshed)
-                high_mesh = _mesh_from_geom(high_geom)
-                if high_mesh is not None:
-                    geom = high_geom
-                    mesh_dict = high_mesh
-                    mesh_stats = _mesh_stats(high_mesh)
-                    settings_fp_current = settings_fp_high
-                    materials = _clone_materials(getattr(remeshed, "materials", materials) or materials)
-                    material_ids = list(getattr(remeshed, "material_ids", material_ids) or material_ids)
-                    detail_mode = "high"
-                    detail_source_obj = remeshed
-                else:
-                    mesh_dict = mesh_dict_base
-                    mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
-                    detail_reasons.append("high_detail_failed_empty_geometry")
-            else:
-                mesh_dict = mesh_dict_base
-                mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
-                detail_reasons.append("high_detail_remesh_failed")
-
-        if enable_high_detail and high_detail_settings is not None and (mesh_dict is None or mesh_dict["faces"].size == 0) and allow_brep_fallback:
-            detail_reasons.append("brep_fallback_triggered")
-            remeshed_brep = _remesh_product_geometry(product, high_detail_settings, use_brep=True)
-            if remeshed_brep is not None:
-                brep_geom = getattr(remeshed_brep, "geometry", remeshed_brep)
-                brep_mesh = _mesh_from_geom(brep_geom)
-                if brep_mesh is not None:
-                    geom = brep_geom
-                    mesh_dict = brep_mesh
-                    mesh_stats = _mesh_stats(brep_mesh)
-                    settings_fp_current = settings_fp_brep
-                    materials = _clone_materials(getattr(remeshed_brep, "materials", materials) or materials)
-                    material_ids = list(getattr(remeshed_brep, "material_ids", material_ids) or material_ids)
-                    detail_mode = "brep"
-                    detail_source_obj = remeshed_brep
-                else:
-                    detail_reasons.append("brep_fallback_empty_geometry")
-                    mesh_dict = mesh_dict_base
-                    mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
-            else:
-                detail_reasons.append("brep_fallback_failed")
-                mesh_dict = mesh_dict_base
-                mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
-
-        if enable_high_detail and detail_mesh_data is None:
-            detail_settings_obj = high_detail_settings or settings
-            detail_mesh_data = occ_detail.build_detail_mesh_payload(
-                detail_source_obj,
-                detail_settings_obj,
-                product=product,
-                default_linear_def=_DEFAULT_LINEAR_DEF,
-                default_angular_def=_DEFAULT_ANGULAR_DEF,
-                logger=log,
+        if detail_object_match:
+            log.info(
+                "Detail scope object hit: %s name=%s guid=%s step=%s",
+                product_class_upper or product_class or "<unknown>",
+                product_name,
+                guid_for_log,
+                step_id,
             )
+            detail_mode = "object"
+            detail_mesh_data = _build_object_scope_detail_mesh(ctx, product, material_resolver=detail_material_resolver)
             if detail_mesh_data is None:
-                log.debug(
-                    "Detail mode: OCC mesh unavailable for %s guid=%s step=%s name=%s",
+                log.warning(
+                    "Detail scope object: OCC mesh unavailable for %s guid=%s step=%s name=%s",
                     product_class_upper or product_class or "<unknown>",
                     getattr(product, "GlobalId", None),
                     step_id,
                     product_name,
                 )
+        else:
+            if ctx.detail_scope == "all":
+                needs_high_detail = True
+                allow_brep_fallback = True
+                detail_reasons.append("scope_all")
+
+            if enable_high_detail and ctx.user_high_detail and product_class_upper:
+                if product_class_upper in _HIGH_DETAIL_CLASSES and "class_match" not in detail_reasons:
+                    needs_high_detail = True
+                    detail_reasons.append("class_match")
+                if product_class_upper in _BREP_FALLBACK_CLASSES:
+                    allow_brep_fallback = True
+
+            if (
+                enable_high_detail
+                and ctx.user_high_detail
+                and not needs_high_detail
+                and product_class_upper == "IFCBUILDINGELEMENTPROXY"
+                and mesh_stats is not None
+            ):
+                proxy_needs_high_detail, proxy_reasons = occ_detail.proxy_requires_high_detail(mesh_stats)
+                if proxy_needs_high_detail:
+                    needs_high_detail = True
+                    detail_reasons.extend(proxy_reasons)
+
+            if needs_high_detail and high_detail_settings is not None:
+                remeshed = _remesh_product_geometry(product, high_detail_settings)
+                if remeshed is not None:
+                    high_geom = getattr(remeshed, "geometry", remeshed)
+                    high_mesh = _mesh_from_geom(high_geom)
+                    if high_mesh is not None:
+                        geom = high_geom
+                        mesh_dict = high_mesh
+                        mesh_stats = _mesh_stats(high_mesh)
+                        settings_fp_current = settings_fp_high
+                        materials = _clone_materials(getattr(remeshed, "materials", materials) or materials)
+                        material_ids = list(getattr(remeshed, "material_ids", material_ids) or material_ids)
+                        detail_mode = "high"
+                        detail_source_obj = remeshed
+                    else:
+                        mesh_dict = mesh_dict_base
+                        mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+                        detail_reasons.append("high_detail_failed_empty_geometry")
+                else:
+                    mesh_dict = mesh_dict_base
+                    mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+                    detail_reasons.append("high_detail_remesh_failed")
+
+            if (
+                enable_high_detail
+                and high_detail_settings is not None
+                and (mesh_dict is None or mesh_dict["faces"].size == 0)
+                and allow_brep_fallback
+            ):
+                detail_reasons.append("brep_fallback_triggered")
+                remeshed_brep = _remesh_product_geometry(product, high_detail_settings, use_brep=True)
+                if remeshed_brep is not None:
+                    brep_geom = getattr(remeshed_brep, "geometry", remeshed_brep)
+                    brep_mesh = _mesh_from_geom(brep_geom)
+                    if brep_mesh is not None:
+                        geom = brep_geom
+                        mesh_dict = brep_mesh
+                        mesh_stats = _mesh_stats(brep_mesh)
+                        settings_fp_current = settings_fp_brep
+                        materials = _clone_materials(getattr(remeshed_brep, "materials", materials) or materials)
+                        material_ids = list(getattr(remeshed_brep, "material_ids", material_ids) or material_ids)
+                        detail_mode = "brep"
+                        detail_source_obj = remeshed_brep
+                    else:
+                        detail_reasons.append("brep_fallback_empty_geometry")
+                        mesh_dict = mesh_dict_base
+                        mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+                else:
+                    detail_reasons.append("brep_fallback_failed")
+                    mesh_dict = mesh_dict_base
+                    mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+
+            if needs_high_detail and detail_mesh_data is None:
+                detail_settings_obj = high_detail_settings or settings
+                detail_mesh_data = occ_detail.build_detail_mesh_payload(
+                    detail_source_obj,
+                    detail_settings_obj,
+                    product=product,
+                    default_linear_def=_DEFAULT_LINEAR_DEF,
+                    default_angular_def=_DEFAULT_ANGULAR_DEF,
+                    logger=log,
+                    detail_level=ctx.detail_level,
+                    material_resolver=detail_material_resolver,
+                )
+                if detail_mesh_data is None:
+                    log.debug(
+                        "Detail mode: OCC mesh unavailable for %s guid=%s step=%s name=%s",
+                        product_class_upper or product_class or "<unknown>",
+                        getattr(product, "GlobalId", None),
+                        step_id,
+                        product_name,
+                    )
 
         if detail_mesh_data is not None:
             subshape_entries = getattr(detail_mesh_data, "subshapes", None) or []
@@ -2148,14 +5194,14 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 if not info.material_ids and material_ids: info.material_ids = list(material_ids)
                 if not info.style_face_groups and face_style_groups:
                     info.style_face_groups = _clone_style_groups(face_style_groups)
-                if info.detail_mesh is None and detail_mesh_data is not None:
+                if info.detail_mesh is None and detail_mesh_data is not None and ctx.detail_scope != "object":
                     info.detail_mesh = detail_mesh_data
                 info.count = 0
 
             if info.mesh is not None and info.mesh_hash == mesh_hash and info.settings_fp == settings_fp_current:
                 info.count += 1; repmap_counts[type_id] += 1
                 primary_key = PrototypeKey(kind="repmap", identifier=type_id)
-            if info.detail_mesh is None and detail_mesh_data is not None:
+            if info.detail_mesh is None and detail_mesh_data is not None and ctx.detail_scope != "object":
                 info.detail_mesh = detail_mesh_data
 
         if primary_key is None:
@@ -2176,7 +5222,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                         count=0,
                         style_material=style_material,
                         style_face_groups=_clone_style_groups(face_style_groups),
-                        detail_mesh=detail_mesh_data,
+                        detail_mesh=detail_mesh_data if ctx.detail_scope != "object" else None,
                     )
                     hashes[digest] = bucket
                 bucket.count += 1
@@ -2191,7 +5237,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     bucket.style_face_groups = _clone_style_groups(face_style_groups)
                 if bucket.canonical_frame is None and xf_tuple is not None and _is_affine_invertible_tuple(xf_tuple):
                     bucket.canonical_frame = xf_tuple
-                if bucket.detail_mesh is None and detail_mesh_data is not None:
+                if bucket.detail_mesh is None and detail_mesh_data is not None and ctx.detail_scope != "object":
                     bucket.detail_mesh = detail_mesh_data
                 primary_key = PrototypeKey(kind="hash", identifier=digest)
             else:
