@@ -515,6 +515,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Forward the conversion through the OCC detail pipeline (enables high-detail remeshing).",
     )
+    parser.add_argument(
+        "--detail-scope",
+        dest="detail_scope",
+        choices=("none", "all", "object"),
+        default=None,
+        help="Select which objects receive OCC detail meshes ('none', 'all', or 'object' IDs only).",
+    )
+    parser.add_argument(
+        "--detail-level",
+        dest="detail_level",
+        choices=("subshape", "face"),
+        default=None,
+        help="Granularity of OCC detail meshes when enabled ('subshape' groups or per 'face').",
+    )
+    parser.add_argument(
+        "--detail-object-ids",
+        dest="detail_object_ids",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="STEP_ID",
+        help="STEP ids to remesh when --detail-scope object is used (space-separated list).",
+    )
+    parser.add_argument(
+        "--detail-object-guids",
+        dest="detail_object_guids",
+        nargs="+",
+        default=None,
+        metavar="GUID",
+        help="GUIDs to remesh when --detail-scope object is used (space-separated list).",
+    )
     return parser.parse_args(argv)
 # ------------- helpers -------------
 def _strip_quotes(value: str) -> str:
@@ -1317,7 +1348,14 @@ def _process_single_ifc(
         _ensure_not_cancelled(cancel_event)
         ifc = ifcopenshell.open(local_ifc.as_posix())
         _ensure_not_cancelled(cancel_event)
+        logger.info("Building prototypes for %s...", path_name(ifc_path))
         caches = build_prototypes(ifc, options)
+        logger.info(
+            "Prototype build complete: %d type prototypes, %d hashed prototypes, %d instances",
+            len(caches.repmaps),
+            len(caches.hashes),
+            len(caches.instances),
+        )
         logger.info(
             "IFC %s → %d type prototypes, %d hashed prototypes, %d instances",
             path_name(ifc_path), len(caches.repmaps), len(caches.hashes), len(caches.instances),
@@ -1521,6 +1559,25 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     if getattr(args, "detail_mode", False):
         LOG.info("Detail mode enabled: forwarding to OCC high-detail conversion path.")
         options_override = replace(options_override, enable_high_detail_remesh=True)
+    detail_scope_arg = getattr(args, "detail_scope", None)
+    if detail_scope_arg:
+        LOG.info("Detail scope override: %s", detail_scope_arg)
+        options_override = replace(options_override, detail_scope=detail_scope_arg)
+    detail_level_arg = getattr(args, "detail_level", None)
+    if detail_level_arg:
+        LOG.info("Detail level override: %s", detail_level_arg)
+        options_override = replace(options_override, detail_level=detail_level_arg)
+    detail_ids_arg = getattr(args, "detail_object_ids", None)
+    if detail_ids_arg:
+        LOG.info("Detail object ids override: %s", detail_ids_arg)
+        options_override = replace(options_override, detail_object_ids=tuple(int(i) for i in detail_ids_arg))
+    detail_guids_arg = getattr(args, "detail_object_guids", None)
+    if detail_guids_arg:
+        LOG.info("Detail object GUIDs override: %s", detail_guids_arg)
+        options_override = replace(
+            options_override,
+            detail_object_guids=tuple(str(g) for g in detail_guids_arg),
+        )
     try:
         results = convert(
             args.input_path,
