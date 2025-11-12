@@ -2147,6 +2147,90 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
     return mesh
 
 
+def _author_occ_detail_meshes(
+    stage: Usd.Stage,
+    detail_root_path: Sdf.Path,
+    detail_mesh: Any,
+    *,
+    meters_per_unit: float,
+) -> List[UsdGeom.Mesh]:
+    """Author one Mesh per OCC subshape beneath ``detail_root_path``."""
+    subshapes = getattr(detail_mesh, "subshapes", None) or []
+    faces = getattr(detail_mesh, "faces", None) or []
+    if not subshapes and faces:
+        subshapes = [
+            {"index": idx, "label": f"Face_{idx}", "shape_type": "FACE", "faces": [face]}
+            for idx, face in enumerate(faces)
+        ]
+    if not subshapes:
+        LOG.debug("Detail mesh authoring skipped: no subshapes or faces found for %s", detail_root_path)
+        return []
+
+    detail_root = UsdGeom.Xform.Define(stage, detail_root_path)
+    detail_root.ClearXformOpOrder()
+    authored: List[UsdGeom.Mesh] = []
+    used_names: Set[str] = set()
+
+    def _combine_faces(face_entries: List[Any]) -> Optional[Dict[str, Any]]:
+        verts_list: List[np.ndarray] = []
+        faces_list: List[np.ndarray] = []
+        offset = 0
+        for entry in face_entries:
+            verts = getattr(entry, "vertices", None)
+            tris = getattr(entry, "faces", None)
+            if verts is None or tris is None:
+                continue
+            verts_np = np.asarray(verts, dtype=np.float64)
+            tris_np = np.asarray(tris, dtype=np.int64)
+            if verts_np.size == 0 or tris_np.size == 0:
+                continue
+            verts_list.append(verts_np)
+            faces_list.append(tris_np + offset)
+            offset += verts_np.shape[0]
+        if not verts_list or not faces_list:
+            return None
+        return {
+            "vertices": np.vstack(verts_list),
+            "faces": np.vstack(faces_list),
+        }
+
+    for entry in subshapes:
+        faces_for_subshape = getattr(entry, "faces", None) or []
+        mesh_data = _combine_faces(faces_for_subshape)
+        if mesh_data is None:
+            LOG.debug(
+                "Detail mesh subshape %s produced no triangles (label=%s)",
+                getattr(entry, "index", len(authored)),
+                getattr(entry, "label", "<unnamed>"),
+            )
+            continue
+        label = getattr(entry, "label", None) or f"Subshape_{getattr(entry, 'index', len(authored))}"
+        sanitized = _sanitize_identifier(label, fallback="Subshape")
+        candidate = sanitized
+        counter = 1
+        while candidate in used_names:
+            candidate = f"{sanitized}_{counter}"
+            counter += 1
+        used_names.add(candidate)
+        mesh = write_usd_mesh(
+            stage,
+            detail_root_path,
+            candidate,
+            mesh_data,
+            stage_meters_per_unit=meters_per_unit,
+        )
+        verts_np = np.asarray(mesh_data.get("vertices"), dtype=np.float64)
+        faces_np = np.asarray(mesh_data.get("faces"), dtype=np.int64)
+        LOG.debug(
+            "Detail mesh: authored %s with %d vertices / %d faces",
+            detail_root_path.AppendChild(candidate),
+            verts_np.shape[0],
+            faces_np.shape[0],
+        )
+        authored.append(mesh)
+    return authored
+
+
 # ---------------- Prototype authoring ----------------
 
 def _name_for_repmap(proto: Any) -> str:
@@ -2226,6 +2310,20 @@ def _iter_prototypes(caches: PrototypeCaches) -> Iterable[Tuple[PrototypeKey, An
         yield PrototypeKey(kind="hash", identifier=digest), proto
 
 
+def _prototype_from_key(caches: PrototypeCaches, key: Optional[PrototypeKey]) -> Optional[Any]:
+    """Return the prototype record referenced by ``key``."""
+    if key is None:
+        return None
+    if key.kind == "repmap":
+        try:
+            identifier = int(key.identifier)
+        except Exception:
+            return None
+        return caches.repmaps.get(identifier)
+    identifier_str = str(key.identifier)
+    return caches.hashes.get(identifier_str)
+
+
 def author_prototype_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
@@ -2251,6 +2349,12 @@ def author_prototype_layer(
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
     used_names: Dict[str, int] = {}
     use_component_classification = getattr(options, "enable_material_classification", False)
+    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
+    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
+    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
+    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
+    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
+    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
     def _unique_name(base: str) -> str:
         c = used_names.get(base, 0)
@@ -2263,7 +2367,10 @@ def author_prototype_layer(
 
         for key, proto in _iter_prototypes(caches):
             mesh_payload = getattr(proto, "mesh", None)
-            if not mesh_payload:
+            detail_payload = getattr(proto, "detail_mesh", None)
+            has_detail = bool(detail_mode_enabled and detail_payload and getattr(detail_payload, "faces", None))
+
+            if not mesh_payload and not has_detail:
                 continue
 
             # Name the prototype Xform
@@ -2288,18 +2395,27 @@ def author_prototype_layer(
             full_style_groups = getattr(proto, "style_face_groups", None)
             full_materials = list(getattr(proto, "materials", []) or [])
 
-            write_usd_mesh(
-                stage,
-                proto_path,
-                "Geom",
-                mesh_payload,
-                abs_mat=None,
-                material_ids=full_material_ids,
-                style_groups=full_style_groups,
-                materials=full_materials,
-                stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
-                use_component_classification=use_component_classification,
-            )
+            if has_detail:
+                detail_parent = proto_path.AppendChild("Geom")
+                _author_occ_detail_meshes(
+                    stage,
+                    detail_parent,
+                    detail_payload,
+                    meters_per_unit=stage_meters_per_unit,
+                )
+            else:
+                write_usd_mesh(
+                    stage,
+                    proto_path,
+                    "Geom",
+                    mesh_payload,
+                    abs_mat=None,
+                    material_ids=full_material_ids,
+                    style_groups=full_style_groups,
+                    materials=full_materials,
+                    stage_meters_per_unit=stage_meters_per_unit,
+                    use_component_classification=use_component_classification,
+                )
 
     return proto_layer, proto_paths
 
@@ -2468,6 +2584,9 @@ def _bind_materials_on_prototype_mesh(
     for key, proto in _iter_prototypes(caches):
         mesh_root = proto_paths.get(key)
         if not mesh_root:
+            continue
+        detail_payload = getattr(proto, "detail_mesh", None)
+        if detail_payload and getattr(detail_payload, "faces", None):
             continue
         mesh_path = mesh_root.AppendChild("Geom")
         mesh_prim = stage.GetPrimAtPath(mesh_path)
@@ -3125,6 +3244,8 @@ def author_instance_layer(
     hierarchy_nodes_by_label: Dict[Tuple[Sdf.Path, str], Sdf.Path] = {}
 
     use_component_classification = getattr(options, "enable_material_classification", False)
+    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
+    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
     def _unique_child_name(parent_path: Sdf.Path, base: str) -> str:
         used = name_counters[parent_path]
@@ -3200,6 +3321,35 @@ def author_instance_layer(
             )
             material_ids = list(record.material_ids or [])
 
+            detail_payload = getattr(record, "detail_mesh", None)
+            has_detail_mesh = bool(
+                detail_mode_enabled and detail_payload and getattr(detail_payload, "faces", None)
+            )
+            if has_detail_mesh:
+                detail_root = inst_path.AppendChild("Geom")
+                detail_meshes = _author_occ_detail_meshes(
+                    stage,
+                    detail_root,
+                    detail_payload,
+                    meters_per_unit=stage_meters_per_unit,
+                )
+                if resolved_materials:
+                    _apply_material_bindings_to_prim(
+                        stage,
+                        inst_prim,
+                        resolved_materials,
+                        style_groups=style_groups,
+                    )
+                if resolved_color is not None:
+                    _apply_display_color_to_prim(inst_prim, resolved_color)
+                    for mesh_geom in detail_meshes:
+                        try:
+                            mesh_gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
+                            mesh_gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
+                        except Exception:
+                            pass
+                continue
+
             # Per-instance mesh fallback (non-instanced geometry)
             if record.mesh:
                 mesh_geom = write_usd_mesh(
@@ -3210,7 +3360,7 @@ def author_instance_layer(
                     abs_mat=None,
                     material_ids=material_ids,
                     materials=list(getattr(record, "materials", []) or []),
-                    stage_meters_per_unit=float(stage.GetMetadata("metersPerUnit") or 1.0),
+                    stage_meters_per_unit=stage_meters_per_unit,
                     style_groups=style_groups,
                     use_component_classification=use_component_classification,
                 )
@@ -3238,6 +3388,10 @@ def author_instance_layer(
             if proto_path is None:
                 continue
 
+            proto_detail = _prototype_from_key(caches, record.prototype)
+            proto_detail_mesh = getattr(proto_detail, "detail_mesh", None) if proto_detail else None
+            proto_has_detail = bool(proto_detail_mesh and getattr(proto_detail_mesh, "faces", None))
+
             ref_path = inst_path.AppendChild("Prototype")
             ref_prim = stage.DefinePrim(ref_path, "Xform")
             refs = ref_prim.GetReferences()
@@ -3259,7 +3413,7 @@ def author_instance_layer(
             UsdGeom.Imageable(mesh_child_override).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
 
             if resolved_materials:
-                proto_mesh_path = proto_path.AppendChild("Geom")
+                proto_mesh_path = None if proto_has_detail else proto_path.AppendChild("Geom")
                 _apply_material_bindings_to_prim(
                     stage,
                     inst_prim,
