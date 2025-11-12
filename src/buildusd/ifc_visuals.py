@@ -237,7 +237,10 @@ def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, A
             faces = [face_offset + idx for idx in entry.get("faces", [])]
             if not faces:
                 continue
-            grouped = combined.setdefault(key, {"material": entry["material"], "faces": []})
+            grouped = combined.setdefault(
+                key,
+                {"material": entry["material"], "faces": [], "style_id": entry.get("style_id")},
+            )
             grouped["faces"].extend(faces)
         face_offset += face_count
 
@@ -245,7 +248,10 @@ def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, A
     for i, (key, entry) in enumerate(combined.items()):
         mat = entry["material"]
         token = _sanitize_style_token(f"{mat.name}_{i}")
-        result[token] = {"material": mat, "faces": entry["faces"]}
+        payload = {"material": mat, "faces": entry["faces"]}
+        if entry.get("style_id") is not None:
+            payload["style_id"] = entry["style_id"]
+        result[token] = payload
     return result
 
 
@@ -256,8 +262,13 @@ def _face_style_groups_from_item(item, face_styles) -> Tuple[Dict, int]:
 
     item_id = id(item)
     if item_id in face_styles:
-        mat = _to_pbr(face_styles[item_id][0])
-        return {("styled", mat.name): {"material": mat, "faces": list(range(face_count))}}, face_count
+        style = face_styles[item_id][0]
+        mat = _to_pbr(style)
+        try:
+            style_id = int(style.id())
+        except Exception:
+            style_id = None
+        return {("styled", mat.name): {"material": mat, "faces": list(range(face_count)), "style_id": style_id}}, face_count
 
     # Fallback: IfcIndexedColourMap
     groups = {}
@@ -283,12 +294,12 @@ def _face_style_groups_from_item(item, face_styles) -> Tuple[Dict, int]:
     if color_entries:
         for key, entry in color_entries.items():
             mat = PBRMaterial(name="Color", base_color=(key[0], key[1], key[2]))
-            groups[("color", key)] = {"material": mat, "faces": entry["faces"]}
+            groups[("color", key)] = {"material": mat, "faces": entry["faces"], "style_id": None}
 
     unassigned = [i for i, f in enumerate(assigned) if not f]
     if unassigned:
         mat = PBRMaterial(name="Default")
-        groups[("default",)] = {"material": mat, "faces": unassigned}
+        groups[("default",)] = {"material": mat, "faces": unassigned, "style_id": None}
 
     return groups, face_count
 
@@ -345,40 +356,42 @@ def _resolve_uv_ifc4_polygonal_texture_map(tess) -> Optional[MeshUV]:
 
 
 # === PBR CONVERSION ===
-def _to_pbr(style: ifcopenshell.entity_instance) -> PBRMaterial:
-    if style.is_a("IfcSurfaceStyleWithTextures"):
-        for tex in getattr(style, "Textures", []) or []:
-            if color := _color_from_texture(tex):
-                return PBRMaterial(name=style.Name or "Texture", base_color=color)
-        return PBRMaterial(name=style.Name or "Texture")
+def _get_material_for_style(model, style) -> Optional[ifcopenshell.entity_instance]:
+    for mdr in model.by_type("IfcMaterialDefinitionRepresentation"):
+        for rep in mdr.Representations:
+            for item in rep.Items:
+                if item == style or (hasattr(item, "Styles") and style in item.Styles):
+                    return mdr.RepresentedMaterial
+    return None
+
+def _to_pbr(style: ifcopenshell.entity_instance, model) -> PBRMaterial:
+    material = _get_material_for_style(model, style)
+    mat_name = material.Name if material else None
+    style_name = style.Name
+
+    pbr = PBRMaterial(name=mat_name or style_name or "Unknown")
 
     if style.is_a("IfcSurfaceStyle"):
         elements = getattr(style, "Styles", []) or []
         rendering = next((e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None)
         if rendering:
-            base_color = _get_base_color(rendering)
-            opacity = 1.0 - float(getattr(rendering, "Transparency", 0.0) or 0.0)
+            pbr.base_color = _get_base_color(rendering)
+            pbr.opacity = 1.0 - float(getattr(rendering, "Transparency", 0.0) or 0.0)
             spec = _as_rgb(getattr(rendering, "SpecularColour", None))
             spec_level = max(spec) if spec else 0.0
-            roughness = max(0.05, 1.0 - min(0.95, spec_level))
-            return PBRMaterial(
-                name=style.Name or "SurfaceStyle",
-                base_color=base_color,
-                opacity=opacity,
-                roughness=roughness,
-            )
-        shading = next((e for e in elements if e.is_a("IfcSurfaceStyleShading")), None)
-        if shading:
-            return PBRMaterial(name=style.Name or "SurfaceStyle", base_color=_as_rgb(shading.SurfaceColour))
+            pbr.roughness = max(0.05, 1.0 - min(0.95, spec_level))
+        else:
+            shading = next((e for e in elements if e.is_a("IfcSurfaceStyleShading")), None)
+            if shading:
+                pbr.base_color = _as_rgb(shading.SurfaceColour)
 
-    if style.is_a("IfcSurfaceStyleRendering"):
-        return PBRMaterial(
-            name=style.Name or "Rendering",
-            base_color=_get_base_color(style),
-            opacity=1.0 - float(getattr(style, "Transparency", 0.0) or 0.0)
-        )
+    # Final name: Material (Style)
+    if mat_name and style_name and style_name != mat_name:
+        pbr.name = f"{mat_name} ({style_name})"
+    elif mat_name:
+        pbr.name = mat_name
 
-    return PBRMaterial(name=style.Name or "Style")
+    return pbr
 
 
 def _get_base_color(rendering) -> Tuple[float, float, float]:

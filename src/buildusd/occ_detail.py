@@ -5,23 +5,35 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Literal, Set, Callable
 
 import numpy as np
 import ifcopenshell
 
 try:
     from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh
+    from OCC.Core.IMeshTools import IMeshTools_Parameters
+    from OCC.Core.BRepCheck import BRepCheck_Analyzer
+    from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Sewing
+    from OCC.Core.ShapeFix import ShapeFix_Shape
+    from OCC.Core.Message import Message_ProgressRange
     from OCC.Core.TopAbs import TopAbs_COMPOUND, TopAbs_COMPSOLID, TopAbs_FACE, TopAbs_SHELL, TopAbs_SOLID
     from OCC.Core.TopExp import TopExp_Explorer
     from OCC.Core.TopoDS import TopoDS_Shape, topods_Face
     from OCC.Core.TopLoc import TopLoc_Location
     from OCC.Core.BRep import BRep_Tool
+    from OCC.Core.Bnd import Bnd_Box
+    from OCC.Core.BRepBndLib import brepbndlib_Add
     from ifcopenshell.geom import occ_utils as _occ_utils
 
     _HAVE_OCC = True
 except Exception:  # pragma: no cover - optional dependency
     BRepMesh_IncrementalMesh = None  # type: ignore
+    IMeshTools_Parameters = None  # type: ignore
+    BRepCheck_Analyzer = None  # type: ignore
+    BRepBuilderAPI_Sewing = None  # type: ignore
+    ShapeFix_Shape = None  # type: ignore
+    Message_ProgressRange = None  # type: ignore
     TopAbs_FACE = None  # type: ignore
     TopAbs_SOLID = None  # type: ignore
     TopAbs_COMPSOLID = None  # type: ignore
@@ -32,6 +44,8 @@ except Exception:  # pragma: no cover - optional dependency
     topods_Face = None  # type: ignore
     TopLoc_Location = None  # type: ignore
     BRep_Tool = None  # type: ignore
+    Bnd_Box = None  # type: ignore
+    brepbndlib_Add = None  # type: ignore
     _occ_utils = None  # type: ignore
     _HAVE_OCC = False
 
@@ -49,7 +63,7 @@ __all__ = [
     "mesh_from_detail_mesh",
 ]
 
-_DEFAULT_LINEAR_DEF = 0.005  # metres
+_DEFAULT_LINEAR_DEF = 0.01  # metres (cap)
 _DEFAULT_ANGULAR_DEF = 0.5   # degrees
 
 _PROXY_SHORT_DIM_THRESHOLD = 0.06  # metres
@@ -66,6 +80,7 @@ class OCCFaceMesh:
     face_index: int
     vertices: np.ndarray
     faces: np.ndarray
+    material_key: Optional[Any] = None
 
 
 @dataclass
@@ -76,6 +91,7 @@ class OCCSubshapeMesh:
     label: str
     shape_type: str
     faces: List[OCCFaceMesh]
+    material_key: Optional[Any] = None
 
 
 @dataclass
@@ -139,7 +155,7 @@ def build_detail_mesh(
         return None
     linear_tol = max(float(linear_deflection), 1e-6)
     angular_tol = max(float(angular_deflection_rad), math.radians(0.1))
-    if not _perform_meshing(topo_shape, linear_tol, angular_tol, logger=logger):
+    if not _perform_meshing(topo_shape, linear_tol, angular_tol, logger=logger, ifc_entity=getattr(shape_obj, "id", lambda: None)()):
         return None
     subshape_shapes = _primary_subshape_list(topo_shape)
     subshape_meshes: List[OCCSubshapeMesh] = []
@@ -218,9 +234,53 @@ def _iter_occ_candidates(root: Any) -> Iterator[Any]:
 
 
 def _is_topods(candidate: Any) -> bool:
-    if not is_available() or TopoDS_Shape is None:
+    if candidate is None:
         return False
-    return isinstance(candidate, TopoDS_Shape)
+    if not is_available():
+        return False
+    if TopoDS_Shape is not None and isinstance(candidate, TopoDS_Shape):
+        return True
+    return hasattr(candidate, "ShapeType") and hasattr(candidate, "IsNull") and callable(candidate.ShapeType)
+
+
+def _ensure_occ_components() -> bool:
+    if not is_available():
+        return False
+    missing = [
+        component is None
+        for component in (
+            BRepCheck_Analyzer,
+            ShapeFix_Shape,
+            BRepBuilderAPI_Sewing,
+            IMeshTools_Parameters,
+            BRepMesh_IncrementalMesh,
+        )
+    ]
+    if not any(missing):
+        return True
+    try:
+        from OCC.Core.BRepCheck import BRepCheck_Analyzer as _BRepCheck_Analyzer  # type: ignore
+        from OCC.Core.ShapeFix import ShapeFix_Shape as _ShapeFix_Shape  # type: ignore
+        from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Sewing as _BRepBuilderAPI_Sewing  # type: ignore
+        from OCC.Core.IMeshTools import IMeshTools_Parameters as _IMeshTools_Parameters  # type: ignore
+        from OCC.Core.BRepMesh import BRepMesh_IncrementalMesh as _BRepMesh_IncrementalMesh  # type: ignore
+    except Exception as exc:
+        log.debug("Detail mesher: OCC re-import failed: %s", exc)
+        return False
+
+    globals()["BRepCheck_Analyzer"] = _BRepCheck_Analyzer
+    globals()["ShapeFix_Shape"] = _ShapeFix_Shape
+    globals()["BRepBuilderAPI_Sewing"] = _BRepBuilderAPI_Sewing
+    globals()["IMeshTools_Parameters"] = _IMeshTools_Parameters
+    globals()["BRepMesh_IncrementalMesh"] = _BRepMesh_IncrementalMesh
+    return True
+
+
+def _require_occ_components(ifc_entity=None) -> None:
+    if not _ensure_occ_components():
+        msg = f"Detail mesher unavailable: OCC bindings not loaded for {ifc_entity}"
+        log.error(msg)
+        raise RuntimeError(msg)
 
 
 _SHAPE_TYPE_NAMES = {
@@ -245,32 +305,188 @@ def _shape_type_name(shape: Any) -> str:
     return _SHAPE_TYPE_NAMES.get(shape_type, str(shape_type))
 
 
+def _set_linear_deflection(params, value: float) -> None:
+    for name in (
+        "SetLinearDeflection",
+        "SetDeflection",
+        "SetMaximalChordalDeviation",
+        "SetChordalDeflection",
+        "SetMaxChordalDeviation",
+    ):
+        method = getattr(params, name, None)
+        if callable(method):
+            method(float(value))
+            return
+    setattr(params, "linear_deflection", float(value))
+
+
+def _set_angular_deflection(params, value: float) -> None:
+    for name in ("SetAngularDeflection", "SetAngularDeviation", "SetAngularError", "SetMaximalAngle"):
+        method = getattr(params, name, None)
+        if callable(method):
+            method(float(value))
+            return
+    setattr(params, "angular_deflection", float(value))
+
+
+def _set_bool_flag(params, candidates: Tuple[str, ...], value: bool) -> None:
+    for name in candidates:
+        method = getattr(params, name, None)
+        if callable(method):
+            method(bool(value))
+            return
+    for name in candidates:
+        if hasattr(params, name):
+            setattr(params, name, bool(value))
+            return
+
+
+def _shape_diagonal(shape: Any) -> float:
+    if not is_available() or Bnd_Box is None or brepbndlib_Add is None:
+        return 1.0
+    try:
+        box = Bnd_Box()
+        box.SetGap(0.0)
+        brepbndlib_Add(shape, box)
+        xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+        dx = float(xmax - xmin)
+        dy = float(ymax - ymin)
+        dz = float(zmax - zmin)
+        diag = math.sqrt(max(dx, 0.0) ** 2 + max(dy, 0.0) ** 2 + max(dz, 0.0) ** 2)
+        if not math.isfinite(diag) or diag <= 0.0:
+            return 1.0
+        return diag
+    except Exception:
+        return 1.0
+
+
+def safe_mesh_shape(
+    occ_shape,
+    *,
+    ifc_entity=None,
+    base_linear_deflection: float = 0.01,
+    base_angular_deflection: float = 0.5,
+    logger: Optional[logging.Logger] = None,
+):
+    active_log = logger or log
+    if occ_shape is None or getattr(occ_shape, "IsNull", lambda: True)():
+        msg = f"Detail mesher: null OCC shape for {ifc_entity}"
+        active_log.error(msg)
+        raise RuntimeError(msg)
+    if not is_available():
+        msg = f"Detail mesher: OCC runtime not available for {ifc_entity}"
+        active_log.error(msg)
+        raise RuntimeError(msg)
+
+    _require_occ_components(ifc_entity)
+
+    missing_components = [
+        name
+        for name, component in (
+            ("BRepCheck_Analyzer", BRepCheck_Analyzer),
+            ("ShapeFix_Shape", ShapeFix_Shape),
+            ("BRepBuilderAPI_Sewing", BRepBuilderAPI_Sewing),
+            ("IMeshTools_Parameters", IMeshTools_Parameters),
+            ("BRepMesh_IncrementalMesh", BRepMesh_IncrementalMesh),
+        )
+        if component is None
+    ]
+    if missing_components:
+        msg = (
+            f"Detail mesher: OCC components {', '.join(missing_components)} missing; "
+            f"cannot mesh {ifc_entity}"
+        )
+        active_log.error(msg)
+        raise RuntimeError(msg)
+
+    try:
+        analyzer = BRepCheck_Analyzer(occ_shape)
+        if analyzer is not None and not analyzer.IsValid():
+            active_log.info("Detail mesher: invalid B-Rep for %s, running ShapeFix.", ifc_entity)
+            fixer = ShapeFix_Shape(occ_shape)
+            fixer.Perform()
+            fixed_shape = fixer.Shape()
+            if fixed_shape is None or fixed_shape.IsNull():
+                active_log.warning("Detail mesher: ShapeFix failed for %s", ifc_entity)
+                return False, None
+            occ_shape = fixed_shape
+    except Exception:
+        active_log.debug("Detail mesher: BRepCheck analyzer failed for %s", ifc_entity, exc_info=True)
+
+    if BRepBuilderAPI_Sewing is not None:
+        try:
+            sewing = BRepBuilderAPI_Sewing(1e-6)
+            sewing.Add(occ_shape)
+            sewing.Perform()
+            sewn = sewing.SewedShape()
+            if sewn is not None and not sewn.IsNull():
+                occ_shape = sewn
+        except Exception:
+            active_log.debug("Detail mesher: sewing failed for %s", ifc_entity, exc_info=True)
+
+    diag = _shape_diagonal(occ_shape)
+    linear_deflection = min(base_linear_deflection, diag * 0.001)
+    angular_deflection = base_angular_deflection
+
+    params = IMeshTools_Parameters()
+    _set_linear_deflection(params, linear_deflection)
+    _set_angular_deflection(params, angular_deflection)
+    _set_bool_flag(
+        params,
+        ("SetRelative", "SetRelativeMode", "SetRelativeFlag"),
+        True,
+    )
+    _set_bool_flag(
+        params,
+        ("SetInParallel", "SetIsInParallel", "SetParallel"),
+        True,
+    )
+    _set_bool_flag(
+        params,
+        ("SetAllowQualityDecrease", "SetAllowQualityDrop", "SetQualityDecrease"),
+        True,
+    )
+
+    try:
+        mesher = BRepMesh_IncrementalMesh(occ_shape, params)
+        active_log.debug(
+            "Detail mesher: meshed %s (diag=%.3f, defl=%.5f, angle=%.2f)",
+            ifc_entity,
+            diag,
+            linear_deflection,
+            angular_deflection,
+        )
+        return True, mesher
+    except Exception as exc:
+        active_log.warning("Detail mesher: OCC meshing failed for %s: %s", ifc_entity, exc)
+        return False, None
+
+
 def _perform_meshing(
     topo_shape: Any,
     linear_deflection: float,
     angular_deflection: float,
     *,
     logger: Optional[logging.Logger] = None,
+    ifc_entity: Any = None,
 ) -> bool:
     """Run the OCCT mesher once so all faces carry triangulations."""
     try:
-        mesher = BRepMesh_IncrementalMesh(
+        success, _ = safe_mesh_shape(
             topo_shape,
-            float(linear_deflection),
-            False,
-            float(angular_deflection),
-            True,
+            ifc_entity=ifc_entity,
+            base_linear_deflection=linear_deflection,
+            base_angular_deflection=angular_deflection,
+            logger=logger,
         )
-        if hasattr(mesher, "Perform"):
-            mesher.Perform()
-        return True
+        return success
     except Exception as exc:  # pragma: no cover - defensive
         if logger:
-            logger.debug("BRepMesh_IncrementalMesh failed: %s", exc)
+            logger.debug("Safe OCC meshing failed: %s", exc)
         return False
 
 
-def _collect_face_meshes(target_shape: Any, start_index: int) -> tuple[List[OCCFaceMesh], int]:
+def _collect_face_meshes(target_shape: Any, start_index: int, *, material_key: Optional[Any] = None) -> tuple[List[OCCFaceMesh], int]:
     """Collect OCCFaceMesh entries for every face in ``target_shape``."""
     faces: List[OCCFaceMesh] = []
     face_index = start_index
@@ -285,6 +501,8 @@ def _collect_face_meshes(target_shape: Any, start_index: int) -> tuple[List[OCCF
         mesh = _triangulate_face(face)
         if mesh is not None:
             mesh.face_index = face_index
+            if material_key is not None and getattr(mesh, "material_key", None) is None:
+                mesh.material_key = material_key
             faces.append(mesh)
         explorer.Next()
         face_index += 1
@@ -396,6 +614,8 @@ def build_detail_mesh_payload(
     default_linear_def: float = _DEFAULT_LINEAR_DEF,
     default_angular_def: float = _DEFAULT_ANGULAR_DEF,
     logger: Optional[logging.Logger] = None,
+    detail_level: Literal["subshape", "face"] = "subshape",
+    material_resolver: Optional[Callable[[Any], Any]] = None,
 ) -> Optional[OCCDetailMesh]:
     """Construct OCC face meshes for detail-mode geometry."""
     logref = logger or log
@@ -444,6 +664,8 @@ def build_detail_mesh_payload(
             float(linear_def),
             angular_rad,
             logger=logref,
+            detail_level=detail_level,
+            material_resolver=material_resolver,
         )
         if detail_mesh is not None and logref:
             logref.debug(
@@ -456,6 +678,9 @@ def build_detail_mesh_payload(
         if logref:
             logref.debug("OCC detail: no mesh generated for %s", target_name)
         return None
+
+    if detail_level == "face":
+        detail_mesh = _explode_to_faces(detail_mesh)
 
     subshape_count = len(getattr(detail_mesh, "subshapes", []) or [])
     face_total = detail_mesh.face_count if hasattr(detail_mesh, "face_count") else 0
@@ -476,6 +701,7 @@ def precompute_detail_meshes(
     default_linear_def: float = _DEFAULT_LINEAR_DEF,
     default_angular_def: float = _DEFAULT_ANGULAR_DEF,
     logger: Optional[logging.Logger] = None,
+    detail_level: Literal["subshape", "face"] = "subshape",
 ) -> Dict[int, OCCDetailMesh]:
     """Precompute OCC detail meshes for every product (detail-mode prepass)."""
     cache: Dict[int, OCCDetailMesh] = {}
@@ -499,6 +725,7 @@ def precompute_detail_meshes(
             default_linear_def=default_linear_def,
             default_angular_def=default_angular_def,
             logger=logref,
+            detail_level=detail_level,
         )
         if detail_mesh is not None:
             cache[product_id] = detail_mesh
@@ -518,6 +745,8 @@ def _build_representation_detail_mesh(
     angular_rad: float,
     *,
     logger: Optional[logging.Logger] = None,
+    detail_level: Literal["subshape", "face"] = "subshape",
+    material_resolver: Optional[Callable[[Any], Any]] = None,
 ):
     """Fallback OCC extraction that tessellates each representation item directly."""
     representation = getattr(product, "Representation", None)
@@ -534,10 +763,11 @@ def _build_representation_detail_mesh(
             rep_index=rep_index,
             item_index=item_index,
             logger=logger,
+            detail_level=detail_level,
+            material_resolver=material_resolver,
         )
         if detail_mesh is None:
             continue
-        _annotate_detail_subshapes(detail_mesh, product, rep_index, item_index, item)
         item_meshes.append(detail_mesh)
     if not item_meshes:
         return None
@@ -597,6 +827,8 @@ def _detail_mesh_for_item(
     rep_index: Optional[int] = None,
     item_index: Optional[int] = None,
     logger: Optional[logging.Logger] = None,
+    detail_level: Literal["subshape", "face"] = "subshape",
+    material_resolver: Optional[Callable[[Any], Any]] = None,
 ):
     if item is None:
         return None
@@ -616,6 +848,7 @@ def _detail_mesh_for_item(
         angular_deflection_rad=float(angular_rad),
         logger=logger or log,
     )
+    material_key = material_resolver(item) if material_resolver else None
     if detail_mesh is None and logger:
         logger.debug(
             "Detail mode: OCC tessellation yielded no faces for product=%s step=%s item=%s rep=%s/%s",
@@ -625,17 +858,23 @@ def _detail_mesh_for_item(
             rep_index,
             item_index,
         )
-    elif detail_mesh is not None and logger:
-        subshape_count = len(getattr(detail_mesh, "subshapes", None) or [])
-        logger.debug(
-            "Detail mode: OCC tessellation succeeded for product=%s step=%s item=%s rep=%s/%s subshapes=%d",
-            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
-            getattr(product, "id", lambda: None)(),
-            _describe_rep_item(item),
-            rep_index,
-            item_index,
-            subshape_count,
-        )
+    elif detail_mesh is not None:
+        _apply_material_key(detail_mesh, material_key)
+        if detail_level == "face":
+            detail_mesh = _explode_to_faces(detail_mesh)
+        if product is not None and rep_index is not None and item_index is not None:
+            _annotate_detail_subshapes(detail_mesh, product, rep_index, item_index, item, material_key=material_key)
+        if logger:
+            subshape_count = len(getattr(detail_mesh, "subshapes", None) or [])
+            logger.debug(
+                "Detail mode: OCC tessellation succeeded for product=%s step=%s item=%s rep=%s/%s subshapes=%d",
+                getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+                getattr(product, "id", lambda: None)(),
+                _describe_rep_item(item),
+                rep_index,
+                item_index,
+                subshape_count,
+            )
     return detail_mesh
 
 
@@ -702,7 +941,7 @@ def _create_occ_product_shape(settings, product, *, logger: Optional[logging.Log
     return geometry or shape_obj
 
 
-def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index: int, item):
+def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index: int, item, material_key: Optional[Any] = None):
     """Tag OCC subshape labels so downstream USD meshes remain traceable."""
     subshapes = getattr(detail_mesh, "subshapes", None) or []
     if not subshapes:
@@ -713,6 +952,23 @@ def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index:
     for local_index, subshape in enumerate(subshapes):
         current = getattr(subshape, "label", f"Subshape_{local_index}")
         subshape.label = f"{prefix}_{current}"
+        if material_key is not None and getattr(subshape, "material_key", None) is None:
+            subshape.material_key = material_key
+        for face in getattr(subshape, "faces", None) or []:
+            if material_key is not None and getattr(face, "material_key", None) is None:
+                face.material_key = material_key
+
+
+def _apply_material_key(detail_mesh, material_key: Optional[Any]) -> None:
+    if material_key is None:
+        return
+    subshapes = getattr(detail_mesh, "subshapes", None) or []
+    for subshape in subshapes:
+        if getattr(subshape, "material_key", None) is None:
+            subshape.material_key = material_key
+        for face in getattr(subshape, "faces", None) or []:
+            if getattr(face, "material_key", None) is None:
+                face.material_key = material_key
 
 
 def _normalize_detail_indices(detail_mesh):
@@ -732,11 +988,39 @@ def _merge_detail_meshes(meshes: List[OCCDetailMesh]) -> Optional[OCCDetailMesh]
                     label=label,
                     shape_type=getattr(subshape, "shape_type", "UNKNOWN"),
                     faces=list(getattr(subshape, "faces", []) or []),
+                    material_key=getattr(subshape, "material_key", None),
                 )
             )
     if not combined:
         return None
     return OCCDetailMesh(shape=None, subshapes=combined)
+
+
+def _explode_to_faces(detail_mesh: OCCDetailMesh) -> OCCDetailMesh:
+    """Return a copy of detail mesh where each face is exposed as its own subshape."""
+    subshapes = getattr(detail_mesh, "subshapes", None) or []
+    exploded: List[OCCSubshapeMesh] = []
+    for parent in subshapes:
+        faces = getattr(parent, "faces", None) or []
+        for face in faces:
+            label = getattr(parent, "label", "Subshape")
+            face_material = getattr(face, "material_key", None)
+            subshape_material = getattr(parent, "material_key", None)
+            if face_material is None and subshape_material is not None:
+                face.material_key = subshape_material
+                face_material = subshape_material
+            exploded.append(
+                OCCSubshapeMesh(
+                    index=len(exploded),
+                    label=f"{label}_face{face.face_index}",
+                    shape_type="Face",
+                    faces=[face],
+                    material_key=face_material or subshape_material,
+                )
+            )
+    if not exploded:
+        return detail_mesh
+    return OCCDetailMesh(shape=detail_mesh.shape, subshapes=exploded)
 
 
 def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict[str, Any]]:

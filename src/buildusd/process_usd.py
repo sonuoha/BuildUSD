@@ -2153,7 +2153,7 @@ def _author_occ_detail_meshes(
     detail_mesh: Any,
     *,
     meters_per_unit: float,
-) -> List[UsdGeom.Mesh]:
+) -> List[Tuple[UsdGeom.Mesh, List[Any]]]:
     """Author one Mesh per OCC subshape beneath ``detail_root_path``."""
     subshapes = getattr(detail_mesh, "subshapes", None) or []
     faces = getattr(detail_mesh, "faces", None) or []
@@ -2168,13 +2168,14 @@ def _author_occ_detail_meshes(
 
     detail_root = UsdGeom.Xform.Define(stage, detail_root_path)
     detail_root.ClearXformOpOrder()
-    authored: List[UsdGeom.Mesh] = []
+    authored: List[Tuple[UsdGeom.Mesh, List[Any]]] = []
     used_names: Set[str] = set()
 
-    def _combine_faces(face_entries: List[Any]) -> Optional[Dict[str, Any]]:
+    def _combine_faces(face_entries: List[Any]) -> Tuple[Optional[Dict[str, Any]], List[Any]]:
         verts_list: List[np.ndarray] = []
         faces_list: List[np.ndarray] = []
         offset = 0
+        face_materials: List[Any] = []
         for entry in face_entries:
             verts = getattr(entry, "vertices", None)
             tris = getattr(entry, "faces", None)
@@ -2186,17 +2187,22 @@ def _author_occ_detail_meshes(
                 continue
             verts_list.append(verts_np)
             faces_list.append(tris_np + offset)
+            face_token = getattr(entry, "material_key", None)
+            face_materials.extend([face_token] * tris_np.shape[0])
             offset += verts_np.shape[0]
         if not verts_list or not faces_list:
-            return None
-        return {
-            "vertices": np.vstack(verts_list),
-            "faces": np.vstack(faces_list),
-        }
+            return None, []
+        return (
+            {
+                "vertices": np.vstack(verts_list),
+                "faces": np.vstack(faces_list),
+            },
+            face_materials,
+        )
 
     for entry in subshapes:
         faces_for_subshape = getattr(entry, "faces", None) or []
-        mesh_data = _combine_faces(faces_for_subshape)
+        mesh_data, face_materials = _combine_faces(faces_for_subshape)
         if mesh_data is None:
             LOG.debug(
                 "Detail mesh subshape %s produced no triangles (label=%s)",
@@ -2227,7 +2233,7 @@ def _author_occ_detail_meshes(
             verts_np.shape[0],
             faces_np.shape[0],
         )
-        authored.append(mesh)
+        authored.append((mesh, face_materials))
     return authored
 
 
@@ -2349,11 +2355,10 @@ def author_prototype_layer(
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
     used_names: Dict[str, int] = {}
     use_component_classification = getattr(options, "enable_material_classification", False)
-    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
-    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
-    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
-    stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
-    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
+    detail_scope = getattr(options, "detail_scope", "none") or "none"
+    detail_mode_enabled = bool(
+        getattr(options, "enable_high_detail_remesh", False) or detail_scope == "all"
+    )
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
     def _unique_name(base: str) -> str:
@@ -3107,6 +3112,63 @@ def _apply_material_bindings_to_prim(
     return primary_path
 
 
+def _bind_detail_materials(
+    stage: Usd.Stage,
+    mesh_geom: UsdGeom.Mesh,
+    face_material_keys: Sequence[Any],
+    resolved_materials: Dict[Any, Sdf.Path],
+) -> None:
+    if not resolved_materials:
+        return
+    mesh_path = mesh_geom.GetPath()
+    keys = list(face_material_keys or [])
+    valid_keys = [key for key in keys if key in resolved_materials]
+    if not valid_keys:
+        _apply_material_bindings_to_prim(stage, mesh_geom.GetPrim(), resolved_materials, mesh_path=mesh_path)
+        return
+    order: List[Any] = []
+    seen: Set[Any] = set()
+    for key in valid_keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        order.append(key)
+    if len(order) == 1:
+        _apply_material_bindings_to_prim(stage, mesh_geom.GetPrim(), resolved_materials, mesh_path=mesh_path)
+        return
+
+    binding_api = UsdShade.MaterialBindingAPI(mesh_geom)
+    binding_api.UnbindAllBindings()
+    primary_key = order[0]
+    primary_material = UsdShade.Material.Get(stage, resolved_materials.get(primary_key))
+    if not primary_material:
+        return
+    binding_api.Bind(primary_material)
+
+    family_name = "materialBind"
+    face_lookup: Dict[Any, List[int]] = {}
+    for face_index, key in enumerate(keys):
+        if key not in resolved_materials:
+            continue
+        face_lookup.setdefault(key, []).append(face_index)
+
+    for key, indices in face_lookup.items():
+        if not indices or key == primary_key:
+            continue
+        subset_token = _subset_token_for_material(key)
+        subset_path = mesh_path.AppendChild(subset_token)
+        subset = UsdGeom.Subset.Define(stage, subset_path)
+        UsdGeom.Subset.SetElementType(subset, UsdGeom.Tokens.face)
+        subset.CreateIndicesAttr(indices)
+        subset_material = UsdShade.Material.Get(stage, resolved_materials.get(key))
+        if subset_material:
+            UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(subset_material)
+    try:
+        UsdGeom.Subset.SetFamilyType(mesh_geom, family_name, UsdGeom.Tokens.nonOverlapping)
+    except Exception:
+        pass
+
+
 def author_material_layer(
     stage: Usd.Stage,
     caches: PrototypeCaches,
@@ -3244,7 +3306,10 @@ def author_instance_layer(
     hierarchy_nodes_by_label: Dict[Tuple[Sdf.Path, str], Sdf.Path] = {}
 
     use_component_classification = getattr(options, "enable_material_classification", False)
-    detail_mode_enabled = bool(getattr(options, "enable_high_detail_remesh", False))
+    detail_scope = getattr(options, "detail_scope", "none") or "none"
+    detail_mode_enabled = bool(
+        getattr(options, "enable_high_detail_remesh", False) or detail_scope in ("all", "object")
+    )
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
     def _unique_child_name(parent_path: Sdf.Path, base: str) -> str:
@@ -3327,22 +3392,22 @@ def author_instance_layer(
             )
             if has_detail_mesh:
                 detail_root = inst_path.AppendChild("Geom")
-                detail_meshes = _author_occ_detail_meshes(
+                detail_entries = _author_occ_detail_meshes(
                     stage,
                     detail_root,
                     detail_payload,
                     meters_per_unit=stage_meters_per_unit,
                 )
                 if resolved_materials:
-                    _apply_material_bindings_to_prim(
-                        stage,
-                        inst_prim,
-                        resolved_materials,
-                        style_groups=style_groups,
-                    )
+                    for mesh_geom, face_materials in detail_entries:
+                        _bind_detail_materials(
+                            stage,
+                            mesh_geom,
+                            face_materials,
+                            resolved_materials,
+                        )
                 if resolved_color is not None:
-                    _apply_display_color_to_prim(inst_prim, resolved_color)
-                    for mesh_geom in detail_meshes:
+                    for mesh_geom, _ in detail_entries:
                         try:
                             mesh_gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
                             mesh_gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
