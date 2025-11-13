@@ -506,12 +506,21 @@ def convert(
     if manifest_path and manifest is not None:
         raise ValueError("Provide either manifest or manifest_path, not both.")
     exclude = normalize_exclusions(exclude_names)
+    stage_path_override: Optional[Path] = None
+    base_name_override: Optional[str] = None
+    output_path_literal = output_dir
     if output_dir is None:
         output_root: PathLike = DEFAULT_OUTPUT_ROOT
     else:
         output_root = output_dir
     if not is_omniverse_path(output_root):
         output_root = Path(output_root).resolve()
+        suffix = output_root.suffix.lower()
+        if suffix in {".usd", ".usda", ".usdc"} and output_dir is not None:
+            stage_path_override = output_root
+            base_name_override = output_root.stem or output_root.name
+            parent = output_root.parent
+            output_root = parent if str(parent) else Path(".").resolve()
     check_paths: list[PathLike] = [input_path, output_root]
     if manifest_path:
         check_paths.append(manifest_path)
@@ -558,7 +567,24 @@ def convert(
     if not targets:
         log.info("Connected to %s but found no IFC files to convert.", input_path)
         return []
-    log.info("Discovered %d IFC file(s) under %s", len(targets), input_path)
+    target_count = len(targets)
+    log.info("Discovered %d IFC file(s) under %s", target_count, input_path)
+    if stage_path_override is not None:
+        if target_count == 1:
+            log.info(
+                "Output will be authored to explicit stage path %s",
+                stage_path_override,
+            )
+        else:
+            log.warning(
+                "Output path %s points to a USD file but %d IFC files were discovered. "
+                "Each IFC will be exported into %s instead.",
+                output_path_literal,
+                target_count,
+                output_root,
+            )
+            stage_path_override = None
+            base_name_override = None
     results: list[ConversionResult] = []
     for target in targets:
         _ensure_not_cancelled(cancel_event)
@@ -588,7 +614,11 @@ def convert(
                 usd_format=usd_format_normalized,
                 usd_auto_binary_threshold_mb=auto_binary_threshold,
                 cancel_event=cancel_event,
+                base_name_override=base_name_override,
+                stage_path_override=stage_path_override,
             )
+            base_name_override = None
+            stage_path_override = None
         except ConversionCancelledError:
             raise
         except Exception as exc:
@@ -822,7 +852,13 @@ def _manifest_key_for_path(path: PathLike) -> Path:
     return Path(str(path)).resolve()
 
 # ------------- layout + checkpoint -------------
-def _build_output_layout(output_root: PathLike, base_name: str, usd_format: str) -> _OutputLayout:
+def _build_output_layout(
+    output_root: PathLike,
+    base_name: str,
+    usd_format: str,
+    *,
+    stage_override: PathLike | None = None,
+) -> _OutputLayout:
     ensure_directory(output_root)
     prototypes_dir = join_path(output_root, "prototypes")
     materials_dir = join_path(output_root, "materials")
@@ -834,7 +870,14 @@ def _build_output_layout(output_root: PathLike, base_name: str, usd_format: str)
     ext = _normalise_usd_format(usd_format)
     if ext == "auto":
         raise ValueError("Auto USD format must be resolved before building the output layout.")
-    stage_path = join_path(output_root, f"{base_name}.{ext}")
+    if stage_override is not None:
+        stage_path = Path(stage_override)
+        if stage_path.suffix.lower().lstrip(".") != ext:
+            raise ValueError(
+                f"Output file extension {stage_path.suffix} does not match usd_format {ext}."
+            )
+    else:
+        stage_path = join_path(output_root, f"{base_name}.{ext}")
     ensure_parent_directory(stage_path)
     return _OutputLayout(
         stage=stage_path,
@@ -1163,11 +1206,13 @@ def _process_single_ifc(
     default_base_point: BasePointConfig = DEFAULT_BASE_POINT,
     default_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
     default_master_stage: str = DEFAULT_MASTER_STAGE,
+    base_name_override: Optional[str] = None,
+    stage_path_override: PathLike | None = None,
 ) -> ConversionResult:
     import ifcopenshell  # Local import
 
     _ensure_not_cancelled(cancel_event)
-    base_name = path_stem(ifc_path)
+    base_name = base_name_override or path_stem(ifc_path)
     revision_note = plan.revision if plan and plan.revision else None
     checkpoint_note: Optional[str] = None
     checkpoint_tags: list[str] = []
@@ -1197,7 +1242,12 @@ def _process_single_ifc(
                 base_name=base_name,
                 logger=logger,
             )
-        layout = _build_output_layout(output_root, base_name, authoring_format)
+        layout = _build_output_layout(
+            output_root,
+            base_name,
+            authoring_format,
+            stage_override=stage_path_override,
+        )
         stage = create_usd_stage(layout.stage)
         proto_layer, proto_paths = author_prototype_layer(stage, caches, layout.prototypes, base_name, options)
         _ensure_not_cancelled(cancel_event)
