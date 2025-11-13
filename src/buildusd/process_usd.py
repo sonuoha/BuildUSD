@@ -289,8 +289,45 @@ def _reindex_for_uv_seams(
     return new_points, new_normals, new_indices, new_uvs
 
 
+def _material_name_from_entry(entry: Any) -> Optional[str]:
+    if entry is None:
+        return None
+    if PBRMaterial is not None and isinstance(entry, PBRMaterial):
+        return entry.name
+    if isinstance(entry, dict):
+        for key in ("name", "Name", "label", "Label", "description", "Description"):
+            value = entry.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    for attr in ("Name", "name", "Description", "ElementName", "Label"):
+        if hasattr(entry, attr):
+            value = getattr(entry, attr)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _material_identifier_for_index(index: int, materials: Optional[Sequence[Any]]) -> Any:
+    if not materials:
+        return index
+    try:
+        entry = materials[index]
+    except Exception:
+        return index
+    label = _material_name_from_entry(entry)
+    if label:
+        return (index, label)
+    return index
+
+
 def _subset_token_for_material(material_identifier: Any) -> str:
     """Return a USD-legal prim token for a material/style identifier."""
+    if isinstance(material_identifier, tuple) and material_identifier:
+        idx = material_identifier[0]
+        label = material_identifier[1] if len(material_identifier) > 1 else None
+        base = _subset_token_for_material(int(idx))
+        label_token = sanitize_name(label, fallback="") if label else ""
+        return f"{base}_{label_token}" if label_token else base
     if isinstance(material_identifier, int):
         index = int(material_identifier)
         if index >= 0:
@@ -307,16 +344,13 @@ def _material_index_from_subset_token(token: str) -> Optional[int]:
     """Recover a material index from a subset token, if it encodes one."""
     if not token.startswith("Material"):
         return None
-    if token.startswith("Material_neg"):
-        suffix = token[len("Material_neg") :]
-        if suffix.isdigit():
-            return -int(suffix)
+    match = re.match(r"Material_(neg)?(\d+)", token)
+    if not match:
         return None
-    if token.startswith("Material_"):
-        suffix = token[len("Material_") :]
-        if suffix.isdigit():
-            return int(suffix)
-    return None
+    value = int(match.group(2))
+    if match.group(1):
+        value = -value
+    return value
 
 
 def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1779,7 +1813,7 @@ def _ensure_material_subsets(
                     if face_index not in assigned:
                         leftover_by_material[int(material_id)].append(face_index)
                 for material_id, faces in leftover_by_material.items():
-                    token = _subset_token_for_material(material_id)
+                    token = _subset_token_for_material(_material_identifier_for_index(material_id, materials))
                     if token in face_style_map:
                         face_style_map[token].extend(faces)
                     else:
@@ -1969,7 +2003,8 @@ def _ensure_material_subsets(
 
                     if authored_groups:
                         for mid, ci, dir_label, faces in authored_groups:
-                            subset_name = f"Material_{mid}_C{ci}"
+                            base_token = _subset_token_for_material(_material_identifier_for_index(mid, materials))
+                            subset_name = f"{base_token}_C{ci}"
                             if dir_label:
                                 subset_name = f"{subset_name}_{dir_label}"
                             subset_path = mesh.GetPath().AppendChild(subset_name)
@@ -1988,7 +2023,7 @@ def _ensure_material_subsets(
             for material_index, face_indices in sorted(indices_by_material.items()):
                 if not face_indices:
                     continue
-                subset_token = _subset_token_for_material(material_index)
+                subset_token = _subset_token_for_material(_material_identifier_for_index(material_index, materials))
                 subset_path = mesh.GetPath().AppendChild(subset_token)
                 subset = UsdGeom.Subset.Define(stage, subset_path)
                 try:
@@ -2153,6 +2188,7 @@ def _author_occ_detail_meshes(
     detail_mesh: Any,
     *,
     meters_per_unit: float,
+    abs_mat: Optional[Sequence[Sequence[float]]] = None,
 ) -> List[Tuple[UsdGeom.Mesh, List[Any]]]:
     """Author one Mesh per OCC subshape beneath ``detail_root_path``."""
     subshapes = getattr(detail_mesh, "subshapes", None) or []
@@ -2170,6 +2206,22 @@ def _author_occ_detail_meshes(
     detail_root.ClearXformOpOrder()
     authored: List[Tuple[UsdGeom.Mesh, List[Any]]] = []
     used_names: Set[str] = set()
+
+    composed_abs = abs_mat
+    try:
+        pre_xform = getattr(detail_mesh, "pre_xform", None)
+    except Exception:
+        pre_xform = None
+    if pre_xform is not None:
+        try:
+            pre_arr = np.asarray(pre_xform, dtype=float).reshape(4, 4)
+            if composed_abs is None:
+                composed_abs = pre_arr.tolist()
+            else:
+                base_arr = np.asarray(composed_abs, dtype=float).reshape(4, 4)
+                composed_abs = (pre_arr @ base_arr).tolist()
+        except Exception:
+            composed_abs = abs_mat
 
     def _combine_faces(face_entries: List[Any]) -> Tuple[Optional[Dict[str, Any]], List[Any]]:
         verts_list: List[np.ndarray] = []
@@ -2223,6 +2275,7 @@ def _author_occ_detail_meshes(
             detail_root_path,
             candidate,
             mesh_data,
+            abs_mat=composed_abs,
             stage_meters_per_unit=meters_per_unit,
         )
         verts_np = np.asarray(mesh_data.get("vertices"), dtype=np.float64)
@@ -2312,6 +2365,8 @@ def _iter_prototypes(caches: PrototypeCaches) -> Iterable[Tuple[PrototypeKey, An
     """Yield prototypes in a deterministic order for layer authoring."""
     for rep_id, proto in sorted(caches.repmaps.items()):
         yield PrototypeKey(kind="repmap", identifier=rep_id), proto
+        if getattr(proto, "detail_mesh", None) is not None:
+            yield PrototypeKey(kind="repmap_detail", identifier=rep_id), proto
     for digest, proto in sorted(caches.hashes.items()):
         yield PrototypeKey(kind="hash", identifier=digest), proto
 
@@ -2320,7 +2375,7 @@ def _prototype_from_key(caches: PrototypeCaches, key: Optional[PrototypeKey]) ->
     """Return the prototype record referenced by ``key``."""
     if key is None:
         return None
-    if key.kind == "repmap":
+    if key.kind in ("repmap", "repmap_detail"):
         try:
             identifier = int(key.identifier)
         except Exception:
@@ -2352,12 +2407,13 @@ def author_prototype_layer(
         root_layer.subLayerPaths.append(root_sub_path)
 
     proto_root = Sdf.Path("/World/__Prototypes")
+    proto_root_detail = Sdf.Path("/World/__PrototypesDetail")
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
     used_names: Dict[str, int] = {}
     use_component_classification = getattr(options, "enable_material_classification", False)
     detail_scope = getattr(options, "detail_scope", "none") or "none"
     detail_mode_enabled = bool(
-        getattr(options, "enable_high_detail_remesh", False) or detail_scope == "all"
+        getattr(options, "enable_high_detail_remesh", False) or detail_scope in ("all", "object")
     )
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
@@ -2367,8 +2423,8 @@ def author_prototype_layer(
         return base if c == 0 else f"{base}_{c}"
 
     with Usd.EditContext(stage, proto_layer):
-        # container scope
         UsdGeom.Scope.Define(stage, proto_root)
+        UsdGeom.Scope.Define(stage, proto_root_detail)
 
         for key, proto in _iter_prototypes(caches):
             mesh_payload = getattr(proto, "mesh", None)
@@ -2379,13 +2435,16 @@ def author_prototype_layer(
                 continue
 
             # Name the prototype Xform
-            if key.kind == "repmap":
-                base = _name_for_repmap(proto)  # Defining Type name (sanitized)
+            if key.kind in ("repmap", "repmap_detail"):
+                base = _name_for_repmap(proto)
+                if key.kind == "repmap_detail":
+                    base = f"{base}_Detail"
             else:
                 base = _name_for_hash(proto)
             prim_name = _unique_name(base)
 
-            proto_path = proto_root.AppendChild(prim_name)
+            parent_scope = proto_root_detail if key.kind == "repmap_detail" else proto_root
+            proto_path = parent_scope.AppendChild(prim_name)
             proto_paths[key] = proto_path
 
             # Define prototype Xform and mark as 'guide' (no direct render)
@@ -2400,7 +2459,7 @@ def author_prototype_layer(
             full_style_groups = getattr(proto, "style_face_groups", None)
             full_materials = list(getattr(proto, "materials", []) or [])
 
-            if has_detail:
+            if has_detail and key.kind == "repmap_detail":
                 detail_parent = proto_path.AppendChild("Geom")
                 _author_occ_detail_meshes(
                     stage,
@@ -2408,7 +2467,7 @@ def author_prototype_layer(
                     detail_payload,
                     meters_per_unit=stage_meters_per_unit,
                 )
-            else:
+            elif key.kind != "repmap_detail":
                 write_usd_mesh(
                     stage,
                     proto_path,
@@ -3109,6 +3168,7 @@ def _apply_material_bindings_to_prim(
                 continue
             _bind_subset(key, material_path)
 
+    _bind_style_subsets(stage, mesh_path, style_groups, resolved_materials)
     return primary_path
 
 
@@ -3167,6 +3227,29 @@ def _bind_detail_materials(
         UsdGeom.Subset.SetFamilyType(mesh_geom, family_name, UsdGeom.Tokens.nonOverlapping)
     except Exception:
         pass
+
+
+def _bind_style_subsets(
+    stage: Usd.Stage,
+    mesh_path: Optional[Sdf.Path],
+    style_groups: Optional[Dict[str, Dict[str, Any]]],
+    resolved_materials: Dict[Any, Sdf.Path],
+) -> None:
+    if mesh_path is None or not style_groups:
+        return
+    for key in style_groups.keys():
+        material_path = resolved_materials.get(key)
+        if not material_path:
+            continue
+        material = UsdShade.Material.Get(stage, material_path)
+        if not material:
+            continue
+        subset_token = _subset_token_for_material(key)
+        subset_path = mesh_path.AppendChild(subset_token)
+        subset_prim = stage.GetPrimAtPath(subset_path)
+        if not subset_prim:
+            continue
+        UsdShade.MaterialBindingAPI(subset_prim).Bind(material)
 
 
 def author_material_layer(

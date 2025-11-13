@@ -71,6 +71,7 @@ def _build_object_scope_detail_mesh(
     product,
     *,
     material_resolver,
+    reference_shape=None,
 ) -> Optional["OCCDetailMesh"]:
     if ctx.object_scope_settings is None:
         return None
@@ -107,6 +108,7 @@ def _build_object_scope_detail_mesh(
         logger=log,
         detail_level=ctx.detail_level,
         material_resolver=material_resolver,
+        reference_shape=reference_shape,
     )
 
 
@@ -477,9 +479,9 @@ class ConversionOptions:
 
 @dataclass(frozen=True)
 class PrototypeKey:
-    """Stable dictionary key distinguishing repmap and hashed prototypes."""
+    """Stable dictionary key distinguishing repmap/detail/hash prototypes."""
 
-    kind: Literal["repmap", "hash"]
+    kind: Literal["repmap", "repmap_detail", "hash"]
     identifier: Union[int, str]
 
 @dataclass
@@ -4969,6 +4971,79 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         except Exception:
             product_id_int = None
 
+        type_ref = None
+        type_guid = None
+        type_name = None
+        type_id: Optional[int] = None
+        for rel in (getattr(product, "IsTypedBy", []) or []):
+            rel_type = getattr(rel, "RelatingType", None)
+            if rel_type is None:
+                continue
+            type_ref = rel_type
+            type_guid = getattr(rel_type, "GlobalId", None)
+            type_name = getattr(rel_type, "Name", None)
+            try:
+                type_id = int(rel_type.id())
+            except Exception:
+                type_id = None
+            break
+
+        type_info: Optional[MeshProto] = None
+        type_detail_mesh: Optional["OCCDetailMesh"] = None
+        if type_id is not None:
+            info = repmaps.get(type_id)
+            if info is None:
+                info = MeshProto(
+                    repmap_id=type_id,
+                    type_name=type_name,
+                    type_class=type_ref.is_a() if hasattr(type_ref, "is_a") else None,
+                    type_guid=type_guid,
+                    repmap_index=None,
+                    style_material=style_material,
+                    style_face_groups=_clone_style_groups(face_style_groups),
+                )
+                repmaps[type_id] = info
+            else:
+                if info.type_name is None and type_name is not None:
+                    info.type_name = type_name
+                if info.type_class is None and hasattr(type_ref, "is_a"):
+                    info.type_class = type_ref.is_a()
+                if info.type_guid is None and type_guid is not None:
+                    info.type_guid = type_guid
+                if info.style_material is None and style_material is not None:
+                    info.style_material = style_material
+                if not info.style_face_groups and face_style_groups:
+                    info.style_face_groups = _clone_style_groups(face_style_groups)
+            if (
+                ctx.enable_high_detail
+                and ctx.detail_scope in ("all", "object")
+                and occ_detail.is_available()
+                and getattr(info, "detail_mesh", None) is None
+            ):
+                try:
+                    info.detail_mesh = occ_detail.build_canonical_detail_for_type(
+                        product,
+                        ctx.high_detail_settings or ctx.settings,
+                        default_linear_def=_DEFAULT_LINEAR_DEF,
+                        default_angular_def=_DEFAULT_ANGULAR_DEF,
+                        logger=log,
+                        detail_level=ctx.detail_level,
+                        material_resolver=detail_material_resolver,
+                    )
+                    if info.detail_mesh:
+                        log.debug(
+                            "Cached canonical OCC detail for type step=%s name=%s",
+                            type_id,
+                            getattr(type_ref, "Name", None)
+                            or (type_ref.is_a() if hasattr(type_ref, "is_a") else "<type>"),
+                        )
+                except Exception:
+                    log.debug("Canonical OCC detail build failed for type step=%s", type_id, exc_info=True)
+            type_info = info
+            type_detail_mesh = getattr(info, "detail_mesh", None)
+
+        primary_key: Optional[PrototypeKey] = None
+
         def _mesh_from_geom(candidate_geom):
             try:
                 tri = triangulated_to_dict(candidate_geom)
@@ -5016,7 +5091,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 step_id,
             )
             detail_mode = "object"
-            detail_mesh_data = _build_object_scope_detail_mesh(ctx, product, material_resolver=detail_material_resolver)
+            detail_mesh_data = _build_object_scope_detail_mesh(
+                ctx,
+                product,
+                material_resolver=detail_material_resolver,
+                reference_shape=shape,
+            )
             if detail_mesh_data is None:
                 log.warning(
                     "Detail scope object: OCC mesh unavailable for %s guid=%s step=%s name=%s",
@@ -5025,6 +5105,9 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     step_id,
                     product_name,
                 )
+            elif type_detail_mesh is not None and type_id is not None:
+                primary_key = PrototypeKey(kind="repmap_detail", identifier=type_id)
+                detail_mesh_data = type_detail_mesh
         else:
             if ctx.detail_scope == "all":
                 needs_high_detail = True
@@ -5113,6 +5196,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     logger=log,
                     detail_level=ctx.detail_level,
                     material_resolver=detail_material_resolver,
+                    reference_shape=shape,
                 )
                 if detail_mesh_data is None:
                     log.debug(
@@ -5191,7 +5275,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     "High-detail tessellation (%s) applied to %s step=%s guid=%s reasons=%s dims=%s faces=%s",
                     detail_mode,
                     product_class_upper or product_class or "<unknown>",
-                    shape.id,
+                    step_id,
                     guid_for_log,
                     ", ".join(detail_reasons) if detail_reasons else "unspecified",
                     f"({dims[0]:.3f},{dims[1]:.3f},{dims[2]:.3f})" if dims else "n/a",
@@ -5201,7 +5285,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 log.debug(
                     "High-detail tessellation requested but fell back to iterator mesh for %s step=%s guid=%s; reasons=%s",
                     product_class_upper or product_class or "<unknown>",
-                    shape.id,
+                    step_id,
                     guid_for_log,
                     ", ".join(detail_reasons) if detail_reasons else "unspecified",
                 )
@@ -5209,57 +5293,34 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         # World transform
         xf_tuple = resolve_absolute_matrix(shape, product)
 
-        # Defining Type anchor
-        type_ref = None; type_guid=None; type_name=None; type_id=None
-        for rel in (getattr(product, "IsTypedBy", []) or []):
-            rel_type = getattr(rel, "RelatingType", None)
-            if rel_type is not None:
-                type_ref = rel_type
-                type_guid = getattr(rel_type, "GlobalId", None)
-                type_name = getattr(rel_type, "Name", None)
-                break
-        if type_ref is not None and mesh_hash is not None:
-            try: type_id = int(type_ref.id())
-            except Exception: type_id = None
-
-        primary_key: Optional[PrototypeKey] = None
         instance_mesh: Optional[Dict[str, Any]] = None
 
-        if type_id is not None:
-            info = repmaps.get(type_id)
-            if info is None:
-                info = MeshProto(
-                    repmap_id=type_id,
-                    type_name=type_name,
-                    type_class=type_ref.is_a() if hasattr(type_ref, "is_a") else None,
-                    type_guid=type_guid,
-                    repmap_index=None,
-                    style_material=style_material,
-                    style_face_groups=_clone_style_groups(face_style_groups),
-                )
-                repmaps[type_id] = info
-            else:
-                if info.type_name is None and type_name is not None: info.type_name = type_name
-                if info.type_class is None and hasattr(type_ref, "is_a"): info.type_class = type_ref.is_a()
-                if info.type_guid is None and type_guid is not None: info.type_guid = type_guid
-                if info.style_material is None and style_material is not None:
-                    info.style_material = style_material
-                if not info.style_face_groups and face_style_groups:
-                    info.style_face_groups = _clone_style_groups(face_style_groups)
-
-            if info.mesh is None and mesh_hash is not None:
-                info.mesh = mesh_dict; info.mesh_hash = mesh_hash; info.settings_fp = settings_fp_current
-                if not info.materials and materials: info.materials = _clone_materials(materials)
-                if not info.material_ids and material_ids: info.material_ids = list(material_ids)
+        if type_info is not None and type_id is not None and mesh_hash is not None:
+            info = type_info
+            if info.mesh is None:
+                info.mesh = mesh_dict
+                info.mesh_hash = mesh_hash
+                info.settings_fp = settings_fp_current
+                if not info.materials and materials:
+                    info.materials = _clone_materials(materials)
+                if not info.material_ids and material_ids:
+                    info.material_ids = list(material_ids)
                 if not info.style_face_groups and face_style_groups:
                     info.style_face_groups = _clone_style_groups(face_style_groups)
                 if info.detail_mesh is None and detail_mesh_data is not None and ctx.detail_scope != "object":
                     info.detail_mesh = detail_mesh_data
                 info.count = 0
 
-            if info.mesh is not None and info.mesh_hash == mesh_hash and info.settings_fp == settings_fp_current:
-                info.count += 1; repmap_counts[type_id] += 1
-                primary_key = PrototypeKey(kind="repmap", identifier=type_id)
+            if (
+                info.mesh is not None
+                and info.mesh_hash == mesh_hash
+                and info.settings_fp == settings_fp_current
+            ):
+                info.count += 1
+                repmap_counts[type_id] += 1
+                if primary_key is None:
+                    primary_key = PrototypeKey(kind="repmap", identifier=type_id)
+
             if info.detail_mesh is None and detail_mesh_data is not None and ctx.detail_scope != "object":
                 info.detail_mesh = detail_mesh_data
 
@@ -5305,7 +5366,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         detail_mesh_for_instance: Optional["OCCDetailMesh"] = detail_mesh_data
         if primary_key is not None:
             prototype_bucket = None
-            if primary_key.kind == "repmap":
+            if primary_key.kind in ("repmap", "repmap_detail"):
                 prototype_bucket = repmaps.get(primary_key.identifier)
             elif primary_key.kind == "hash":
                 prototype_bucket = hashes.get(primary_key.identifier)
@@ -5319,7 +5380,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             continue
 
         # Build InstanceRecord
-        step_id = shape.id
+        # step_id already computed above
         if primary_key is not None:
             step_keys[step_id] = primary_key
 

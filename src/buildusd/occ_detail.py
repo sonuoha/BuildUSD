@@ -20,6 +20,12 @@ from .occ_detail_bootstrap import (
 
 log = logging.getLogger(__name__)
 
+_OCC_READY = False
+
+# NOTE: This module only produces meshes in the local IFC coordinate frame.
+# World/local normalization is handled upstream (process_ifc) via pre/post
+# transforms so USD authors can decide how anchors/geolocation are applied.
+
 __all__ = [
     "OCCFaceMesh",
     "OCCSubshapeMesh",
@@ -27,6 +33,8 @@ __all__ = [
     "is_available",
     "build_detail_mesh",
     "build_detail_mesh_payload",
+    "build_canonical_detail_for_type",
+    "detail_from_repmap_items",
     "precompute_detail_meshes",
     "proxy_requires_high_detail",
     "mesh_from_detail_mesh",
@@ -204,6 +212,45 @@ def _is_topods(candidate: Any) -> bool:
     return hasattr(candidate, "ShapeType") and hasattr(candidate, "IsNull") and callable(candidate.ShapeType)
 
 
+def try_inv_4x4(matrix: Any) -> Optional[List[List[float]]]:
+    """Attempt to invert a 4x4 matrix; return None on failure."""
+    if matrix is None:
+        return None
+    try:
+        arr = np.asarray(matrix, dtype=float)
+        if arr.shape != (4, 4):
+            return None
+        inv = np.linalg.inv(arr)
+        return inv.tolist()
+    except Exception:
+        return None
+
+
+def mesh_center(vertices: Any) -> Optional[np.ndarray]:
+    """Return the centroid of a vertex array (Nx3)."""
+    if vertices is None:
+        return None
+    try:
+        arr = np.asarray(vertices, dtype=float)
+        if arr.size == 0:
+            return None
+        return np.mean(arr, axis=0)
+    except Exception:
+        return None
+
+
+def _apply_matrix_to_vertices(vertices: np.ndarray, mat16: Any) -> np.ndarray:
+    """Apply a flattened 4x4 (row-major) matrix to vertex rows."""
+    try:
+        mat = np.asarray(mat16, dtype=np.float64).reshape(4, 4)
+    except Exception:
+        return vertices
+    ones = np.ones((vertices.shape[0], 1), dtype=np.float64)
+    homo = np.hstack([vertices, ones])
+    transformed = homo @ mat.T
+    return transformed[:, :3]
+
+
 def _require_occ_components(ifc_entity=None) -> None:
     if is_available():
         return
@@ -280,9 +327,9 @@ def _shape_diagonal(shape: Any) -> float:
         Bnd_Box = sym("Bnd_Box")
         add_callable = None
         try:
-            from OCC.Core import brepbndlib as _brepbndlib  # type: ignore
+            from OCC.Core import BRepBndLib as _BRepBndLib  # type: ignore
 
-            add_callable = getattr(_brepbndlib, "Add", None)
+            add_callable = getattr(_BRepBndLib, "Add", None)
         except Exception:
             add_callable = None
         if add_callable is None:
@@ -524,6 +571,45 @@ def _triangulate_face(face: Any) -> Optional[OCCFaceMesh]:
 def _primary_subshape_list(topo_shape: Any) -> List[tuple[str, Any]]:
     """Return a list of first-level subshapes (prefer solids, then shells, etc.)."""
     collected: List[tuple[str, Any]] = []
+
+    def _flatten_subshape(shape: Any, label: str) -> List[tuple[str, Any]]:
+        """Recursively explode COMPOUND nodes, stopping at composite solids/solids."""
+        shape_name = _shape_type_name(shape)
+        if shape_name not in ("COMPOUND", "COMPSOLID"):
+            return [(label, shape)]
+        try:
+            TopExp_Explorer = sym("TopExp_Explorer")
+            TopAbs_COMPSOLID = sym("TopAbs_COMPSOLID")
+            TopAbs_SOLID = sym("TopAbs_SOLID")
+            TopAbs_SHELL = sym("TopAbs_SHELL")
+        except Exception:
+            return [(label, shape)]
+
+        had_volumetric = False
+
+        # Prefer composite solids first
+        for top_abs, suffix in (
+            (TopAbs_COMPSOLID, "CompositeSolid"),
+            (TopAbs_SOLID, "Solid"),
+            (TopAbs_SHELL, "Shell"),
+        ):
+            explorer = TopExp_Explorer(shape, top_abs)
+            entries: List[tuple[str, Any]] = []
+            index = 0
+            while explorer.More():
+                child = explorer.Current()
+                child_label = f"{label}_{suffix}_{index}"
+                entries.extend(_flatten_subshape(child, child_label))
+                if suffix in ("CompositeSolid", "Solid"):
+                    had_volumetric = True
+                index += 1
+                explorer.Next()
+            if entries:
+                return entries
+        if not had_volumetric:
+            log.info("Detail mesh: compound %s contains no solids; returning compound as-is.", label)
+        return [(label, shape)]
+
     occ_utils = None
     try:
         occ_utils = sym("occ_utils")
@@ -537,7 +623,8 @@ def _primary_subshape_list(topo_shape: Any) -> List[tuple[str, Any]]:
                 if shape_name not in _DETAIL_TYPE_WHITELIST:
                     continue
                 bucket = type_buckets.setdefault(shape_name, [])
-                bucket.append((f"{shape_name}_{len(bucket)}", subshape))
+                base_label = f"{shape_name}_{len(bucket)}"
+                bucket.extend(_flatten_subshape(subshape, base_label))
         except Exception as exc:
             log.debug("OCC detail: yield_subshapes failed (%s); falling back to TopExp iterator.", exc)
         if type_buckets:
@@ -580,7 +667,7 @@ def _primary_subshape_list(topo_shape: Any) -> List[tuple[str, Any]]:
         index = 0
         while explorer.More():
             current = explorer.Current()
-            collected.append((f"{label}_{index}", current))
+            collected.extend(_flatten_subshape(current, f"{label}_{index}"))
             index += 1
             explorer.Next()
         if collected:
@@ -626,6 +713,7 @@ def build_detail_mesh_payload(
     logger: Optional[logging.Logger] = None,
     detail_level: Literal["subshape", "face"] = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
+    reference_shape: Optional[Any] = None,
 ) -> Optional[OCCDetailMesh]:
     """Construct OCC face meshes for detail-mode geometry."""
     logref = logger or log
@@ -659,13 +747,44 @@ def build_detail_mesh_payload(
             )
         return detail
 
-    detail_mesh = None
-    if shape_obj is not None:
-        detail_mesh = _run_occ_detail(shape_obj, "iterator")
+    def _attach_pre_xform(detail_mesh, primary_shape):
+        if detail_mesh is None or product is None:
+            return
+        candidates: List[Any] = []
+        if primary_shape is not None:
+            candidates.append(primary_shape)
+        if reference_shape is not None and reference_shape is not primary_shape:
+            candidates.append(reference_shape)
+        for candidate in candidates:
+            try:
+                from .process_ifc import resolve_absolute_matrix
 
-    if detail_mesh is None and product is not None:
+                abs_mat = resolve_absolute_matrix(candidate, product)
+            except Exception:
+                abs_mat = None
+            abs_inv = try_inv_4x4(abs_mat)
+            if abs_inv is not None:
+                setattr(detail_mesh, "pre_xform", abs_inv)
+                if logref:
+                    logref.debug("OCC detail: mesh normalized with inverse abs matrix (source=%s)", type(candidate).__name__)
+                return
+        if logref:
+            logref.debug("OCC detail: abs matrix not invertible or unavailable; writing as-is")
+
+    detail_mesh = None
+
+    # Prefer product-local OCC so we stay in the product's native local frame.
+    if product is not None:
         product_occ_shape = _create_occ_product_shape(settings, product, logger=logref)
         detail_mesh = _run_occ_detail(product_occ_shape, "product")
+    if detail_mesh is not None and product is not None:
+        _attach_pre_xform(detail_mesh, product_occ_shape)
+
+    # If that failed, fall back to iterator OCC and attach a normalization matrix if possible.
+    if detail_mesh is None and shape_obj is not None:
+        detail_mesh = _run_occ_detail(shape_obj, "iterator")
+        if detail_mesh is not None and product is not None:
+            _attach_pre_xform(detail_mesh, shape_obj)
 
     if detail_mesh is None and product is not None:
         detail_mesh = _build_representation_detail_mesh(
@@ -888,6 +1007,79 @@ def _detail_mesh_for_item(
     return detail_mesh
 
 
+def detail_from_repmap_items(
+    type_obj,
+    settings,
+    *,
+    linear_def: float,
+    angular_def_rad: float,
+    logger: Optional[logging.Logger] = None,
+    detail_level: Literal["subshape", "face"] = "subshape",
+    material_resolver: Optional[Callable[[Any], Any]] = None,
+) -> Optional[OCCDetailMesh]:
+    """Tessellate the type's representation maps (canonical frame) into an OCCDetailMesh."""
+    repmaps = getattr(type_obj, "RepresentationMaps", None) or []
+    if not repmaps:
+        return None
+    meshes: List[OCCDetailMesh] = []
+    for rep_index, repmap in enumerate(repmaps):
+        mapped = getattr(repmap, "MappedRepresentation", None)
+        if mapped is None:
+            continue
+        for item_index, item in enumerate(getattr(mapped, "Items", None) or []):
+            dm = _detail_mesh_for_item(
+                item,
+                settings,
+                float(linear_def),
+                float(angular_def_rad),
+                product=None,
+                rep_index=rep_index,
+                item_index=item_index,
+                logger=logger,
+                detail_level=detail_level,
+                material_resolver=material_resolver,
+            )
+            if dm is not None:
+                meshes.append(dm)
+    if not meshes:
+        return None
+    if len(meshes) == 1:
+        _normalize_detail_indices(meshes[0])
+        return meshes[0]
+    return _merge_detail_meshes(meshes)
+
+
+def build_canonical_detail_for_type(
+    product,
+    settings,
+    *,
+    default_linear_def: float = _DEFAULT_LINEAR_DEF,
+    default_angular_def: float = _DEFAULT_ANGULAR_DEF,
+    logger: Optional[logging.Logger] = None,
+    detail_level: Literal["subshape", "face"] = "subshape",
+    material_resolver: Optional[Callable[[Any], Any]] = None,
+) -> Optional[OCCDetailMesh]:
+    """Return an OCC detail mesh in the type's canonical (repmap) frame."""
+    type_obj = None
+    for rel in getattr(product, "IsTypedBy", None) or []:
+        candidate = getattr(rel, "RelatingType", None)
+        if candidate is not None:
+            type_obj = candidate
+            break
+    if type_obj is None:
+        return None
+    ang_rad = math.radians(float(default_angular_def))
+    return detail_from_repmap_items(
+        type_obj,
+        settings,
+        linear_def=float(default_linear_def),
+        angular_def_rad=ang_rad,
+        logger=logger or log,
+        detail_level=detail_level,
+        material_resolver=material_resolver,
+    )
+
+
 def _create_occ_shape(
     settings,
     element,
@@ -1062,6 +1254,12 @@ def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict
         faces_arr = np.vstack(face_arrays)
     except Exception:
         return None
+    pre_xform = getattr(detail_mesh, "pre_xform", None)
+    if pre_xform is not None:
+        try:
+            vertices = _apply_matrix_to_vertices(vertices, pre_xform)
+        except Exception:
+            pass
     return {"vertices": vertices, "faces": faces_arr}
 
 
