@@ -357,11 +357,25 @@ def _resolve_uv_ifc4_polygonal_texture_map(tess) -> Optional[MeshUV]:
 
 # === PBR CONVERSION ===
 def _get_material_for_style(model, style) -> Optional[ifcopenshell.entity_instance]:
-    for mdr in model.by_type("IfcMaterialDefinitionRepresentation"):
-        for rep in mdr.Representations:
-            for item in rep.Items:
-                if item == style or (hasattr(item, "Styles") and style in item.Styles):
-                    return mdr.RepresentedMaterial
+    """Resolve the IfcMaterial that owns ``style`` via MDR chains."""
+    try:
+        mdrs = model.by_type("IfcMaterialDefinitionRepresentation")
+    except Exception:
+        mdrs = []
+    for mdr in mdrs:
+        represented = getattr(mdr, "RepresentedMaterial", None)
+        for rep in getattr(mdr, "Representations", []) or []:
+            for item in getattr(rep, "Items", []) or []:
+                if item is None:
+                    continue
+                if item.is_a("IfcStyledItem"):
+                    styles = getattr(item, "Styles", []) or []
+                    if any(s == style for s in styles):
+                        return represented
+                elif hasattr(item, "Styles"):
+                    for psa in item.Styles or []:
+                        if style in (psa.Styles or []):
+                            return represented
     return None
 
 def _to_pbr(style: ifcopenshell.entity_instance, model) -> PBRMaterial:
@@ -395,11 +409,17 @@ def _to_pbr(style: ifcopenshell.entity_instance, model) -> PBRMaterial:
 
 
 def _get_base_color(rendering) -> Tuple[float, float, float]:
-    if sc := getattr(rendering, "SurfaceColour", None):
-        return _as_rgb(sc)
-    if dc := getattr(rendering, "DiffuseColour", None):
-        return _color_or_factor(dc) or (0.8, 0.8, 0.8)
-    return (0.8, 0.8, 0.8)
+    base = _as_rgb(getattr(rendering, "SurfaceColour", None))
+    if base is None:
+        base = (0.8, 0.8, 0.8)
+    diffuse = getattr(rendering, "DiffuseColour", None)
+    factor = _color_or_factor(diffuse)
+    if factor:
+        base = tuple(
+            max(0.0, min(1.0, base[i] * factor[i]))
+            for i in range(3)
+        )
+    return base
 
 
 def _as_rgb(col) -> Tuple[float, float, float]:
