@@ -204,6 +204,7 @@ def _is_cancelled(cancel_event: Any | None) -> bool:
 def _ensure_not_cancelled(cancel_event: Any | None, *, message: str | None = None) -> None:
     if _is_cancelled(cancel_event):
         raise ConversionCancelledError(message or "Conversion cancelled.")
+    
 @dataclass(slots=True)
 class ConversionResult:
     """Artifacts produced for a single converted IFC file."""
@@ -521,6 +522,11 @@ def convert(
             base_name_override = output_root.stem or output_root.name
             parent = output_root.parent
             output_root = parent if str(parent) else Path(".").resolve()
+            if stage_path_override.exists() and stage_path_override.is_dir():
+                raise ValueError(
+                    f"Output path {stage_path_override} is an existing directory; "
+                    "remove or pick a different file when specifying --output as a USD file."
+                )
     check_paths: list[PathLike] = [input_path, output_root]
     if manifest_path:
         check_paths.append(manifest_path)
@@ -570,6 +576,18 @@ def convert(
     target_count = len(targets)
     log.info("Discovered %d IFC file(s) under %s", target_count, input_path)
     if stage_path_override is not None:
+        stage_override_ext = stage_path_override.suffix.lower().lstrip(".")
+        if stage_override_ext:
+            if usd_format_normalized == "auto":
+                usd_format_normalized = stage_override_ext
+            elif stage_override_ext != usd_format_normalized:
+                log.warning(
+                    "Output file extension .%s overrides --usd-format %s for stage %s",
+                    stage_override_ext,
+                    usd_format_normalized,
+                    stage_path_override,
+                )
+                usd_format_normalized = stage_override_ext
         if target_count == 1:
             log.info(
                 "Output will be authored to explicit stage path %s",
@@ -634,7 +652,9 @@ def convert(
             continue
         results.append(result)
     return results
+
 # ------------- local & nucleus helpers -------------
+
 def _collect_ifc_paths(
     input_path: PathLike,
     *,
@@ -660,6 +680,8 @@ def _collect_ifc_paths(
         exclude=exclude,
         log=log,
     )
+
+
 def _collect_ifc_paths_local(
     root: Path,
     *,
@@ -709,6 +731,8 @@ def _collect_ifc_paths_local(
             continue
         targets.append(_IfcTarget(source=candidate, manifest_key=candidate))
     return targets
+
+
 def _collect_ifc_paths_nucleus(
     uri: str,
     *,
@@ -859,7 +883,10 @@ def _build_output_layout(
     *,
     stage_override: PathLike | None = None,
 ) -> _OutputLayout:
+    
+    # Esnure output directory exists
     ensure_directory(output_root)
+
     prototypes_dir = join_path(output_root, "prototypes")
     materials_dir = join_path(output_root, "materials")
     instances_dir = join_path(output_root, "instances")
@@ -1178,10 +1205,12 @@ def _cleanup_paths(paths: Sequence[Path], logger: logging.Logger) -> None:
             continue
         except Exception as exc:
             logger.debug("Unable to remove temporary USD file %s: %s", path_obj, exc)
+
 def _make_checkpoint_metadata(revision: Optional[str], base_name: str) -> tuple[str, list[str]]:
     note = revision or f"{base_name}"; tag_src = revision or base_name
     tag_candidates = tag_src.replace(",", " ").split(); tags = [t.strip() for t in tag_candidates if t.strip()] or [base_name]
     return note, tags
+
 def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: logging.Logger, label: str) -> None:
     try:
         did_checkpoint = create_checkpoint(path, note=note, tags=tags)
@@ -1190,6 +1219,7 @@ def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: log
         return
     if did_checkpoint:
         logger.info("Checkpoint saved for %s (%s)", label, note)
+
 # ------------- core per-file -------------
 def _process_single_ifc(
     ifc_path: PathLike,
@@ -1218,6 +1248,7 @@ def _process_single_ifc(
     checkpoint_tags: list[str] = []
     if checkpoint:
         checkpoint_note, checkpoint_tags = _make_checkpoint_metadata(revision_note, base_name)
+
     def _execute(local_ifc: Path) -> ConversionResult:
         _ensure_not_cancelled(cancel_event)
         ifc = ifcopenshell.open(local_ifc.as_posix())
@@ -1248,13 +1279,18 @@ def _process_single_ifc(
             authoring_format,
             stage_override=stage_path_override,
         )
+
+        # Create stage for file in process.
         stage = create_usd_stage(layout.stage)
         proto_layer, proto_paths = author_prototype_layer(stage, caches, layout.prototypes, base_name, options)
         _ensure_not_cancelled(cancel_event)
         mat_layer, material_library = author_material_layer(
             stage, caches, proto_paths, layer_path=layout.materials, base_name=base_name, proto_layer=proto_layer, options=options,
         )
-        _ensure_not_cancelled(cancel_event)
+
+        _ensure_not_cancelled(cancel_event) # Ensure conversion process is not cancelled for the file
+
+        # Author instance layer
         inst_layer = author_instance_layer(
             stage,
             caches,
@@ -1264,12 +1300,21 @@ def _process_single_ifc(
             base_name=base_name,
             options=options,
         )
-        _ensure_not_cancelled(cancel_event)
+
+        _ensure_not_cancelled(cancel_event) # Ensure conversion process is not cancelled for the file
+
+        # Author 2D Geometries
         geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name, options)
-        _ensure_not_cancelled(cancel_event)
-        persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths)
-        _ensure_not_cancelled(cancel_event)
+        _ensure_not_cancelled(cancel_event) 
+
+        # Author instance layer
+        persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths) # Save instnace cache to file 
+
+        _ensure_not_cancelled(cancel_event) # Ensure conversion process is not cancelled for the file
+
+        # Resolve Coordinate Systems and Basepoints from manifests and overrides.
         effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
+
         if effective_base_point is None:
             raise ValueError(
                 f"No base point configured for {path_name(ifc_path)}; provide a manifest entry or update defaults."
@@ -1281,11 +1326,13 @@ def _process_single_ifc(
             )
         geodetic_crs = plan.geodetic_crs if plan and plan.geodetic_crs else default_geodetic_crs
         lonlat_override = plan.lonlat if plan else None
+
         _ensure_not_cancelled(cancel_event)
         shared_site_point = (
             plan.shared_site_base_point if plan and getattr(plan, "shared_site_base_point", None) else DEFAULT_SHARED_BASE_POINT
         )
         anchor_mode = _normalize_anchor_mode(getattr(options, "anchor_mode", None))
+
         if anchor_mode is not None:
             apply_stage_anchor_transform(
                 stage,
@@ -1305,8 +1352,10 @@ def _process_single_ifc(
         proto_layer.Save()
         mat_layer.Save()
         inst_layer.Save()
+
         if geometry2d_layer:
             geometry2d_layer.Save()
+
         paths_to_cleanup: list[Path] = []
         if authoring_format == "usda" and usd_auto_binary_threshold_mb and usd_auto_binary_threshold_mb > 0:
             layout, paths_to_cleanup = _maybe_convert_layers_to_usdc(
@@ -1320,6 +1369,8 @@ def _process_single_ifc(
                 logger=logger,
             )
             _ensure_not_cancelled(cancel_event)
+
+        # Layer Checkpointing for Nucleus
         if checkpoint and checkpoint_note is not None:
             _checkpoint_path(layout.stage, checkpoint_note, checkpoint_tags, logger, f"{base_name} stage")
             _checkpoint_path(layout.prototypes, checkpoint_note, checkpoint_tags, logger, f"{base_name} prototypes layer")
@@ -1327,6 +1378,8 @@ def _process_single_ifc(
             _checkpoint_path(layout.instances, checkpoint_note, checkpoint_tags, logger, f"{base_name} instances layer")
             if geometry2d_layer:
                 _checkpoint_path(layout.geometry2d, checkpoint_note, checkpoint_tags, logger, f"{base_name} 2D geometry layer")
+
+        # Logging Outcomes
         logger.info("Wrote stage %s", str(layout.stage))
         master_stage_path = None
         counts = {
@@ -1360,8 +1413,12 @@ def _process_single_ifc(
                 except Exception as exc:
                     identifier = getattr(layer_handle, "identifier", "<anonymous>")
                     logger.debug("layer.Close() failed for %s: %s", identifier, exc)
+        
+        #Clean-Ups
         _cleanup_paths(paths_to_cleanup, logger)
+
         _ensure_not_cancelled(cancel_event)
+
         return ConversionResult(
             ifc_path=ifc_path,
             stage_path=layout.stage,
@@ -1374,7 +1431,10 @@ def _process_single_ifc(
             plan=plan,
             revision=revision_note,
         )
+    
     LOG.info("Opening IFC %s", ifc_path)
+
+    # The actuall proceesing calling _execute
     if is_omniverse_path(ifc_path):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir) / path_name(ifc_path)

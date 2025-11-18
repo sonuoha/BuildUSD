@@ -472,7 +472,10 @@ def _material_name_from_associations(product) -> Optional[str]:
                 for c in children:
                     collect(c.Material if hasattr(c, "Material") else c)
     collect(mat)
-    return " | ".join(dict.fromkeys(names)) if names else None
+    if not names:
+        return None
+    # Prefer the first declared material name instead of concatenating the entire stack.
+    return next(iter(dict.fromkeys(names)))
 
 
 def _default_name_for_product(product) -> str:
