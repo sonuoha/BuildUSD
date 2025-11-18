@@ -38,6 +38,7 @@ __all__ = [
     "precompute_detail_meshes",
     "proxy_requires_high_detail",
     "mesh_from_detail_mesh",
+    "align_detail_mesh_to_base",
 ]
 
 _DEFAULT_LINEAR_DEF = 0.01  # metres (cap)
@@ -116,6 +117,8 @@ def build_detail_mesh(
 ) -> Optional[OCCDetailMesh]:
     """Return OCC meshes grouped by logical sub-shapes, when OCC is available."""
     if not is_available() or shape_obj is None:
+        if logger:
+            logger.log(1, "Either OCC Module not installed or no valid TopoDS Shape found", exc_info=True)
         return None
     topo_shape = _extract_topods_shape(shape_obj, logger=logger)
     if topo_shape is None:
@@ -249,6 +252,63 @@ def _apply_matrix_to_vertices(vertices: np.ndarray, mat16: Any) -> np.ndarray:
     homo = np.hstack([vertices, ones])
     transformed = homo @ mat.T
     return transformed[:, :3]
+
+
+def _compose_pre_xform(detail_mesh: OCCDetailMesh, matrix: np.ndarray) -> bool:
+    try:
+        new_mat = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+    except Exception:
+        return False
+    existing = getattr(detail_mesh, "pre_xform", None)
+    if existing is not None:
+        try:
+            existing_arr = np.asarray(existing, dtype=np.float64).reshape(4, 4)
+            new_mat = new_mat @ existing_arr
+        except Exception:
+            return False
+    detail_mesh.pre_xform = new_mat.tolist()
+    return True
+
+
+def align_detail_mesh_to_base(detail_mesh: OCCDetailMesh, base_mesh: Dict[str, Any]) -> bool:
+    """Attach a translation pre_xform so OCC detail shares the base mesh's center."""
+    base_center = _mesh_center(base_mesh)
+    if base_center is None:
+        return False
+    detail_flat = mesh_from_detail_mesh(detail_mesh)
+    if detail_flat is None:
+        return False
+    detail_center = _mesh_center(detail_flat)
+    if detail_center is None:
+        return False
+    delta = base_center - detail_center
+    if not np.any(np.abs(delta) > 1e-6):
+        return False
+    translation = np.eye(4, dtype=np.float64)
+    translation[0, 3] = float(delta[0])
+    translation[1, 3] = float(delta[1])
+    translation[2, 3] = float(delta[2])
+    return _compose_pre_xform(detail_mesh, translation)
+
+
+def _scale_detail_mesh(detail_mesh: Optional[OCCDetailMesh], scale: float) -> None:
+    if detail_mesh is None:
+        return
+    if not math.isfinite(scale) or abs(scale - 1.0) < 1e-12:
+        return
+    subshapes = getattr(detail_mesh, "subshapes", None) or []
+    for subshape in subshapes:
+        faces = getattr(subshape, "faces", None) or []
+        for face in faces:
+            verts = getattr(face, "vertices", None)
+            if verts is None:
+                continue
+            try:
+                verts_arr = np.asarray(verts, dtype=np.float64)
+                verts_arr *= float(scale)
+                face.vertices = verts_arr
+            except Exception:
+                continue
 
 
 def _require_occ_components(ifc_entity=None) -> None:
@@ -714,6 +774,7 @@ def build_detail_mesh_payload(
     detail_level: Literal["subshape", "face"] = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     reference_shape: Optional[Any] = None,
+    unit_scale: float = 1.0,
 ) -> Optional[OCCDetailMesh]:
     """Construct OCC face meshes for detail-mode geometry."""
     logref = logger or log
@@ -795,6 +856,7 @@ def build_detail_mesh_payload(
             logger=logref,
             detail_level=detail_level,
             material_resolver=material_resolver,
+            unit_scale=unit_scale,
         )
         if detail_mesh is not None and logref:
             logref.debug(
@@ -813,6 +875,7 @@ def build_detail_mesh_payload(
 
     subshape_count = len(getattr(detail_mesh, "subshapes", []) or [])
     face_total = detail_mesh.face_count if hasattr(detail_mesh, "face_count") else 0
+    _scale_detail_mesh(detail_mesh, unit_scale)
     if logref:
         logref.debug(
             "OCC detail: generated %d subshape mesh(es) totalling %s faces for %s",
@@ -831,6 +894,7 @@ def precompute_detail_meshes(
     default_angular_def: float = _DEFAULT_ANGULAR_DEF,
     logger: Optional[logging.Logger] = None,
     detail_level: Literal["subshape", "face"] = "subshape",
+    unit_scale: float = 1.0,
 ) -> Dict[int, OCCDetailMesh]:
     """Precompute OCC detail meshes for every product (detail-mode prepass)."""
     cache: Dict[int, OCCDetailMesh] = {}
@@ -855,6 +919,7 @@ def precompute_detail_meshes(
             default_angular_def=default_angular_def,
             logger=logref,
             detail_level=detail_level,
+            unit_scale=unit_scale,
         )
         if detail_mesh is not None:
             cache[product_id] = detail_mesh
@@ -876,6 +941,7 @@ def _build_representation_detail_mesh(
     logger: Optional[logging.Logger] = None,
     detail_level: Literal["subshape", "face"] = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
+    unit_scale: float = 1.0,
 ):
     """Fallback OCC extraction that tessellates each representation item directly."""
     representation = getattr(product, "Representation", None)
@@ -894,6 +960,7 @@ def _build_representation_detail_mesh(
             logger=logger,
             detail_level=detail_level,
             material_resolver=material_resolver,
+            unit_scale=unit_scale,
         )
         if detail_mesh is None:
             continue
@@ -958,6 +1025,7 @@ def _detail_mesh_for_item(
     logger: Optional[logging.Logger] = None,
     detail_level: Literal["subshape", "face"] = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
+    unit_scale: float = 1.0,
 ):
     if item is None:
         return None
@@ -1004,6 +1072,7 @@ def _detail_mesh_for_item(
                 item_index,
                 subshape_count,
             )
+        _scale_detail_mesh(detail_mesh, unit_scale)
     return detail_mesh
 
 
@@ -1016,6 +1085,7 @@ def detail_from_repmap_items(
     logger: Optional[logging.Logger] = None,
     detail_level: Literal["subshape", "face"] = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
+    unit_scale: float = 1.0,
 ) -> Optional[OCCDetailMesh]:
     """Tessellate the type's representation maps (canonical frame) into an OCCDetailMesh."""
     repmaps = getattr(type_obj, "RepresentationMaps", None) or []
@@ -1038,6 +1108,7 @@ def detail_from_repmap_items(
                 logger=logger,
                 detail_level=detail_level,
                 material_resolver=material_resolver,
+                unit_scale=unit_scale,
             )
             if dm is not None:
                 meshes.append(dm)
@@ -1058,6 +1129,7 @@ def build_canonical_detail_for_type(
     logger: Optional[logging.Logger] = None,
     detail_level: Literal["subshape", "face"] = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
+    unit_scale: float = 1.0,
 ) -> Optional[OCCDetailMesh]:
     """Return an OCC detail mesh in the type's canonical (repmap) frame."""
     type_obj = None
@@ -1077,6 +1149,7 @@ def build_canonical_detail_for_type(
         logger=logger or log,
         detail_level=detail_level,
         material_resolver=material_resolver,
+        unit_scale=unit_scale,
     )
 
 
