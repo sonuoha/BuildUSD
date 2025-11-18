@@ -197,18 +197,53 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
 # === PER-FACE MAPPING ===
 
 def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_instance) -> Dict[int, List[ifcopenshell.entity_instance]]:
-    mapping = {}
-    for rep in (product.Representation.Representations if product.Representation else []):
-        for item in rep.Items:
-            _collect_styled_items(item, mapping)
-    return mapping
+    if not product or not hasattr(product, "Representation"):
+        return {}
+
+    shape_styles: Dict[int, List[ifcopenshell.entity_instance]] = {}
+
+    # Collect styles from the explicit representation tree.
+    rep = product.Representation
+    for shape_rep in getattr(rep, "Representations", []) or []:
+        for item in getattr(shape_rep, "Items", []) or []:
+            _collect_styled_items(item, shape_styles)
+
+    # Merge in any styles provided via IfcStyledItem associations on the product.
+    for styled in getattr(product, "StyledByItem", []) or []:
+        styles = []
+        for psa in getattr(styled, "Styles", []) or []:
+            if hasattr(psa, "Styles"):
+                styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+            elif psa.is_a("IfcSurfaceStyle"):
+                styles.append(psa)
+        if not styles:
+            continue
+        # Associate with each representation item referenced by the styled item.
+        targets = [
+            getattr(styled, "Item", None),
+            getattr(styled, "SecondaryItem", None),
+            getattr(styled, "ThirdItem", None),
+        ]
+        for target in targets:
+            if target is None:
+                continue
+            for rep in getattr(target, "Representations", []) or []:
+                for item in getattr(rep, "Items", []) or []:
+                    shape_styles.setdefault(id(item), []).extend(styles)
+
+    return shape_styles
 
 
 def _collect_styled_items(item, mapping):
     for styled in getattr(item, "StyledByItem", []):
         styles = []
         for psa in styled.Styles:
-            styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+            if hasattr(psa, "Styles"):
+                styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+            elif psa.is_a("IfcSurfaceStyle"):
+                styles.append(psa)
+            else:
+                styles.append(psa)
         if styles:
             mapping[id(item)] = styles
 
@@ -216,7 +251,11 @@ def _collect_styled_items(item, mapping):
         _collect_styled_items(item.FirstOperand, mapping)
         _collect_styled_items(item.SecondOperand, mapping)
     elif item.is_a("IfcMappedItem"):
-        _collect_styled_items(item.MappingSource.MappedRepresentation.Items[0], mapping)
+        source = getattr(item, "MappingSource", None)
+        mapped = getattr(source, "MappedRepresentation", None) if source is not None else None
+        if mapped is not None:
+            for sub in getattr(mapped, "Items", []) or []:
+                _collect_styled_items(sub, mapping)
     elif hasattr(item, "Operands"):
         for op in item.Operands:
             _collect_styled_items(op, mapping)
@@ -229,10 +268,11 @@ def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, A
     if not face_styles:
         return {}
 
+    shape_name_by_item = _shape_aspect_name_map(product)
     combined = {}
     face_offset = 0
     for item in _iter_representation_items(product):
-        item_groups, face_count = _face_style_groups_from_item(item, face_styles)
+        item_groups, face_count = _face_style_groups_from_item(item, face_styles, model, shape_name_by_item)
         for key, entry in item_groups.items():
             faces = [face_offset + idx for idx in entry.get("faces", [])]
             if not faces:
@@ -255,7 +295,7 @@ def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, A
     return result
 
 
-def _face_style_groups_from_item(item, face_styles) -> Tuple[Dict, int]:
+def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item) -> Tuple[Dict, int]:
     face_count = _face_count_from_item(item)
     if face_count == 0:
         return {}, 0
@@ -263,7 +303,8 @@ def _face_style_groups_from_item(item, face_styles) -> Tuple[Dict, int]:
     item_id = id(item)
     if item_id in face_styles:
         style = face_styles[item_id][0]
-        mat = _to_pbr(style)
+        friendly_name = _friendly_style_name(style, shape_name_by_item.get(item_id))
+        mat = _to_pbr(style, model=model, preferred_name=friendly_name)
         try:
             style_id = int(style.id())
         except Exception:
