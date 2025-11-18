@@ -65,6 +65,123 @@ def _clone_style_groups(groups):
             cloned[key]["style_id"] = entry["style_id"]
     return cloned
 
+_STYLE_RENDER_TOKEN_RE = re.compile(r"IfcSurfaceStyleRendering[-_](\d+)", re.IGNORECASE)
+_RENDER_STYLE_CACHE: Dict[int, Dict[int, ifcopenshell.entity_instance]] = {}
+
+
+def _render_id_from_style_name(name: Optional[str]) -> Optional[int]:
+    if not name:
+        return None
+    match = _STYLE_RENDER_TOKEN_RE.search(str(name))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _pbr_from_ifc_style(style_obj, fallback_name: str) -> PBRMaterial:
+    """Convert an ifcopenshell style wrapper into a simple PBR material."""
+    base_color = (0.8, 0.8, 0.8)
+    try:
+        diffuse = getattr(style_obj, "diffuse", None)
+        if diffuse is not None:
+            base_color = (
+                float(getattr(diffuse, "r", base_color[0])),
+                float(getattr(diffuse, "g", base_color[1])),
+                float(getattr(diffuse, "b", base_color[2])),
+            )
+    except Exception:
+        pass
+    opacity = 1.0
+    try:
+        transparency = getattr(style_obj, "transparency", None)
+        if transparency is not None:
+            opacity = max(0.0, min(1.0, 1.0 - float(transparency)))
+    except Exception:
+        pass
+    roughness = 0.5
+    try:
+        spec = getattr(style_obj, "specular", None)
+        if spec is not None:
+            comps = [
+                float(getattr(spec, attr, 0.5))
+                for attr in ("r", "g", "b")
+            ]
+            level = max(comps)
+            roughness = max(0.05, 1.0 - min(0.95, level))
+    except Exception:
+        pass
+    base_name = fallback_name or getattr(style_obj, "name", None)
+    sanitized = sanitize_name(base_name, fallback=fallback_name or "Material")
+    return PBRMaterial(name=sanitized, base_color=base_color, opacity=opacity, roughness=roughness)
+
+
+def _render_style_map(ifc_file) -> Dict[int, ifcopenshell.entity_instance]:
+    cache_key = id(ifc_file)
+    mapping = _RENDER_STYLE_CACHE.get(cache_key)
+    if mapping is not None:
+        return mapping
+    mapping = {}
+    try:
+        for style in ifc_file.by_type("IfcSurfaceStyle"):
+            for element in getattr(style, "Styles", []) or []:
+                if element is None or not element.is_a("IfcSurfaceStyleRendering"):
+                    continue
+                try:
+                    mapping[int(element.id())] = style
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    _RENDER_STYLE_CACHE[cache_key] = mapping
+    return mapping
+
+
+def _normalize_geom_materials(materials, face_style_groups, ifc_file):
+    """Map iterator-provided style wrappers to friendly PBR materials."""
+    if not isinstance(materials, (list, tuple)):
+        return materials
+    style_lookup: Dict[int, PBRMaterial] = {}
+    for entry in (face_style_groups or {}).values():
+        style_id = entry.get("style_id")
+        mat = entry.get("material")
+        if style_id is None or mat is None or not isinstance(mat, PBRMaterial):
+            continue
+        try:
+            style_lookup[int(style_id)] = mat
+        except Exception:
+            continue
+    render_map = _render_style_map(ifc_file)
+    converted: List[PBRMaterial] = []
+    for idx, entry in enumerate(materials):
+        if isinstance(entry, PBRMaterial):
+            converted.append(entry)
+            continue
+        render_name = getattr(entry, "name", None)
+        render_id = _render_id_from_style_name(render_name)
+        style_entity = render_map.get(render_id) if render_id is not None else None
+        style_id = None
+        style_name = None
+        if style_entity is not None:
+            try:
+                style_id = int(style_entity.id())
+            except Exception:
+                style_id = None
+            style_name = getattr(style_entity, "Name", None)
+        if style_id is not None:
+            existing = style_lookup.get(style_id)
+            if existing is not None:
+                converted.append(existing)
+                continue
+        fallback = sanitize_name(style_name, fallback=f"Material_{idx}")
+        pbr = _pbr_from_ifc_style(entry, fallback)
+        converted.append(pbr)
+        if style_id is not None:
+            style_lookup.setdefault(style_id, pbr)
+    return converted
+
 
 def _build_object_scope_detail_mesh(
     ctx: PrototypeBuildContext,
@@ -4942,6 +5059,8 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         except Exception:
             style_material = None
         face_style_groups = extract_face_style_groups(product) or {}
+        if materials:
+            materials = _normalize_geom_materials(materials, face_style_groups, ifc_file)
         style_token_by_style_id: Dict[int, str] = {}
         for token, entry in face_style_groups.items():
             style_id = entry.get("style_id")

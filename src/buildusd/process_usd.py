@@ -1835,6 +1835,16 @@ def _ensure_material_subsets(
                 if not indices_attr:
                     indices_attr = subset.CreateIndicesAttr()
                 indices_attr.Set(Vt.IntArray([int(f) for f in faces]))
+                # Traceability: style token and base material ids on these faces
+                base_token = cluster_lookup.get(token)  # original style base when clustered
+                src_tok = base_token or token
+                subset.GetPrim().CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(src_tok)
+                if material_ids:
+                    mids = sorted({int(material_ids[i]) for i in faces if 0 <= int(i) < face_count})
+                    if len(mids) == 1:
+                        subset.GetPrim().CreateAttribute("ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int).Set(mids[0])
+                    elif mids:
+                        subset.GetPrim().CreateAttribute("ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(mids))
                 base_token = cluster_lookup.get(token)
                 if base_token:
                     subset.GetPrim().CreateAttribute("ifc:baseStyleToken", Sdf.ValueTypeNames.String).Set(base_token)
@@ -1880,6 +1890,16 @@ def _ensure_material_subsets(
                 if not indices_attr:
                     indices_attr = subset.CreateIndicesAttr()
                 indices_attr.Set(Vt.IntArray(valid_faces))
+                # Traceability for plain style subsets
+                prim = subset.GetPrim()
+                prim.CreateAttribute("ifc:sourceStyleKey", Sdf.ValueTypeNames.String).Set(str(key))
+                prim.CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(subset_token)
+                if material_ids:
+                    mids = sorted({int(material_ids[i]) for i in valid_faces if 0 <= int(i) < face_count})
+                    if len(mids) == 1:
+                        prim.CreateAttribute("ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int).Set(mids[0])
+                    elif mids:
+                        prim.CreateAttribute("ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(mids))
                 try:
                     subset.CreateFamilyNameAttr().Set(family_name)
                 except Exception:
@@ -2013,6 +2033,7 @@ def _ensure_material_subsets(
                             subset.CreateElementTypeAttr().Set(element_token)
                             subset.CreateIndicesAttr(Vt.IntArray([int(f) for f in faces]))
                             subset.GetPrim().CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(dir_label or "NA")
+                            subset.GetPrim().CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(mid))
                             created_subsets = True
                             stats.append((str(subset_path), len(faces)))
                         authored_geo = True
@@ -2037,6 +2058,8 @@ def _ensure_material_subsets(
                 if not indices_attr:
                     indices_attr = subset.CreateIndicesAttr()
                 indices_attr.Set(Vt.IntArray(face_indices))
+                # Traceability for numeric subsets
+                subset.GetPrim().CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(material_index))
                 try:
                     subset.CreateFamilyNameAttr().Set(family_name)
                 except Exception:
@@ -2517,6 +2540,48 @@ def _prototype_style_groups(caches: PrototypeCaches, key: PrototypeKey) -> Dict[
     if not groups:
         return {}
     return groups
+
+def _merge_style_face_groups(
+    instance_groups: Optional[Dict[str, Dict[str, Any]]],
+    prototype_groups: Optional[Dict[str, Dict[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Deep-merge instance + prototype style groups into a single view:
+      - Instance faces/material override prototype when present.
+      - Prototype fills any missing fields/entries.
+      - Faces are normalized to a unique, sorted list of ints.
+    """
+    inst = dict(instance_groups or {})
+    proto = dict(prototype_groups or {})
+    if not inst and not proto:
+        return {}
+    keys = set(inst.keys()) | set(proto.keys())
+    merged: Dict[str, Dict[str, Any]] = {}
+    for key in keys:
+        I = dict(inst.get(key) or {})
+        P = dict(proto.get(key) or {})
+        faces_src = I.get("faces", P.get("faces"))
+        if faces_src is not None:
+            try:
+                faces = sorted({int(i) for i in faces_src})
+            except Exception:
+                faces = [int(i) for i in faces_src]  # best effort
+        else:
+            faces = None
+        material = I.get("material", P.get("material"))
+        entry: Dict[str, Any] = {}
+        if faces is not None:
+            entry["faces"] = faces
+        if material is not None:
+            entry["material"] = material
+        # carry through helpful tags when present
+        for extra in ("name", "label", "id", "guid", "shapeAspect", "style_id"):
+            if extra in I:
+                entry[extra] = I[extra]
+            elif extra in P:
+                entry[extra] = P[extra]
+        merged[key] = entry
+    return merged
 def _iter_material_entries(materials: Any) -> Iterable[Tuple[Any, Any]]:
     if isinstance(materials, dict):
         return materials.items()
@@ -3051,12 +3116,11 @@ def _resolve_instance_materials(
     if record.prototype is not None:
         _apply_style(_prototype_materials(caches, record.prototype), "prototype")
 
-    if record.style_face_groups:
-        style_groups = record.style_face_groups
-    elif record.prototype is not None:
-        style_groups = _prototype_style_groups(caches, record.prototype)
-    else:
-        style_groups = {}
+    # Merge instance-level style groups over prototype groups so the
+    # resolved view always reflects "how this instance presents".
+    proto_groups = _prototype_style_groups(caches, record.prototype) if record.prototype is not None else {}
+    inst_groups = record.style_face_groups or {}
+    style_groups = _merge_style_face_groups(inst_groups, proto_groups)
 
     for entry_index, (material_key, material_value) in enumerate(_iter_material_entries(materials_container)):
         props = _extract_material_properties(material_value, prototype_label=label, index=entry_index)
@@ -3092,6 +3156,7 @@ def _resolve_instance_materials(
             material_path = material_library.signature_to_path.get(signature)
             if material_path:
                 resolved_paths.setdefault(key, material_path)
+                # Prefer a style color for previews when available.
                 if display_color is None:
                     display_color = Gf.Vec3f(*props.display_color)
 
@@ -3143,9 +3208,9 @@ def _apply_material_bindings_to_prim(
             return
         subset_token = _subset_token_for_material(key)
         subset_path = mesh_path.AppendChild(subset_token)
-        subset_prim = stage.GetPrimAtPath(subset_path)
-        if not subset_prim or subset_prim.GetTypeName() != "GeomSubset":
-            return
+        # Ensure we author a local override on the instance path so the binding
+        # is per-instance even if the subset comes in via a reference.
+        subset_prim = stage.GetPrimAtPath(subset_path) or stage.OverridePrim(subset_path)
         subset_material = UsdShade.Material.Get(stage, material_path)
         if not subset_material:
             return
@@ -3246,9 +3311,7 @@ def _bind_style_subsets(
             continue
         subset_token = _subset_token_for_material(key)
         subset_path = mesh_path.AppendChild(subset_token)
-        subset_prim = stage.GetPrimAtPath(subset_path)
-        if not subset_prim:
-            continue
+        subset_prim = stage.GetPrimAtPath(subset_path) or stage.OverridePrim(subset_path)
         UsdShade.MaterialBindingAPI(subset_prim).Bind(material)
 
 
@@ -3339,8 +3402,8 @@ def author_material_layer(
                 log.debug("Authored material %s for signature %s", material_prim_path, signature)
 
     library = MaterialLibrary(signature_to_path)
-    with Usd.EditContext(stage, material_layer):
-        _bind_materials_on_prototype_mesh(stage, proto_paths, caches, library)
+    # Do not bind materials on /World/__Prototypes. We want all style/material
+    # opinions authored per-instance so the same prototype can appear with different looks.
     return material_layer, library
 
 
@@ -3560,14 +3623,46 @@ def author_instance_layer(
             mesh_child_override = stage.OverridePrim(mesh_child_path)
             UsdGeom.Imageable(mesh_child_override).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
 
+            # If this instance supplies its own style groups and/or per-face material ids,
+            # re-author the GeomSubsets on the *instance override* so faces match the instance.
+            try:
+                mesh_geom = UsdGeom.Mesh(mesh_child_override)
+                counts_val = mesh_geom.GetFaceVertexCountsAttr().Get() or []
+                face_count_for_inst = len(counts_val)
+            except Exception:
+                face_count_for_inst = 0
+            if face_count_for_inst > 0 and (style_groups or material_ids):
+                pts = None; fvc = None; fvi = None
+                try:
+                    fvc = list(counts_val)
+                    if use_component_classification:
+                        fvi = list(mesh_geom.GetFaceVertexIndicesAttr().Get() or [])
+                        pvals = mesh_geom.GetPointsAttr().Get() or []
+                        pts = [(float(v[0]), float(v[1]), float(v[2])) for v in pvals]
+                except Exception:
+                    pass
+                _ensure_material_subsets(
+                    mesh_geom,
+                    material_ids if material_ids else [],
+                    face_count_for_inst,
+                    style_groups=style_groups if style_groups else {},
+                    materials=list(getattr(record, "materials", []) or []),
+                    points=pts,
+                    face_vertex_counts=fvc,
+                    face_vertex_indices=fvi,
+                    use_component_classification=use_component_classification,
+                )
+
             if resolved_materials:
-                proto_mesh_path = None if proto_has_detail else proto_path.AppendChild("Geom")
+                # Bind on the *instance* override path, not on the prototype.
+                # This makes per-instance style/material changes stick.
+                instance_mesh_path = None if proto_has_detail else mesh_child_path
                 _apply_material_bindings_to_prim(
                     stage,
                     inst_prim,
                     resolved_materials,
                     style_groups=style_groups,
-                    mesh_path=proto_mesh_path,
+                    mesh_path=instance_mesh_path,
                 )
             if resolved_color is not None:
                 _apply_display_color_to_prim(inst_prim, resolved_color)
