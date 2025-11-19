@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 import re
+import logging
 
 import ifcopenshell
 import ifcopenshell.util.element
@@ -16,6 +17,8 @@ __all__ = [
     "extract_face_style_groups",
     "extract_uvs_for_product",
 ]
+
+LOG = logging.getLogger(__name__)
 
 
 # === PBR DATACLASS ===
@@ -86,12 +89,12 @@ def _build_material_for_product_internal(product, model) -> Dict[str, Any]:
     # 1. Per-face (highest priority)
     face_styles = get_face_styles(model, product)
     if face_styles:
-        result["per_face"] = {item_id: _to_pbr(styles[0]) for item_id, styles in face_styles.items()}
+        result["per_face"] = {item_id: _to_pbr(styles[0], model) for item_id, styles in face_styles.items()}
 
     # 2. Object-level (A→E precedence)
     obj_styles = get_surface_styles(model, product)
     if obj_styles:
-        result["object"] = _to_pbr(obj_styles[0])
+        result["object"] = _to_pbr(obj_styles[0], model)
 
     # 3. Fallback: material name
     name = _material_name_from_associations(product) or _default_name_for_product(product)
@@ -303,10 +306,11 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item) -
     item_id = id(item)
     if item_id in face_styles:
         style = face_styles[item_id][0]
-        friendly_name = _friendly_style_name(style, shape_name_by_item.get(item_id))
-        mat = _to_pbr(style, model=model, preferred_name=friendly_name)
+        resolved_style = _resolve_surface_style_entity(style) or style
+        friendly_name = _friendly_style_name(resolved_style, shape_name_by_item.get(item_id))
+        mat = _to_pbr(resolved_style, model=model, preferred_name=friendly_name)
         try:
-            style_id = int(style.id())
+            style_id = int(resolved_style.id())
         except Exception:
             style_id = None
         return {("styled", mat.name): {"material": mat, "faces": list(range(face_count)), "style_id": style_id}}, face_count
@@ -419,52 +423,222 @@ def _get_material_for_style(model, style) -> Optional[ifcopenshell.entity_instan
                             return represented
     return None
 
-def _to_pbr(style: ifcopenshell.entity_instance, model) -> PBRMaterial:
+def _resolve_surface_style_entity(style: Optional[ifcopenshell.entity_instance]) -> Optional[ifcopenshell.entity_instance]:
+    """Chase through presentation assignments/styled items to find an IfcSurfaceStyle."""
+    if style is None:
+        return None
+    seen: Set[int] = set()
+    stack: List[ifcopenshell.entity_instance] = [style]
+    while stack:
+        entity = stack.pop()
+        if entity is None:
+            continue
+        try:
+            key = int(entity.id())
+        except Exception:
+            key = id(entity)
+        if key in seen:
+            continue
+        seen.add(key)
+        if hasattr(entity, "is_a") and entity.is_a("IfcSurfaceStyle"):
+            return entity
+        for attr_name in ("Styles", "styles", "Items", "items"):
+            values = getattr(entity, attr_name, None)
+            if not values:
+                continue
+            if isinstance(values, (list, tuple)):
+                stack.extend(v for v in values if v is not None)
+            else:
+                stack.append(values)
+    return None
+
+
+def _friendly_style_name(style: ifcopenshell.entity_instance, shape_name: Optional[str] = None) -> str:
+    """Readable token combining shape aspect name + material/style name."""
+    model = getattr(style, "file", None)
     material = _get_material_for_style(model, style)
-    mat_name = material.Name if material else None
-    style_name = style.Name
+    mat_name = getattr(material, "Name", None)
+    style_name = getattr(style, "Name", None)
 
-    pbr = PBRMaterial(name=mat_name or style_name or "Unknown")
-
-    if style.is_a("IfcSurfaceStyle"):
-        elements = getattr(style, "Styles", []) or []
-        rendering = next((e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None)
-        if rendering:
-            pbr.base_color = _get_base_color(rendering)
-            pbr.opacity = 1.0 - float(getattr(rendering, "Transparency", 0.0) or 0.0)
-            spec = _as_rgb(getattr(rendering, "SpecularColour", None))
-            spec_level = max(spec) if spec else 0.0
-            pbr.roughness = max(0.05, 1.0 - min(0.95, spec_level))
-        else:
-            shading = next((e for e in elements if e.is_a("IfcSurfaceStyleShading")), None)
-            if shading:
-                pbr.base_color = _as_rgb(shading.SurfaceColour)
-
-    # Final name: Material (Style)
     if mat_name and style_name and style_name != mat_name:
-        pbr.name = f"{mat_name} ({style_name})"
-    elif mat_name:
-        pbr.name = mat_name
+        core = f"{mat_name} ({style_name})"
+    else:
+        core = mat_name or style_name or "Material"
+
+    parts = [shape_name, core]
+    raw = "_".join([p for p in parts if p])
+    return _sanitize_style_token(raw or "Material")
+
+
+def _to_pbr(
+    style: ifcopenshell.entity_instance,
+    model: Optional[ifcopenshell.file] = None,
+    *,
+    preferred_name: Optional[str] = None,
+) -> PBRMaterial:
+    surface_style = _resolve_surface_style_entity(style) or style
+    material = _get_material_for_style(model or getattr(surface_style, "file", None), surface_style)
+    mat_name = getattr(material, "Name", None)
+    style_name = getattr(surface_style, "Name", None)
+    material_name = preferred_name or mat_name or style_name or "Unknown"
+    pbr = PBRMaterial(name=material_name)
+
+    if surface_style is not None and surface_style.is_a("IfcSurfaceStyle"):
+        elements = list(getattr(surface_style, "Styles", []) or [])
+        rendering = next((e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None)
+        shading = next((e for e in elements if e.is_a("IfcSurfaceStyleShading")), None)
+        if rendering:
+            base_color = _rendering_base_color(rendering)
+            pbr.base_color = base_color
+            pbr.opacity = _rendering_opacity(rendering)
+            pbr.roughness = _rendering_roughness(rendering)
+            pbr.metallic = _rendering_metallic(rendering)
+            emissive = _rendering_emissive(rendering, base_color)
+            if emissive:
+                pbr.emissive = emissive
+        elif shading:
+            pbr.base_color = _as_rgb(getattr(shading, "SurfaceColour", None))
+        _log_style_resolution(surface_style, rendering, shading, pbr)
+    else:
+        _log_style_resolution(surface_style or style, None, None, pbr)
+
+    if preferred_name is None:
+        if mat_name and style_name and style_name != mat_name:
+            pbr.name = f"{mat_name} ({style_name})"
+        elif mat_name:
+            pbr.name = mat_name
 
     return pbr
 
 
-def _get_base_color(rendering) -> Tuple[float, float, float]:
-    base = _as_rgb(getattr(rendering, "SurfaceColour", None))
-    if base is None:
-        base = (0.8, 0.8, 0.8)
-    diffuse = getattr(rendering, "DiffuseColour", None)
-    factor = _color_or_factor(diffuse)
-    if factor:
-        base = tuple(
-            max(0.0, min(1.0, base[i] * factor[i]))
-            for i in range(3)
-        )
+def _log_style_resolution(style, rendering, shading, pbr) -> None:
+    root_logger = logging.getLogger()
+    logger: logging.Logger
+    if LOG.isEnabledFor(logging.DEBUG):
+        logger = LOG
+        level = logging.DEBUG
+    elif root_logger.isEnabledFor(logging.DEBUG):
+        logger = root_logger
+        level = logging.DEBUG
+    else:
+        # Fall back to INFO so the message still lands in stdout when DEBUG isn't enabled.
+        logger = LOG if LOG.isEnabledFor(logging.INFO) else root_logger
+        level = logging.INFO
+
+    def _entity_id(entity: Optional[ifcopenshell.entity_instance]) -> Optional[int]:
+        if entity is None:
+            return None
+        try:
+            return int(entity.id())
+        except Exception:
+            return None
+
+    render_snapshot = _rendering_debug_snapshot(rendering)
+    shading_snapshot = _shading_debug_snapshot(shading)
+
+    logger.log(
+        level,
+        "IfcSurfaceStyle '%s' (style_id=%s render_id=%s shade_id=%s) raw_render=%s raw_shading=%s -> material '%s' base=%s opacity=%.4f roughness=%.4f metallic=%.4f emissive=%s",
+        getattr(style, "Name", None) or "<Unnamed>",
+        _entity_id(style),
+        _entity_id(rendering),
+        _entity_id(shading),
+        render_snapshot,
+        shading_snapshot,
+        pbr.name,
+        tuple(round(c, 4) for c in pbr.base_color),
+        pbr.opacity,
+        pbr.roughness,
+        pbr.metallic,
+        tuple(round(c, 4) for c in pbr.emissive) if pbr.emissive else None,
+    )
+
+
+def _rendering_debug_snapshot(rendering: Optional[ifcopenshell.entity_instance]) -> Optional[Dict[str, Any]]:
+    if rendering is None:
+        return None
+
+    def _rounded_color(value):
+        color = _color_or_factor(value)
+        if not color:
+            return None
+        return tuple(round(c, 4) for c in color)
+
+    snapshot = {
+        "SurfaceColour": _rounded_color(getattr(rendering, "SurfaceColour", None)),
+        "DiffuseColour": _rounded_color(getattr(rendering, "DiffuseColour", None)),
+        "SpecularColour": _rounded_color(getattr(rendering, "SpecularColour", None)),
+        "SpecularHighlight": _rounded_color(getattr(rendering, "SpecularHighlight", None)),
+        "EmissiveColour": _rounded_color(getattr(rendering, "EmissiveColour", None)),
+        "Transparency": _float_value(getattr(rendering, "Transparency", None)),
+        "SpecularRoughness": _float_value(getattr(rendering, "SpecularRoughness", None)),
+        "SelfLuminous": _float_value(getattr(rendering, "SelfLuminous", None)),
+        "ReflectanceMethod": getattr(rendering, "ReflectanceMethod", None),
+    }
+    return snapshot
+
+
+def _shading_debug_snapshot(shading: Optional[ifcopenshell.entity_instance]) -> Optional[Dict[str, Any]]:
+    if shading is None:
+        return None
+    surface = getattr(shading, "SurfaceColour", None)
+    color = _color_or_factor(surface) if surface is not None else None
+    return {
+        "SurfaceColour": tuple(round(c, 4) for c in color) if color else None,
+    }
+
+
+def _rendering_base_color(rendering) -> Tuple[float, float, float]:
+    base = _color_or_factor(getattr(rendering, "SurfaceColour", None)) or (0.8, 0.8, 0.8)
+    diffuse = _color_or_factor(getattr(rendering, "DiffuseColour", None))
+    if diffuse:
+        base = tuple(_clamp01(base[i] * diffuse[i]) for i in range(3))
     return base
 
 
+def _rendering_opacity(rendering) -> float:
+    transparency = _float_value(getattr(rendering, "Transparency", None)) or 0.0
+    return _clamp01(1.0 - transparency)
+
+
+def _rendering_roughness(rendering) -> float:
+    rough = _float_value(getattr(rendering, "SpecularRoughness", None))
+    if rough is not None:
+        return _clamp01(rough)
+    spec = _color_or_factor(getattr(rendering, "SpecularColour", None))
+    highlight = _color_or_factor(getattr(rendering, "SpecularHighlight", None))
+    level = None
+    if spec:
+        level = max(spec)
+    elif highlight:
+        level = max(highlight)
+    if level is None:
+        return 0.5
+    return max(0.03, min(1.0, 1.0 - min(level, 0.97)))
+
+
+def _rendering_metallic(rendering) -> float:
+    method = getattr(rendering, "ReflectanceMethod", None)
+    if not method:
+        return 0.0
+    token = str(method).strip().strip(".").lower()
+    if token in {"metal", "mirror"}:
+        return 1.0
+    return 0.0
+
+
+def _rendering_emissive(rendering, base_color: Tuple[float, float, float]) -> Optional[Tuple[float, float, float]]:
+    emissive = _color_or_factor(getattr(rendering, "EmissiveColour", None))
+    if emissive:
+        return tuple(_clamp01(c) for c in emissive)
+    luminous = _float_value(getattr(rendering, "SelfLuminous", None))
+    if luminous and luminous > 0.0:
+        return tuple(_clamp01(base_color[i] * luminous) for i in range(3))
+    return None
+
+
 def _as_rgb(col) -> Tuple[float, float, float]:
-    if not col:
+    if col is None:
         return (0.8, 0.8, 0.8)
     r = float(getattr(col, "Red", 0.8))
     g = float(getattr(col, "Green", 0.8))
@@ -481,9 +655,9 @@ def _color_from_texture(tex) -> Optional[Tuple[float, float, float]]:
 
 
 def _color_or_factor(val) -> Optional[Tuple[float, float, float]]:
-    if not val:
+    if val is None:
         return None
-    if val.is_a("IfcColourRgb"):
+    if hasattr(val, "is_a") and val.is_a("IfcColourRgb"):
         return _as_rgb(val)
     if hasattr(val, "wrappedValue"):
         try:
@@ -497,6 +671,24 @@ def _color_or_factor(val) -> Optional[Tuple[float, float, float]]:
         except:
             pass
     return None
+
+
+def _float_value(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    if hasattr(val, "wrappedValue"):
+        val = val.wrappedValue
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+
+def _clamp01(value: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return 0.0
 
 
 # === FALLBACK NAMES ===
