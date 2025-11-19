@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import logging
+import weakref
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, Union
@@ -305,6 +306,40 @@ def _material_name_from_entry(entry: Any) -> Optional[str]:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return None
+
+
+def _material_name_for_index(index: int, materials: Optional[Sequence[Any]]) -> Optional[str]:
+    if materials is None:
+        return None
+    entry: Any = None
+    if isinstance(materials, dict):
+        entry = materials.get(index)
+        if entry is None:
+            entry = materials.get(str(index))
+    else:
+        try:
+            entry = materials[index]
+        except Exception:
+            entry = None
+    return _material_name_from_entry(entry)
+
+
+def _material_name_from_style_entry(
+    entry: Optional[Dict[str, Any]],
+    *,
+    fallback: Optional[str] = None,
+) -> Optional[str]:
+    if not entry:
+        return fallback
+    for key in ("name", "label", "id", "guid", "shapeAspect", "style_id"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    material_obj = entry.get("material")
+    name = _material_name_from_entry(material_obj)
+    if name:
+        return name
+    return fallback
 
 
 def _material_identifier_for_index(index: int, materials: Optional[Sequence[Any]]) -> Any:
@@ -1691,6 +1726,7 @@ def _ensure_material_subsets(
     face_vertex_counts: Optional[Sequence[int]] = None,
     face_vertex_indices: Optional[Sequence[int]] = None,
     use_component_classification: bool = False,
+    subset_token_map: Optional[Dict[str, str]] = None,
 ) -> bool:
     prim = mesh.GetPrim()
     stage = prim.GetStage()
@@ -1720,6 +1756,7 @@ def _ensure_material_subsets(
     if use_component_classification and len(unique_material_ids) <= 1:
         use_component_classification = False
     stats: List[Tuple[str, int]] = []
+    token_to_style_key: Dict[str, str] = {}
 
     if use_component_classification and material_ids and len(material_ids) == face_count and style_groups:
         # --- EARLY BAILOUT: keep strong IFC style when it already dominates the mesh ---
@@ -1767,6 +1804,9 @@ def _ensure_material_subsets(
                     if not valid_faces:
                         continue
                     subset_token = _subset_token_for_material(key)
+                    token_to_style_key[subset_token] = key
+                    if subset_token_map is not None:
+                        subset_token_map[key] = subset_token
                     subset_path = mesh.GetPath().AppendChild(subset_token)
                     subset = UsdGeom.Subset.Define(stage, subset_path)
                     try:
@@ -1777,6 +1817,9 @@ def _ensure_material_subsets(
                         except AttributeError:
                             subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
                     (subset.GetIndicesAttr() or subset.CreateIndicesAttr()).Set(Vt.IntArray(valid_faces))
+                    prim = subset.GetPrim()
+                    material_name = _material_name_from_style_entry(entry, fallback=str(key))
+                    _set_subset_material_name(prim, material_name)
                     try:
                         subset.CreateFamilyNameAttr().Set(family_name)
                     except Exception:
@@ -1791,7 +1834,11 @@ def _ensure_material_subsets(
         )
         style_tokens: Dict[str, str] = {}
         for key in style_groups:
-            style_tokens[key] = _subset_token_for_material(key)
+            token = _subset_token_for_material(key)
+            style_tokens[key] = token
+            token_to_style_key[token] = key
+            if subset_token_map is not None:
+                subset_token_map[key] = token
 
         face_style_map, cluster_lookup, cluster_dir_map = _resolve_component_styles(
             material_ids,
@@ -1835,22 +1882,27 @@ def _ensure_material_subsets(
                 if not indices_attr:
                     indices_attr = subset.CreateIndicesAttr()
                 indices_attr.Set(Vt.IntArray([int(f) for f in faces]))
+                subset_prim = subset.GetPrim()
                 # Traceability: style token and base material ids on these faces
                 base_token = cluster_lookup.get(token)  # original style base when clustered
-                src_tok = base_token or token
-                subset.GetPrim().CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(src_tok)
+                resolved_token = base_token or token
+                style_key = token_to_style_key.get(resolved_token)
+                entry = style_groups.get(style_key) if style_key and style_groups else None
+                material_name = _material_name_from_style_entry(entry, fallback=str(style_key or resolved_token))
+                _set_subset_material_name(subset_prim, material_name)
+                subset_prim.CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(resolved_token)
                 if material_ids:
                     mids = sorted({int(material_ids[i]) for i in faces if 0 <= int(i) < face_count})
                     if len(mids) == 1:
-                        subset.GetPrim().CreateAttribute("ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int).Set(mids[0])
+                        subset_prim.CreateAttribute("ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int).Set(mids[0])
                     elif mids:
-                        subset.GetPrim().CreateAttribute("ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(mids))
+                        subset_prim.CreateAttribute("ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(mids))
                 base_token = cluster_lookup.get(token)
                 if base_token:
-                    subset.GetPrim().CreateAttribute("ifc:baseStyleToken", Sdf.ValueTypeNames.String).Set(base_token)
+                    subset_prim.CreateAttribute("ifc:baseStyleToken", Sdf.ValueTypeNames.String).Set(base_token)
                 direction_label = cluster_dir_map.get(token)
                 if direction_label:
-                    subset.GetPrim().CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(direction_label)
+                    subset_prim.CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(direction_label)
                 try:
                     subset.CreateFamilyNameAttr().Set(family_name)
                 except Exception:
@@ -1877,6 +1929,9 @@ def _ensure_material_subsets(
                 if not valid_faces:
                     continue
                 subset_token = _subset_token_for_material(key)
+                token_to_style_key[subset_token] = key
+                if subset_token_map is not None:
+                    subset_token_map[key] = subset_token
                 subset_path = mesh.GetPath().AppendChild(subset_token)
                 subset = UsdGeom.Subset.Define(stage, subset_path)
                 try:
@@ -1892,6 +1947,8 @@ def _ensure_material_subsets(
                 indices_attr.Set(Vt.IntArray(valid_faces))
                 # Traceability for plain style subsets
                 prim = subset.GetPrim()
+                material_name = _material_name_from_style_entry(entry, fallback=str(key))
+                _set_subset_material_name(prim, material_name)
                 prim.CreateAttribute("ifc:sourceStyleKey", Sdf.ValueTypeNames.String).Set(str(key))
                 prim.CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(subset_token)
                 if material_ids:
@@ -2032,8 +2089,11 @@ def _ensure_material_subsets(
                             subset.CreateFamilyNameAttr().Set(family_name)
                             subset.CreateElementTypeAttr().Set(element_token)
                             subset.CreateIndicesAttr(Vt.IntArray([int(f) for f in faces]))
-                            subset.GetPrim().CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(dir_label or "NA")
-                            subset.GetPrim().CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(mid))
+                            subset_prim = subset.GetPrim()
+                            material_name = _material_name_for_index(mid, materials)
+                            _set_subset_material_name(subset_prim, material_name)
+                            subset_prim.CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(dir_label or "NA")
+                            subset_prim.CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(mid))
                             created_subsets = True
                             stats.append((str(subset_path), len(faces)))
                         authored_geo = True
@@ -2059,7 +2119,10 @@ def _ensure_material_subsets(
                     indices_attr = subset.CreateIndicesAttr()
                 indices_attr.Set(Vt.IntArray(face_indices))
                 # Traceability for numeric subsets
-                subset.GetPrim().CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(material_index))
+                subset_prim = subset.GetPrim()
+                material_name = _material_name_for_index(material_index, materials)
+                _set_subset_material_name(subset_prim, material_name)
+                subset_prim.CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(material_index))
                 try:
                     subset.CreateFamilyNameAttr().Set(family_name)
                 except Exception:
@@ -2148,6 +2211,8 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
     payload_counts = payload.get("face_vertex_counts")
     payload_indices = payload.get("face_vertex_indices")
 
+    subset_token_map: Optional[Dict[str, str]] = {} if style_groups else None
+
     if material_ids:
         mat_attr = Vt.IntArray([int(i) for i in material_ids])
         mesh.GetPrim().CreateAttribute("ifc:materialIds", Sdf.ValueTypeNames.IntArray).Set(mat_attr)
@@ -2161,6 +2226,7 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
             face_vertex_counts=payload_counts,
             face_vertex_indices=payload_indices,
             use_component_classification=use_component_classification,
+            subset_token_map=subset_token_map,
         )
     else:
         subsets_use_styles = _ensure_material_subsets(
@@ -2173,7 +2239,13 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
             face_vertex_counts=payload_counts,
             face_vertex_indices=payload_indices,
             use_component_classification=use_component_classification,
+            subset_token_map=subset_token_map,
         )
+    if subset_token_map and style_groups:
+        for key, token in subset_token_map.items():
+            entry = style_groups.get(key)
+            if entry is not None:
+                entry["subset_token"] = token
 
     # If a single style group covers the entire mesh, author displayColor for quick previews
     try:
@@ -2613,6 +2685,231 @@ class _FaceGeometry:
 @dataclass
 class MaterialLibrary:
     signature_to_path: Dict[Tuple[Any, ...], Sdf.Path]
+
+
+# ---------- helpers used by binding ----------
+_MATERIAL_NAME_CACHE: "weakref.WeakKeyDictionary[Usd.Stage, Dict[str, Sdf.Path]]" = weakref.WeakKeyDictionary()
+
+
+def _mesh_has_geom_subsets(stage: Usd.Stage, mesh_path: Optional[Sdf.Path]) -> bool:
+    """
+    Return True iff the composed prim at mesh_path has authored GeomSubset children.
+    """
+    if mesh_path is None:
+        return False
+    mesh_prim = stage.GetPrimAtPath(mesh_path)
+    if not mesh_prim:
+        return False
+    for child in mesh_prim.GetChildren():
+        if child.GetTypeName() == "GeomSubset":
+            return True
+    return False
+
+
+def _material_name_key(name: Any) -> Optional[str]:
+    if name is None:
+        return None
+    text = str(name).strip()
+    if not text:
+        return None
+    return text.lower()
+
+
+def _register_material_name(stage: Optional[Usd.Stage], name: Any, path: Optional[Sdf.Path]) -> None:
+    if stage is None or path is None:
+        return
+    key = _material_name_key(name)
+    if key is None:
+        return
+    cache = _MATERIAL_NAME_CACHE.setdefault(stage, {})
+    cache[key] = path
+
+
+def _material_path_by_name(stage: Optional[Usd.Stage], name: Any) -> Optional[Sdf.Path]:
+    if stage is None:
+        return None
+    key = _material_name_key(name)
+    if key is None:
+        return None
+    cache = _MATERIAL_NAME_CACHE.get(stage)
+    if cache and key in cache:
+        return cache[key]
+    for prim in stage.Traverse():
+        if prim.GetTypeName() != "Material":
+            continue
+        attr = prim.GetAttribute("ifc:materialName")
+        if not attr or not attr.HasAuthoredValue():
+            continue
+        try:
+            value = attr.Get()
+        except Exception:
+            continue
+        if _material_name_key(value) == key:
+            path = prim.GetPath()
+            cache = _MATERIAL_NAME_CACHE.setdefault(stage, {})
+            cache[key] = path
+            return path
+    return None
+
+
+def _set_subset_material_name(subset_prim: Usd.Prim, material_name: Optional[str], *, overwrite: bool = False) -> None:
+    if subset_prim is None or material_name is None:
+        return
+    text = str(material_name).strip()
+    if not text:
+        return
+    attr = subset_prim.GetAttribute("ifc:materialName")
+    if attr and attr.HasAuthoredValue() and not overwrite:
+        return
+    subset_prim.CreateAttribute("ifc:materialName", Sdf.ValueTypeNames.String, custom=True).Set(text)
+
+
+def _subset_indices_from_attrs(subset_prim: Usd.Prim) -> List[int]:
+    indices: Set[int] = set()
+
+    def _collect(attr_name: str) -> None:
+        attr = subset_prim.GetAttribute(attr_name)
+        if not attr or not attr.HasAuthoredValue():
+            return
+        try:
+            value = attr.Get()
+        except Exception:
+            return
+        if value is None:
+            return
+        if isinstance(value, (list, tuple, Vt.IntArray)):
+            for item in value:
+                try:
+                    indices.add(int(item))
+                except Exception:
+                    continue
+        else:
+            try:
+                indices.add(int(value))
+            except Exception:
+                return
+
+    for name in ("ifc:sourceMaterialIndex", "ifc:baseMaterialIndex", "ifc:baseMaterialIndices"):
+        _collect(name)
+    return sorted(indices)
+
+
+def _update_material_metadata(
+    stage: Usd.Stage,
+    material_path: Sdf.Path,
+    *,
+    material_name: Optional[str] = None,
+    source_indices: Optional[Iterable[int]] = None,
+) -> None:
+    material_prim = stage.GetPrimAtPath(material_path)
+    if not material_prim:
+        return
+    if material_name:
+        text = str(material_name).strip()
+        if text:
+            material_prim.CreateAttribute("ifc:materialName", Sdf.ValueTypeNames.String, custom=True).Set(text)
+            _register_material_name(stage, text, material_path)
+    new_values: Set[int] = set()
+    if source_indices:
+        for idx in source_indices:
+            try:
+                new_values.add(int(idx))
+            except Exception:
+                continue
+    if new_values:
+        attr = material_prim.GetAttribute("ifc:sourceMaterialIndices")
+        existing: Set[int] = set()
+        if attr and attr.HasAuthoredValue():
+            try:
+                existing_values = attr.Get()
+                for value in existing_values:
+                    try:
+                        existing.add(int(value))
+                    except Exception:
+                        continue
+            except Exception:
+                existing = set()
+        combined = sorted(existing.union(new_values))
+        target_attr = attr or material_prim.CreateAttribute(
+            "ifc:sourceMaterialIndices", Sdf.ValueTypeNames.IntArray, custom=True
+        )
+        target_attr.Set(Vt.IntArray(combined))
+        if len(combined) == 1:
+            material_prim.CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int, custom=True).Set(
+                int(combined[0])
+            )
+
+
+def _propagate_subset_metadata_to_material(
+    stage: Usd.Stage,
+    subset_prim: Usd.Prim,
+    material_path: Sdf.Path,
+) -> None:
+    if subset_prim is None or material_path is None:
+        return
+    material_name: Optional[str] = None
+    name_attr = subset_prim.GetAttribute("ifc:materialName")
+    if name_attr and name_attr.HasAuthoredValue():
+        try:
+            material_name = name_attr.Get()
+        except Exception:
+            material_name = None
+    source_indices = _subset_indices_from_attrs(subset_prim)
+    _update_material_metadata(stage, material_path, material_name=material_name, source_indices=source_indices)
+
+
+def _material_name_from_usd_material(material: UsdShade.Material) -> Optional[str]:
+    if not material:
+        return None
+    prim = material.GetPrim()
+    if not prim:
+        return None
+    attr = prim.GetAttribute("ifc:materialName")
+    if attr and attr.HasAuthoredValue():
+        try:
+            return str(attr.Get()).strip()
+        except Exception:
+            return None
+    return None
+
+
+def _bind_material_from_ifc_name(stage: Usd.Stage, prim: Usd.Prim) -> Optional[Sdf.Path]:
+    if prim is None:
+        return None
+    binding_api = UsdShade.MaterialBindingAPI(prim)
+    if binding_api.GetDirectBinding().GetMaterial():
+        return None
+    attr = prim.GetAttribute("ifc:materialName")
+    if not attr or not attr.HasAuthoredValue():
+        return None
+    try:
+        value = attr.Get()
+    except Exception:
+        return None
+    if not value:
+        return None
+    material_path = _material_path_by_name(stage, value)
+    if not material_path:
+        return None
+    material = UsdShade.Material.Get(stage, material_path)
+    if not material:
+        return None
+    binding_api.Bind(material)
+    prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(material_path))
+    _propagate_subset_metadata_to_material(stage, prim, material_path)
+    return material_path
+
+
+def _bind_ifc_named_materials(stage: Usd.Stage, mesh_path: Optional[Sdf.Path]) -> None:
+    if stage is None or mesh_path is None:
+        return
+    mesh_prim = stage.GetPrimAtPath(mesh_path)
+    if not mesh_prim:
+        return
+    _bind_material_from_ifc_name(stage, mesh_prim)
+    for child in mesh_prim.GetChildren():
+        if child.GetTypeName() == "GeomSubset":
+            _bind_material_from_ifc_name(stage, child)
 
 
 def _as_float(value: Any) -> Optional[float]:
@@ -3060,6 +3357,11 @@ def _author_preview_surface(stage: Usd.Stage, material_path: Sdf.Path, props: _M
     material_surface_output = material.CreateSurfaceOutput()
     material_surface_output.ConnectToSource(shader_surface_output)
     prim = material.GetPrim()
+    if props.name:
+        text = str(props.name).strip()
+        if text:
+            prim.CreateAttribute("ifc:materialName", Sdf.ValueTypeNames.String, custom=True).Set(text)
+            _register_material_name(stage, text, material_path)
     prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(Gf.Vec3f(*props.display_color))
     prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(float(props.opacity))
     return material
@@ -3172,9 +3474,13 @@ def _apply_material_bindings_to_prim(
     mesh_path: Optional[Sdf.Path] = None,
 ) -> Optional[Sdf.Path]:
     if not resolved_materials:
+        if mesh_path is not None:
+            _bind_ifc_named_materials(stage, mesh_path)
         return None
     items = list(resolved_materials.items())
     if not items:
+        if mesh_path is not None:
+            _bind_ifc_named_materials(stage, mesh_path)
         return None
 
     def _style_primary_key() -> Optional[Any]:
@@ -3195,27 +3501,48 @@ def _apply_material_bindings_to_prim(
 
     primary_material = UsdShade.Material.Get(stage, primary_path)
     if not primary_material:
+        if mesh_path is not None:
+            _bind_ifc_named_materials(stage, mesh_path)
         return None
-    UsdShade.MaterialBindingAPI(prim).Bind(primary_material)
-
-    if mesh_path is None:
+    mesh_has_subsets = _mesh_has_geom_subsets(stage, mesh_path)
+    binding_api = UsdShade.MaterialBindingAPI(prim)
+    if mesh_path is None or not mesh_has_subsets:
+        binding_api.Bind(primary_material)
+        prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(primary_path))
+        _set_subset_material_name(prim, _material_name_from_usd_material(primary_material))
+        _bind_ifc_named_materials(stage, mesh_path)
         return primary_path
 
     bound_subset_keys: Set[Any] = set()
+    subset_bound = False
 
     def _bind_subset(key: Any, material_path: Sdf.Path) -> None:
+        nonlocal subset_bound
         if key in bound_subset_keys:
             return
-        subset_token = _subset_token_for_material(key)
+        subset_token = None
+        if isinstance(key, str) and style_groups:
+            entry = style_groups.get(key)
+            if entry is not None:
+                subset_token = entry.get("subset_token")
+        if not subset_token:
+            subset_token = _subset_token_for_material(key)
         subset_path = mesh_path.AppendChild(subset_token)
-        # Ensure we author a local override on the instance path so the binding
-        # is per-instance even if the subset comes in via a reference.
-        subset_prim = stage.GetPrimAtPath(subset_path) or stage.OverridePrim(subset_path)
+        existing = stage.GetPrimAtPath(subset_path)
+        if not existing or existing.GetTypeName() != "GeomSubset":
+            return
+        subset_prim = stage.OverridePrim(subset_path)
         subset_material = UsdShade.Material.Get(stage, material_path)
         if not subset_material:
             return
         UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
+        subset_name = _material_name_from_usd_material(subset_material)
+        if subset_name:
+            _set_subset_material_name(subset_prim, subset_name, overwrite=False)
+        subset_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(material_path))
+        _propagate_subset_metadata_to_material(stage, subset_prim, material_path)
         bound_subset_keys.add(key)
+        subset_bound = True
 
     style_keys = {
         key for key in resolved_materials if isinstance(key, str) and key.strip("'\"").startswith("__style__")
@@ -3233,7 +3560,20 @@ def _apply_material_bindings_to_prim(
                 continue
             _bind_subset(key, material_path)
 
-    _bind_style_subsets(stage, mesh_path, style_groups, resolved_materials)
+    subset_bound = subset_bound or _bind_style_subsets(stage, mesh_path, style_groups, resolved_materials)
+
+    if subset_bound:
+        try:
+            binding_api.UnbindAllBindings()
+        except Exception:
+            pass
+        _bind_ifc_named_materials(stage, mesh_path)
+        return None
+
+    binding_api.Bind(primary_material)
+    prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(primary_path))
+    _set_subset_material_name(prim, _material_name_from_usd_material(primary_material))
+    _bind_ifc_named_materials(stage, mesh_path)
     return primary_path
 
 
@@ -3243,9 +3583,10 @@ def _bind_detail_materials(
     face_material_keys: Sequence[Any],
     resolved_materials: Dict[Any, Sdf.Path],
 ) -> None:
-    if not resolved_materials:
-        return
     mesh_path = mesh_geom.GetPath()
+    if not resolved_materials:
+        _bind_ifc_named_materials(stage, mesh_path)
+        return
     keys = list(face_material_keys or [])
     valid_keys = [key for key in keys if key in resolved_materials]
     if not valid_keys:
@@ -3267,8 +3608,16 @@ def _bind_detail_materials(
     primary_key = order[0]
     primary_material = UsdShade.Material.Get(stage, resolved_materials.get(primary_key))
     if not primary_material:
+        _bind_ifc_named_materials(stage, mesh_path)
         return
     binding_api.Bind(primary_material)
+    mesh_prim = mesh_geom.GetPrim()
+    primary_material_path = resolved_materials.get(primary_key)
+    if primary_material_path:
+        mesh_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(
+            str(primary_material_path)
+        )
+    _set_subset_material_name(mesh_prim, _material_name_from_usd_material(primary_material))
 
     family_name = "materialBind"
     face_lookup: Dict[Any, List[int]] = {}
@@ -3287,11 +3636,20 @@ def _bind_detail_materials(
         subset.CreateIndicesAttr(indices)
         subset_material = UsdShade.Material.Get(stage, resolved_materials.get(key))
         if subset_material:
-            UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(subset_material)
+            subset_prim = subset.GetPrim()
+            mat_name = _material_name_from_usd_material(subset_material)
+            _set_subset_material_name(subset_prim, mat_name)
+            UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
+            subset_path_val = subset_material.GetPath()
+            subset_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(
+                str(subset_path_val)
+            )
+            _propagate_subset_metadata_to_material(stage, subset_prim, subset_path_val)
     try:
         UsdGeom.Subset.SetFamilyType(mesh_geom, family_name, UsdGeom.Tokens.nonOverlapping)
     except Exception:
         pass
+    _bind_ifc_named_materials(stage, mesh_path)
 
 
 def _bind_style_subsets(
@@ -3299,20 +3657,31 @@ def _bind_style_subsets(
     mesh_path: Optional[Sdf.Path],
     style_groups: Optional[Dict[str, Dict[str, Any]]],
     resolved_materials: Dict[Any, Sdf.Path],
-) -> None:
+) -> bool:
     if mesh_path is None or not style_groups:
-        return
-    for key in style_groups.keys():
+        return False
+    bound = False
+    for key, entry in style_groups.items():
         material_path = resolved_materials.get(key)
         if not material_path:
             continue
         material = UsdShade.Material.Get(stage, material_path)
         if not material:
             continue
-        subset_token = _subset_token_for_material(key)
+        subset_token = (entry or {}).get("subset_token") or _subset_token_for_material(key)
         subset_path = mesh_path.AppendChild(subset_token)
-        subset_prim = stage.GetPrimAtPath(subset_path) or stage.OverridePrim(subset_path)
+        existing = stage.GetPrimAtPath(subset_path)
+        if not existing or existing.GetTypeName() != "GeomSubset":
+            continue
+        subset_prim = stage.OverridePrim(subset_path)
         UsdShade.MaterialBindingAPI(subset_prim).Bind(material)
+        subset_name = _material_name_from_usd_material(material)
+        if subset_name:
+            _set_subset_material_name(subset_prim, subset_name, overwrite=False)
+        subset_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(material_path))
+        _propagate_subset_metadata_to_material(stage, subset_prim, material_path)
+        bound = True
+    return bound
 
 
 def author_material_layer(
