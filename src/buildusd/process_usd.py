@@ -2669,7 +2669,14 @@ class _MaterialProperties:
     name: str
     display_color: Tuple[float, float, float]
     opacity: float
+    # NEW: PBR scalars carried through from IFC
+    metallic: float = 0.0
+    roughness: float = 0.5
     emissive_color: Optional[Tuple[float, float, float]] = None
+    # NEW: optional texture slots
+    base_color_tex: Optional[str] = None
+    normal_tex: Optional[str] = None
+    orm_tex: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -2981,7 +2988,17 @@ def _material_properties_from_pbr(
         if material.emissive and max(material.emissive) > 0.0:
             emissive = _normalize_color(tuple(float(c) for c in material.emissive[:3]))
         name = material.name or fallback_name
-        return _MaterialProperties(name=name, display_color=base_color, opacity=opacity, emissive_color=emissive)
+        return _MaterialProperties(
+            name=name,
+            display_color=base_color,
+            opacity=opacity,
+            emissive_color=emissive,
+            metallic=float(getattr(material, "metallic", 0.0)),
+            roughness=float(getattr(material, "roughness", 0.5)),
+            base_color_tex=getattr(material, "base_color_tex", None),
+            normal_tex=getattr(material, "normal_tex", None),
+            orm_tex=getattr(material, "orm_tex", None),
+        )
     if isinstance(material, dict):
         base = material.get("base_color")
         if base is not None:
@@ -2993,7 +3010,17 @@ def _material_properties_from_pbr(
                 if emissive_value is not None:
                     emissive = _normalize_color(tuple(float(c) for c in emissive_value[:3]))
                 name = str(material.get("name", fallback_name))
-                return _MaterialProperties(name=name, display_color=base_color, opacity=opacity, emissive_color=emissive)
+                return _MaterialProperties(
+                    name=name,
+                    display_color=base_color,
+                    opacity=opacity,
+                    emissive_color=emissive,
+                    metallic=float(material.get("metallic", 0.0)),
+                    roughness=float(material.get("roughness", 0.5)),
+                    base_color_tex=material.get("base_color_tex"),
+                    normal_tex=material.get("normal_tex"),
+                    orm_tex=material.get("orm_tex"),
+                )
             except Exception:
                 pass
     return None
@@ -3334,36 +3361,95 @@ def _extract_material_properties(
 
 
 def _material_signature(props: _MaterialProperties) -> Tuple[Any, ...]:
-    emissive = tuple(round(c, 5) for c in props.emissive_color) if props.emissive_color else None
+    """Unique key for material de-dup; include PBR scalars so Metal/Rough variants don’t collapse."""
+    emissive = tuple(round(c, 5) for c in (props.emissive_color or ())) or None
     return (
         tuple(round(c, 5) for c in props.display_color),
         round(props.opacity, 5),
+        round(float(getattr(props, "metallic", 0.0)), 5),
+        round(float(getattr(props, "roughness", 0.5)), 5),
         emissive,
         sanitize_name(props.name, fallback="Material").lower(),
     )
 
 
 def _author_preview_surface(stage: Usd.Stage, material_path: Sdf.Path, props: _MaterialProperties) -> UsdShade.Material:
+    """
+    Author a UsdPreviewSurface network and expose PBR controls via material inputs.
+    This allows downstream edits on </World/Materials/...>.inputs:* and wires textures when available.
+    """
     material = UsdShade.Material.Define(stage, material_path)
     shader = UsdShade.Shader.Define(stage, material_path.AppendChild("PreviewSurface"))
     shader.CreateIdAttr("UsdPreviewSurface")
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.display_color))
-    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(props.opacity))
-    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.5)
+
+    # Material inputs (defaults)
+    in_base = material.CreateInput("baseColor", Sdf.ValueTypeNames.Color3f)
+    in_base.Set(Gf.Vec3f(*props.display_color))
+    in_opacity = material.CreateInput("opacity", Sdf.ValueTypeNames.Float)
+    in_opacity.Set(float(props.opacity))
+    in_metal = material.CreateInput("metallic", Sdf.ValueTypeNames.Float)
+    in_metal.Set(float(getattr(props, "metallic", 0.0)))
+    in_rough = material.CreateInput("roughness", Sdf.ValueTypeNames.Float)
+    in_rough.Set(float(getattr(props, "roughness", 0.5)))
+    in_emiss = None
     if props.emissive_color:
-        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*props.emissive_color))
-    shader_surface_output = shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
-    material_surface_output = material.CreateSurfaceOutput()
-    material_surface_output.ConnectToSource(shader_surface_output)
+        in_emiss = material.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f)
+        in_emiss.Set(Gf.Vec3f(*props.emissive_color))
+
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(in_base)
+    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).ConnectToSource(in_opacity)
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).ConnectToSource(in_metal)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).ConnectToSource(in_rough)
+    if in_emiss:
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(in_emiss)
+
+    st_reader: Optional[UsdShade.Shader] = None
+
+    def _ensure_st_reader() -> UsdShade.Shader:
+        nonlocal st_reader
+        if st_reader:
+            return st_reader
+        st_reader = UsdShade.Shader.Define(stage, material_path.AppendChild("Primvar_st"))
+        st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+        st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        return st_reader
+
+    def _connect_uv_texture(slot: str, asset_path: Optional[str], channel: str = "rgb") -> None:
+        if not asset_path:
+            return
+        tex = UsdShade.Shader.Define(stage, material_path.AppendChild(f"Tex_{slot}"))
+        tex.CreateIdAttr("UsdUVTexture")
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(str(asset_path)))
+        reader = _ensure_st_reader()
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader, "result")
+        target = material.GetInput(slot) or material.CreateInput(slot, Sdf.ValueTypeNames.Token)
+        target.ConnectToSource(tex, channel)
+
+    if getattr(props, "base_color_tex", None):
+        _connect_uv_texture("baseColor", props.base_color_tex, "rgb")
+    if getattr(props, "orm_tex", None):
+        _connect_uv_texture("roughness", props.orm_tex, "g")
+        _connect_uv_texture("metallic", props.orm_tex, "b")
+    if getattr(props, "normal_tex", None):
+        in_norm = material.GetInput("normal") or material.CreateInput("normal", Sdf.ValueTypeNames.Normal3f)
+        shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).ConnectToSource(in_norm)
+        tex = UsdShade.Shader.Define(stage, material_path.AppendChild("Tex_normal"))
+        tex.CreateIdAttr("UsdUVTexture")
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(str(props.normal_tex)))
+        reader = _ensure_st_reader()
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader, "result")
+        in_norm.ConnectToSource(tex, "rgb")
+
+    material.CreateSurfaceOutput().ConnectToSource(shader.CreateOutput("surface", Sdf.ValueTypeNames.Token))
+
     prim = material.GetPrim()
+    prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(Gf.Vec3f(*props.display_color))
+    prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(float(props.opacity))
     if props.name:
         text = str(props.name).strip()
         if text:
             prim.CreateAttribute("ifc:materialName", Sdf.ValueTypeNames.String, custom=True).Set(text)
             _register_material_name(stage, text, material_path)
-    prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(Gf.Vec3f(*props.display_color))
-    prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(float(props.opacity))
     return material
 
 
@@ -3454,6 +3540,17 @@ def _resolve_instance_materials(
             props = _material_properties_from_pbr(material_obj, label)
             if props is None:
                 continue
+            if LOG.isEnabledFor(logging.DEBUG):
+                LOG.debug(
+                    "Style group %s (style_id=%s) -> PBR name=%s base=%s opacity=%.4f roughness=%.4f metallic=%.4f",
+                    key,
+                    entry.get("style_id"),
+                    props.name,
+                    tuple(round(c, 4) for c in props.display_color),
+                    props.opacity,
+                    props.roughness,
+                    props.metallic,
+                )
             signature = _material_signature(props)
             material_path = material_library.signature_to_path.get(signature)
             if material_path:

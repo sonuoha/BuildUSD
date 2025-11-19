@@ -64,3 +64,4 @@ _tmp*
 container_material_debug.log
 patch/
 run_*.txt
+*.zip
