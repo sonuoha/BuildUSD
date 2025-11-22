@@ -173,16 +173,10 @@ def parse_args(
         ),
     )
     parser.add_argument(
-        "--enable-material-classification",
-        dest="enable_material_classification",
-        action="store_true",
-        help="Enable component-level material classification to reconcile IFC style colours.",
-    )
-    parser.add_argument(
         "--detail-mode",
         dest="detail_mode",
         action="store_true",
-        help="Forward the conversion through the OCC detail pipeline (enables high-detail remeshing).",
+        help="Forward the conversion through the OCC detail pipeline (iterator mesh remains base).",
     )
     parser.add_argument(
         "--detail-scope",

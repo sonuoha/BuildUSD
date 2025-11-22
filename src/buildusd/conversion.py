@@ -65,7 +65,6 @@ OPTIONS = ConversionOptions(
     enable_high_detail_remesh=False,
     anchor_mode=None,
     split_topology_by_material=False,
-    enable_material_classification=False,
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
 DEFAULT_USD_FORMAT = "usdc"
@@ -1502,13 +1501,11 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         options_override = replace(options_override, curve_width_rules=width_rules)
     if cli_anchor_mode is not None and getattr(options_override, "anchor_mode", None) != cli_anchor_mode:
         options_override = replace(options_override, anchor_mode=cli_anchor_mode)
-    if getattr(args, "enable_material_classification", False):
-        LOG.info("Material classification enabled: running component-based style reconciliation.")
-        options_override = replace(options_override, enable_material_classification=True)
-    if getattr(args, "detail_mode", False):
-        LOG.info("Detail mode enabled: forwarding to OCC high-detail conversion path.")
-        options_override = replace(options_override, enable_high_detail_remesh=True)
     detail_scope_arg = getattr(args, "detail_scope", None)
+    if getattr(args, "detail_mode", False):
+        LOG.info("Detail mode enabled: forwarding to OCC detail pipeline (iterator mesh for base geometry).")
+        if not detail_scope_arg:
+            detail_scope_arg = "all"
     if detail_scope_arg:
         LOG.info("Detail scope override: %s", detail_scope_arg)
         options_override = replace(options_override, detail_scope=detail_scope_arg)
