@@ -23,7 +23,7 @@ import os
 import math
 import re
 from typing import Dict, Optional, Union, Literal, List, Tuple, Any, TYPE_CHECKING, Iterable, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 
 from .ifc_visuals import (
@@ -194,6 +194,120 @@ def _normalize_geom_materials(materials, face_style_groups, ifc_file):
             style_lookup.setdefault(style_id, pbr)
     return converted
 
+
+def _pbr_signature(mat: Any) -> Optional[Tuple]:
+    """Stable signature for PBRMaterial comparison (rounded floats)."""
+    if not isinstance(mat, PBRMaterial):
+        return None
+    def _round3(val):
+        try:
+            return round(float(val), 6)
+        except Exception:
+            return None
+    base = tuple(_round3(c) for c in getattr(mat, "base_color", ()))
+    emissive = tuple(_round3(c) for c in getattr(mat, "emissive", ()))
+    return (
+        sanitize_name(getattr(mat, "name", None), fallback="Material"),
+        base,
+        _round3(getattr(mat, "opacity", None)),
+        _round3(getattr(mat, "metallic", None)),
+        _round3(getattr(mat, "roughness", None)),
+        emissive,
+        getattr(mat, "base_color_tex", None),
+        getattr(mat, "normal_tex", None),
+        getattr(mat, "orm_tex", None),
+    )
+
+
+def _face_group_map(groups: Dict[str, Dict[str, Any]]) -> Dict[Tuple[int, ...], Dict[str, Any]]:
+    """Index face-style groups by face tuple for comparison."""
+    mapping: Dict[Tuple[int, ...], Dict[str, Any]] = {}
+    for token, entry in (groups or {}).items():
+        faces = tuple(sorted(int(idx) for idx in entry.get("faces", []) if idx is not None))
+        if not faces:
+            continue
+        mapping[faces] = entry
+    return mapping
+
+
+def _variant_suffix(kind: str, group_map: Dict[Tuple[int, ...], Dict[str, Any]], materials: Any) -> str:
+    h = hashlib.sha1()
+    h.update(kind.encode("utf-8"))
+    for faces in sorted(group_map.keys()):
+        h.update(str(faces).encode("utf-8"))
+        h.update(str(_pbr_signature(group_map[faces].get("material"))).encode("utf-8"))
+    if not group_map:
+        for mat in materials or []:
+            h.update(str(_pbr_signature(mat)).encode("utf-8"))
+    return h.hexdigest()[:8]
+
+
+def _variantize_material(mat: Any, suffix: str) -> Any:
+    if not isinstance(mat, PBRMaterial):
+        return mat
+    name = sanitize_name(getattr(mat, "name", None), fallback="Material")
+    return replace(mat, name=sanitize_name(f"{name}_var_{suffix}", fallback=name))
+
+
+def _variantize_materials(materials: Any, suffix: str):
+    if not isinstance(materials, (list, tuple)):
+        return materials
+    return [ _variantize_material(mat, suffix) for mat in materials ]
+
+
+def _variantize_face_groups(groups: Dict[str, Dict[str, Any]], suffix: str) -> Dict[str, Dict[str, Any]]:
+    if not groups:
+        return {}
+    variant: Dict[str, Dict[str, Any]] = {}
+    for token, entry in groups.items():
+        new_entry = dict(entry)
+        if "material" in new_entry:
+            new_entry["material"] = _variantize_material(new_entry["material"], suffix)
+        variant[token] = new_entry
+    return variant
+
+
+def _instance_variant_kind(proto: Optional[MeshProto], materials: Any, face_style_groups: Dict[str, Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    """Compare instance material/style with prototype to decide variant kind and suffix."""
+    if proto is None:
+        return None, None
+    proto_groups = getattr(proto, "style_face_groups", None) or {}
+    inst_groups = face_style_groups or {}
+    proto_map = _face_group_map(proto_groups)
+    inst_map = _face_group_map(inst_groups)
+
+    if proto_map or inst_map:
+        if set(proto_map.keys()) != set(inst_map.keys()):
+            suffix = _variant_suffix("material", inst_map, materials)
+            return "material", suffix
+        style_diff = False
+        for faces, inst_entry in inst_map.items():
+            proto_entry = proto_map.get(faces)
+            if proto_entry is None:
+                style_diff = True
+                break
+            if _pbr_signature(inst_entry.get("material")) != _pbr_signature(proto_entry.get("material")):
+                style_diff = True
+                break
+        if style_diff:
+            suffix = _variant_suffix("style", inst_map, materials)
+            return "style", suffix
+
+    proto_materials = getattr(proto, "materials", None) or []
+    inst_materials = materials or []
+    if proto_materials or inst_materials:
+        if len(proto_materials) != len(inst_materials):
+            suffix = _variant_suffix("material", inst_map, inst_materials)
+            return "material", suffix
+        mat_diff = any(
+            _pbr_signature(im) != _pbr_signature(pm)
+            for im, pm in zip(inst_materials, proto_materials)
+        )
+        if mat_diff:
+            suffix = _variant_suffix("style", inst_map, inst_materials)
+            return "style", suffix
+
+    return None, None
 
 def _build_object_scope_detail_mesh(
     ctx: PrototypeBuildContext,
@@ -605,6 +719,7 @@ class ConversionOptions:
     detail_level: Literal["subshape", "face"] = "subshape"
     detail_object_ids: Tuple[int, ...] = tuple()
     detail_object_guids: Tuple[str, ...] = tuple()
+    enable_instance_material_variants: bool = True
 
 @dataclass(frozen=True)
 class PrototypeKey:
@@ -5506,6 +5621,19 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     detail_mesh_for_instance = prototype_bucket.detail_mesh
         else:
             detail_mesh_for_instance = detail_mesh_data
+
+        if (
+            getattr(options, "enable_instance_material_variants", True)
+            and primary_key is not None
+            and primary_key.kind in ("repmap", "repmap_detail")
+        ):
+            proto = repmaps.get(primary_key.identifier)
+            variant_kind, variant_suffix = _instance_variant_kind(proto, materials, face_style_groups)
+            if variant_suffix:
+                materials = _variantize_materials(materials, variant_suffix)
+                face_style_groups = _variantize_face_groups(face_style_groups, variant_suffix)
+                if style_material is not None:
+                    style_material = _variantize_material(style_material, variant_suffix)
 
         if primary_key is None and instance_mesh is None:
             continue
