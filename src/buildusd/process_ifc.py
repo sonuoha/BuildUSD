@@ -650,6 +650,8 @@ def stable_mesh_hash(verts: Any, faces: Any) -> str:
 def sanitize_name(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
     """Return a USD-friendly identifier derived from IFC names."""
     base = str(raw_name or fallback or "Unnamed")
+    if base.strip().lower() == "undefined" or not base.strip():
+        base = str(fallback or "Material")
     name = re.sub(r"[^A-Za-z0-9_]", "_", base)
     name = re.sub(r"_+", "_", name).strip("_")
     if not name: name = "Unnamed"
@@ -5147,7 +5149,9 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             map_conversion=extract_map_conversion(ifc_file),
         )
 
-    while iterator.next():
+    while True:
+        if not iterator.next():
+            break
         shape = iterator.get()
         if shape is None:
             continue
