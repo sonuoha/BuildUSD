@@ -1725,7 +1725,6 @@ def _ensure_material_subsets(
     points: Optional[Sequence[Tuple[float, float, float]]] = None,
     face_vertex_counts: Optional[Sequence[int]] = None,
     face_vertex_indices: Optional[Sequence[int]] = None,
-    use_component_classification: bool = False,
     subset_token_map: Optional[Dict[str, str]] = None,
 ) -> bool:
     prim = mesh.GetPrim()
@@ -1744,391 +1743,101 @@ def _ensure_material_subsets(
         pass
 
     created_subsets = False
-    unique_material_ids: Set[int] = set()
-    if material_ids:
-        for mid in material_ids:
-            try:
-                mid_int = int(mid)
-            except Exception:
-                continue
-            if mid_int >= 0:
-                unique_material_ids.add(mid_int)
-    if use_component_classification and len(unique_material_ids) <= 1:
-        use_component_classification = False
     stats: List[Tuple[str, int]] = []
     token_to_style_key: Dict[str, str] = {}
+    style_faces_handled: Set[int] = set()
 
-    if use_component_classification and material_ids and len(material_ids) == face_count and style_groups:
-        # --- EARLY BAILOUT: keep strong IFC style when it already dominates the mesh ---
-        # Compute coverage of each style token across all faces; if the most saturated
-        # style already covers >= 60% of faces, don't run component classification.
-        def _style_color(material_obj):
-            return _color_from_material(material_obj) if material_obj is not None else None
-
-        total_faces = float(face_count)
-        cover_by_token: Dict[str, int] = {}
-        sat_by_token: Dict[str, float] = {}
-        for key, entry in (style_groups or {}).items():
-            faces = entry.get("faces") or []
-            token = key
-            cover_by_token[token] = len([i for i in faces if 0 <= int(i) < face_count])
-            sat_by_token[token] = _color_saturation(_style_color(entry.get("material")))
-
-        # pick the most saturated style that also has the best coverage
-        primary_token = None
-        primary_sat = -1.0
-        for tok, cov in cover_by_token.items():
-            sat = sat_by_token.get(tok, 0.0)
-            if sat > primary_sat:
-                primary_sat = sat
-                primary_token = tok
-
-        if primary_token is not None:
-            coverage_frac = (cover_by_token.get(primary_token, 0) / max(total_faces, 1.0))
-            if primary_sat >= 0.18 and coverage_frac >= 0.60:
-                # Keep original style subsets: author style-based subsets directly below
-                LOG.debug("Classification skipped for %s: dominant IFC style=%s coverage=%.2f sat=%.2f",
-                          mesh.GetPath(), primary_token, coverage_frac, primary_sat)
-                created_subsets = False
-                # Author the style subsets exactly as provided, then return
-                for key, entry in style_groups.items():
-                    raw_faces = entry.get("faces") or []
-                    valid_faces = []
-                    for value in raw_faces:
-                        try:
-                            face_index = int(value)
-                        except Exception:
-                            continue
-                        if 0 <= face_index < face_count:
-                            valid_faces.append(face_index)
-                    if not valid_faces:
-                        continue
-                    subset_token = _subset_token_for_material(key)
-                    token_to_style_key[subset_token] = key
-                    if subset_token_map is not None:
-                        subset_token_map[key] = subset_token
-                    subset_path = mesh.GetPath().AppendChild(subset_token)
-                    subset = UsdGeom.Subset.Define(stage, subset_path)
-                    try:
-                        UsdGeom.Subset.SetElementType(subset, element_token)
-                    except Exception:
-                        try:
-                            subset.CreateElementTypeAttr().Set(element_token)
-                        except AttributeError:
-                            subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
-                    (subset.GetIndicesAttr() or subset.CreateIndicesAttr()).Set(Vt.IntArray(valid_faces))
-                    prim = subset.GetPrim()
-                    material_name = _material_name_from_style_entry(entry, fallback=str(key))
-                    _set_subset_material_name(prim, material_name)
-                    try:
-                        subset.CreateFamilyNameAttr().Set(family_name)
-                    except Exception:
-                        subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
-                    created_subsets = True
-                if created_subsets:
-                    return True  # family already validated later
-        LOG.info(
-            "Applying component-based material classification for %s (faces=%d).",
-            mesh.GetPath(),
-            face_count,
-        )
-        style_tokens: Dict[str, str] = {}
-        for key in style_groups:
-            token = _subset_token_for_material(key)
-            style_tokens[key] = token
-            token_to_style_key[token] = key
+    if style_groups:
+        for key, entry in style_groups.items():
+            raw_faces = entry.get("faces") or []
+            if not raw_faces:
+                continue
+            valid_faces: List[int] = []
+            for value in raw_faces:
+                try:
+                    face_index = int(value)
+                except Exception:
+                    continue
+                if 0 <= face_index < face_count:
+                    valid_faces.append(face_index)
+            if not valid_faces:
+                continue
+            subset_token = _subset_token_for_material(key)
+            token_to_style_key[subset_token] = key
             if subset_token_map is not None:
-                subset_token_map[key] = token
-
-        face_style_map, cluster_lookup, cluster_dir_map = _resolve_component_styles(
-            material_ids,
-            style_groups,
-            style_tokens,
-            points=points,
-            face_vertex_counts=face_vertex_counts,
-            face_vertex_indices=face_vertex_indices,
-            materials=materials,
-            cluster_styles=True,
-        )
-        if face_style_map:
-            assigned: Set[int] = set()
-            for faces in face_style_map.values():
-                assigned.update(faces)
-            if len(assigned) < face_count:
-                leftover_by_material: Dict[int, List[int]] = defaultdict(list)
-                for face_index, material_id in enumerate(material_ids):
-                    if face_index not in assigned:
-                        leftover_by_material[int(material_id)].append(face_index)
-                for material_id, faces in leftover_by_material.items():
-                    token = _subset_token_for_material(_material_identifier_for_index(material_id, materials))
-                    if token in face_style_map:
-                        face_style_map[token].extend(faces)
-                    else:
-                        face_style_map[token] = list(faces)
-
-            for token, faces in face_style_map.items():
-                if not faces:
-                    continue
-                subset_path = mesh.GetPath().AppendChild(token)
-                subset = UsdGeom.Subset.Define(stage, subset_path)
+                subset_token_map[key] = subset_token
+            subset_path = mesh.GetPath().AppendChild(subset_token)
+            subset = UsdGeom.Subset.Define(stage, subset_path)
+            try:
+                UsdGeom.Subset.SetElementType(subset, element_token)
+            except Exception:
                 try:
-                    UsdGeom.Subset.SetElementType(subset, element_token)
-                except Exception:
-                    try:
-                        subset.CreateElementTypeAttr().Set(element_token)
-                    except AttributeError:
-                        subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
-                indices_attr = subset.GetIndicesAttr()
-                if not indices_attr:
-                    indices_attr = subset.CreateIndicesAttr()
-                indices_attr.Set(Vt.IntArray([int(f) for f in faces]))
-                subset_prim = subset.GetPrim()
-                # Traceability: style token and base material ids on these faces
-                base_token = cluster_lookup.get(token)  # original style base when clustered
-                resolved_token = base_token or token
-                style_key = token_to_style_key.get(resolved_token)
-                entry = style_groups.get(style_key) if style_key and style_groups else None
-                material_name = _material_name_from_style_entry(entry, fallback=str(style_key or resolved_token))
-                _set_subset_material_name(subset_prim, material_name)
-                subset_prim.CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(resolved_token)
-                if material_ids:
-                    mids = sorted({int(material_ids[i]) for i in faces if 0 <= int(i) < face_count})
-                    if len(mids) == 1:
-                        subset_prim.CreateAttribute("ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int).Set(mids[0])
-                    elif mids:
-                        subset_prim.CreateAttribute("ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(mids))
-                base_token = cluster_lookup.get(token)
-                if base_token:
-                    subset_prim.CreateAttribute("ifc:baseStyleToken", Sdf.ValueTypeNames.String).Set(base_token)
-                direction_label = cluster_dir_map.get(token)
-                if direction_label:
-                    subset_prim.CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(direction_label)
+                    subset.CreateElementTypeAttr().Set(element_token)
+                except AttributeError:
+                    subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+            indices_attr = subset.GetIndicesAttr()
+            if not indices_attr:
+                indices_attr = subset.CreateIndicesAttr()
+            indices_attr.Set(Vt.IntArray(valid_faces))
+            prim = subset.GetPrim()
+            material_name = _material_name_from_style_entry(entry, fallback=str(key))
+            _set_subset_material_name(prim, material_name)
+            prim.CreateAttribute("ifc:sourceStyleKey", Sdf.ValueTypeNames.String).Set(str(key))
+            prim.CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(subset_token)
+            if material_ids:
+                mids = sorted({int(material_ids[i]) for i in valid_faces if 0 <= int(i) < face_count})
+                if len(mids) == 1:
+                    prim.CreateAttribute("ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int).Set(mids[0])
+                elif mids:
+                    prim.CreateAttribute("ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(mids))
+            try:
+                subset.CreateFamilyNameAttr().Set(family_name)
+            except Exception:
+                subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+            created_subsets = True
+            stats.append((str(subset_path), len(valid_faces)))
+            for face_int in valid_faces:
+                style_faces_handled.add(face_int)
+
+    if material_ids and len(material_ids) == face_count:
+        indices_by_material: Dict[int, List[int]] = defaultdict(list)
+        for face_index, material_index in enumerate(material_ids):
+            if face_index in style_faces_handled:
+                continue
+            indices_by_material[int(material_index)].append(int(face_index))
+        if not style_groups and len(indices_by_material) == 1:
+            # Uniform material with no style information: rely on the mesh-level
+            # binding instead of authoring a redundant GeomSubset.
+            indices_by_material.clear()
+
+        for material_index, face_indices in sorted(indices_by_material.items()):
+            if not face_indices:
+                continue
+            subset_token = _subset_token_for_material(_material_identifier_for_index(material_index, materials))
+            subset_path = mesh.GetPath().AppendChild(subset_token)
+            subset = UsdGeom.Subset.Define(stage, subset_path)
+            try:
+                UsdGeom.Subset.SetElementType(subset, element_token)
+            except Exception:
                 try:
-                    subset.CreateFamilyNameAttr().Set(family_name)
-                except Exception:
-                    subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
-                created_subsets = True
-                stats.append((str(subset_path), len(faces)))
-
-    if not created_subsets:
-        # Legacy/simple behaviour.
-        style_faces_handled: Set[int] = set()
-        if style_groups:
-            for key, entry in style_groups.items():
-                raw_faces = entry.get("faces") or []
-                if not raw_faces:
-                    continue
-                valid_faces: List[int] = []
-                for value in raw_faces:
-                    try:
-                        face_index = int(value)
-                    except Exception:
-                        continue
-                    if 0 <= face_index < face_count:
-                        valid_faces.append(face_index)
-                if not valid_faces:
-                    continue
-                subset_token = _subset_token_for_material(key)
-                token_to_style_key[subset_token] = key
-                if subset_token_map is not None:
-                    subset_token_map[key] = subset_token
-                subset_path = mesh.GetPath().AppendChild(subset_token)
-                subset = UsdGeom.Subset.Define(stage, subset_path)
-                try:
-                    UsdGeom.Subset.SetElementType(subset, element_token)
-                except Exception:
-                    try:
-                        subset.CreateElementTypeAttr().Set(element_token)
-                    except AttributeError:
-                        subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
-                indices_attr = subset.GetIndicesAttr()
-                if not indices_attr:
-                    indices_attr = subset.CreateIndicesAttr()
-                indices_attr.Set(Vt.IntArray(valid_faces))
-                # Traceability for plain style subsets
-                prim = subset.GetPrim()
-                material_name = _material_name_from_style_entry(entry, fallback=str(key))
-                _set_subset_material_name(prim, material_name)
-                prim.CreateAttribute("ifc:sourceStyleKey", Sdf.ValueTypeNames.String).Set(str(key))
-                prim.CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(subset_token)
-                if material_ids:
-                    mids = sorted({int(material_ids[i]) for i in valid_faces if 0 <= int(i) < face_count})
-                    if len(mids) == 1:
-                        prim.CreateAttribute("ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int).Set(mids[0])
-                    elif mids:
-                        prim.CreateAttribute("ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(mids))
-                try:
-                    subset.CreateFamilyNameAttr().Set(family_name)
-                except Exception:
-                    subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
-                created_subsets = True
-                stats.append((str(subset_path), len(valid_faces)))
-                for face_int in valid_faces:
-                    style_faces_handled.add(face_int)
-
-        if material_ids and len(material_ids) == face_count:
-            indices_by_material: Dict[int, List[int]] = defaultdict(list)
-            for face_index, material_index in enumerate(material_ids):
-                if face_index in style_faces_handled:
-                    continue
-                indices_by_material[int(material_index)].append(int(face_index))
-            if not style_groups and len(indices_by_material) == 1:
-                # Uniform material with no style information: rely on the mesh-level
-                # binding instead of authoring a redundant GeomSubset.
-                indices_by_material.clear()
-
-            authored_geo = False
-            if use_component_classification:
-                face_vertices_data: Optional[List[List[int]]] = None
-                if (
-                    points is not None
-                    and face_vertex_counts is not None
-                    and face_vertex_indices is not None
-                    and len(face_vertex_counts) == face_count
-                ):
-                    try:
-                        face_vertices_data, _ = _compute_face_components(face_vertex_counts, face_vertex_indices)
-                    except Exception:
-                        face_vertices_data = None
-
-                if face_vertices_data is not None:
-                    PLANE_D_TOL = 0.005
-                    N_DOT_TOL = 0.98
-
-                    def _direction_from_normal(vec: np.ndarray) -> str:
-                        if vec.size < 3:
-                            return "NA"
-                        axis = int(np.argmax(np.abs(vec)))
-                        label_axis = ("X", "Y", "Z")[axis]
-                        positive = vec[axis] >= 0.0
-                        if label_axis == "Z":
-                            return "TOP" if positive else "BOTTOM"
-                        return f"POS_{label_axis}" if positive else f"NEG_{label_axis}"
-
-                    def _sanitize_direction_label_sec(label: Optional[str]) -> str:
-                        if not label:
-                            return "NA"
-                        return sanitize_name(label, fallback="NA")
-
-                    try:
-                        _, local_adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
-                    except Exception:
-                        local_adjacency = None
-
-                    def _component_faces(seed: int, mid: int, visited: set[int]) -> List[int]:
-                        if local_adjacency is None:
-                            return [seed]
-                        stack = [seed]
-                        comp: List[int] = []
-                        while stack:
-                            f = stack.pop()
-                            if f in visited:
-                                continue
-                            if int(material_ids[f]) != mid:
-                                continue
-                            visited.add(f)
-                            comp.append(f)
-                            for nb in local_adjacency[f]:
-                                if nb not in visited and int(material_ids[nb]) == mid:
-                                    stack.append(nb)
-                        return comp
-
-                    authored_groups: List[Tuple[int, int, List[int]]] = []
-                    for mid in sorted(set(int(m) for m in material_ids if m is not None and m >= 0)):
-                        mat_faces = [
-                            i for i, m in enumerate(material_ids)
-                            if int(m) == mid and i not in style_faces_handled
-                        ]
-                        if not mat_faces:
-                            continue
-                        visited_faces: set[int] = set()
-                        components: List[List[int]] = []
-                        for fid in mat_faces:
-                            if fid in visited_faces:
-                                continue
-                            comp = _component_faces(fid, mid, visited_faces)
-                            if comp:
-                                components.append(comp)
-                        cluster_counter = 0
-                        for comp in components:
-                            clusters: List[Tuple[np.ndarray, float, List[int]]] = []
-                            for f in comp:
-                                verts = face_vertices_data[f]
-                                _, normal = _face_area_and_normal(points, verts)
-                                n = np.asarray(normal, dtype=float)
-                                ln = np.linalg.norm(n)
-                                if ln < 1e-9:
-                                    continue
-                                n /= ln
-                                cx, cy, cz = _face_centroid(points, verts)
-                                d = float(np.dot(n, np.asarray([cx, cy, cz], dtype=float)))
-                                placed = False
-                                for ref_n, ref_d, lst in clusters:
-                                    if abs(np.dot(ref_n, n)) >= N_DOT_TOL and abs(ref_d - d) <= PLANE_D_TOL:
-                                        lst.append(f)
-                                        placed = True
-                                        break
-                                if not placed:
-                                    clusters.append([n, d, [f]])
-                            for ref_n, _, flist in clusters:
-                                if not flist:
-                                    continue
-                                dir_label_raw = _direction_from_normal(ref_n)
-                                dir_label = _sanitize_direction_label_sec(dir_label_raw)
-                                authored_groups.append((mid, cluster_counter, dir_label, flist))
-                                cluster_counter += 1
-
-                    if authored_groups:
-                        for mid, ci, dir_label, faces in authored_groups:
-                            base_token = _subset_token_for_material(_material_identifier_for_index(mid, materials))
-                            subset_name = f"{base_token}_C{ci}"
-                            if dir_label:
-                                subset_name = f"{subset_name}_{dir_label}"
-                            subset_path = mesh.GetPath().AppendChild(subset_name)
-                            subset = UsdGeom.Subset.Define(stage, subset_path)
-                            subset.CreateFamilyNameAttr().Set(family_name)
-                            subset.CreateElementTypeAttr().Set(element_token)
-                            subset.CreateIndicesAttr(Vt.IntArray([int(f) for f in faces]))
-                            subset_prim = subset.GetPrim()
-                            material_name = _material_name_for_index(mid, materials)
-                            _set_subset_material_name(subset_prim, material_name)
-                            subset_prim.CreateAttribute("ifc:clusterDirection", Sdf.ValueTypeNames.String).Set(dir_label or "NA")
-                            subset_prim.CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(mid))
-                            created_subsets = True
-                            stats.append((str(subset_path), len(faces)))
-                        authored_geo = True
-
-            if authored_geo:
-                indices_by_material.clear()
-
-            for material_index, face_indices in sorted(indices_by_material.items()):
-                if not face_indices:
-                    continue
-                subset_token = _subset_token_for_material(_material_identifier_for_index(material_index, materials))
-                subset_path = mesh.GetPath().AppendChild(subset_token)
-                subset = UsdGeom.Subset.Define(stage, subset_path)
-                try:
-                    UsdGeom.Subset.SetElementType(subset, element_token)
-                except Exception:
-                    try:
-                        subset.CreateElementTypeAttr().Set(element_token)
-                    except AttributeError:
-                        subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
-                indices_attr = subset.GetIndicesAttr()
-                if not indices_attr:
-                    indices_attr = subset.CreateIndicesAttr()
-                indices_attr.Set(Vt.IntArray(face_indices))
-                # Traceability for numeric subsets
-                subset_prim = subset.GetPrim()
-                material_name = _material_name_for_index(material_index, materials)
-                _set_subset_material_name(subset_prim, material_name)
-                subset_prim.CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(material_index))
-                try:
-                    subset.CreateFamilyNameAttr().Set(family_name)
-                except Exception:
-                    subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
-                created_subsets = True
-                stats.append((str(subset_path), len(face_indices)))
+                    subset.CreateElementTypeAttr().Set(element_token)
+                except AttributeError:
+                    subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+            indices_attr = subset.GetIndicesAttr()
+            if not indices_attr:
+                indices_attr = subset.CreateIndicesAttr()
+            indices_attr.Set(Vt.IntArray(face_indices))
+            # Traceability for numeric subsets
+            subset_prim = subset.GetPrim()
+            material_name = _material_name_for_index(material_index, materials)
+            _set_subset_material_name(subset_prim, material_name)
+            subset_prim.CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(material_index))
+            try:
+                subset.CreateFamilyNameAttr().Set(family_name)
+            except Exception:
+                subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+            created_subsets = True
+            stats.append((str(subset_path), len(face_indices)))
 
     if LOG.isEnabledFor(logging.DEBUG) and stats:
         total_faces = sum(count for _, count in stats)
@@ -2147,7 +1856,7 @@ def _ensure_material_subsets(
 
 def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
                    material_ids=None, style_groups=None, materials=None, stage_meters_per_unit=1.0,
-                   scale_matrix_translation=False, use_component_classification=False):
+                   scale_matrix_translation=False):
     """Author a Mesh prim beneath ``parent_path`` with the supplied data."""
     mesh_path = Sdf.Path(parent_path).AppendChild(mesh_name)
     mesh = UsdGeom.Mesh.Define(stage, mesh_path)
@@ -2225,7 +1934,6 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
             points=payload_points,
             face_vertex_counts=payload_counts,
             face_vertex_indices=payload_indices,
-            use_component_classification=use_component_classification,
             subset_token_map=subset_token_map,
         )
     else:
@@ -2238,7 +1946,6 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
             points=payload_points,
             face_vertex_counts=payload_counts,
             face_vertex_indices=payload_indices,
-            use_component_classification=use_component_classification,
             subset_token_map=subset_token_map,
         )
     if subset_token_map and style_groups:
@@ -2505,7 +2212,6 @@ def author_prototype_layer(
     proto_root_detail = Sdf.Path("/World/__PrototypesDetail")
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
     used_names: Dict[str, int] = {}
-    use_component_classification = getattr(options, "enable_material_classification", False)
     detail_scope = getattr(options, "detail_scope", "none") or "none"
     detail_mode_enabled = bool(
         getattr(options, "enable_high_detail_remesh", False) or detail_scope in ("all", "object")
@@ -2573,7 +2279,6 @@ def author_prototype_layer(
                     style_groups=full_style_groups,
                     materials=full_materials,
                     stage_meters_per_unit=stage_meters_per_unit,
-                    use_component_classification=use_component_classification,
                 )
 
     return proto_layer, proto_paths
@@ -3917,7 +3622,6 @@ def author_instance_layer(
     hierarchy_nodes_by_step: Dict[int, Sdf.Path] = {}
     hierarchy_nodes_by_label: Dict[Tuple[Sdf.Path, str], Sdf.Path] = {}
 
-    use_component_classification = getattr(options, "enable_material_classification", False)
     detail_scope = getattr(options, "detail_scope", "none") or "none"
     detail_mode_enabled = bool(
         getattr(options, "enable_high_detail_remesh", False) or detail_scope in ("all", "object")
@@ -4039,7 +3743,6 @@ def author_instance_layer(
                     materials=list(getattr(record, "materials", []) or []),
                     stage_meters_per_unit=stage_meters_per_unit,
                     style_groups=style_groups,
-                    use_component_classification=use_component_classification,
                 )
                 if resolved_materials:
                     _apply_material_bindings_to_prim(
@@ -4098,25 +3801,12 @@ def author_instance_layer(
             except Exception:
                 face_count_for_inst = 0
             if face_count_for_inst > 0 and (style_groups or material_ids):
-                pts = None; fvc = None; fvi = None
-                try:
-                    fvc = list(counts_val)
-                    if use_component_classification:
-                        fvi = list(mesh_geom.GetFaceVertexIndicesAttr().Get() or [])
-                        pvals = mesh_geom.GetPointsAttr().Get() or []
-                        pts = [(float(v[0]), float(v[1]), float(v[2])) for v in pvals]
-                except Exception:
-                    pass
                 _ensure_material_subsets(
                     mesh_geom,
                     material_ids if material_ids else [],
                     face_count_for_inst,
                     style_groups=style_groups if style_groups else {},
                     materials=list(getattr(record, "materials", []) or []),
-                    points=pts,
-                    face_vertex_counts=fvc,
-                    face_vertex_indices=fvi,
-                    use_component_classification=use_component_classification,
                 )
 
             if resolved_materials:

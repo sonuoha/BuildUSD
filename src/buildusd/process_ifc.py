@@ -709,12 +709,11 @@ class ConversionOptions:
     enable_instancing: bool = True
     enable_hash_dedup: bool = True
     convert_metadata: bool = True
-    enable_high_detail_remesh: bool = True
+    enable_high_detail_remesh: bool = False
     manifest: Optional['ConversionManifest'] = None
     curve_width_rules: Tuple[CurveWidthRule, ...] = tuple()
     anchor_mode: Optional[Literal["local", "site"]] = None
     split_topology_by_material: bool = False
-    enable_material_classification: bool = False
     detail_scope: Literal["none", "all", "object"] = "none"
     detail_level: Literal["subshape", "face"] = "subshape"
     detail_object_ids: Tuple[int, ...] = tuple()
@@ -835,7 +834,7 @@ class PrototypeBuildContext:
 
         detail_mode_requested = detail_scope == "all"
         user_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
-        enable_high_detail = user_high_detail or detail_mode_requested
+        enable_high_detail = user_high_detail
         if not enable_high_detail:
             log.info("High-detail remeshing is DISABLED; using iterator tessellation only.")
         if detail_scope == "object":
@@ -864,11 +863,7 @@ class PrototypeBuildContext:
                 enable_high_detail = False
 
         detail_mesh_cache: Dict[int, "OCCDetailMesh"] = {}
-        if (
-            enable_high_detail
-            and detail_scope == "all"
-            and occ_detail.is_available()
-        ):
+        if detail_scope == "all" and occ_detail.is_available():
             detail_prepass_settings = high_detail_settings or settings
             detail_mesh_cache = occ_detail.precompute_detail_meshes(
                 ifc_file,
@@ -5379,7 +5374,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     needs_high_detail = True
                     detail_reasons.extend(proxy_reasons)
 
-            if needs_high_detail and high_detail_settings is not None:
+            if enable_high_detail and needs_high_detail and high_detail_settings is not None:
                 remeshed = _remesh_product_geometry(product, high_detail_settings)
                 if remeshed is not None:
                     high_geom = getattr(remeshed, "geometry", remeshed)
