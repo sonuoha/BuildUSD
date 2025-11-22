@@ -16,6 +16,7 @@ __all__ = [
     "build_material_for_product",
     "extract_face_style_groups",
     "extract_uvs_for_product",
+    "pbr_from_surface_style",
 ]
 
 LOG = logging.getLogger(__name__)
@@ -125,14 +126,17 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
             if styles:
                 return styles
 
-    # D: IfcShapeAspect
+    # D: IfcShapeAspect (walk standard ShapeRepresentations first; keep older Representation attr as fallback)
     for aspect in getattr(product, "HasShapeAspects", []):
-        for mdr in getattr(aspect, "Representation", []):
-            for rep in getattr(mdr, "Representations", []):
-                for item in getattr(rep, "Items", []):
-                    for styled in getattr(item, "StyledByItem", []):
-                        for psa in styled.Styles:
-                            styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+        aspect_reps = list(getattr(aspect, "ShapeRepresentations", []) or [])
+        legacy_repr = getattr(aspect, "Representation", None)
+        if legacy_repr is not None:
+            aspect_reps.extend(getattr(legacy_repr, "Representations", []) or [])
+        for rep in aspect_reps:
+            for item in getattr(rep, "Items", []):
+                for styled in getattr(item, "StyledByItem", []):
+                    for psa in getattr(styled, "Styles", []) or []:
+                        styles.extend([s for s in getattr(psa, "Styles", []) or [] if s.is_a("IfcSurfaceStyle")])
         if styles:
             return styles
 
@@ -197,6 +201,68 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
     return styles
 
 
+# Map material constituent names to styles (used to correlate with shape aspect names).
+def _constituent_styles_by_name(product: ifcopenshell.entity_instance) -> Dict[str, List[ifcopenshell.entity_instance]]:
+    mapping: Dict[str, List[ifcopenshell.entity_instance]] = {}
+    visited: Set[int] = set()
+
+    def record(name: Optional[str], source: Optional[ifcopenshell.entity_instance]):
+        if not name or source is None:
+            return
+        key = _sanitize_style_token(name)
+        styles = _styles_from_material_definition(source)
+        if styles:
+            mapping.setdefault(key, []).extend(styles)
+
+    def collect(entity):
+        if entity is None:
+            return
+        try:
+            ent_id = int(entity.id())
+        except Exception:
+            ent_id = id(entity)
+        if ent_id in visited:
+            return
+        visited.add(ent_id)
+
+        if entity.is_a("IfcMaterialConstituentSet"):
+            for c in getattr(entity, "MaterialConstituents", []) or []:
+                cname = getattr(c, "Name", None) or getattr(getattr(c, "Material", None), "Name", None)
+                record(cname, getattr(c, "Material", None) or c)
+                collect(c)
+        elif entity.is_a("IfcMaterialConstituent"):
+            cname = getattr(entity, "Name", None) or getattr(getattr(entity, "Material", None), "Name", None)
+            record(cname, getattr(entity, "Material", None) or entity)
+        elif entity.is_a("IfcMaterial"):
+            record(getattr(entity, "Name", None), entity)
+        elif entity.is_a("IfcMaterialLayerSetUsage"):
+            collect(entity.ForLayerSet)
+        elif entity.is_a("IfcMaterialProfileSetUsage"):
+            collect(entity.ForProfileSet)
+
+        # Follow associated material definitions.
+        for child_attr in ("HasAssociations", "ForLayerSet", "ForProfileSet", "MaterialConstituents"):
+            child = getattr(entity, child_attr, None)
+            if isinstance(child, (list, tuple)):
+                for sub in child:
+                    collect(sub)
+            elif child is not None:
+                collect(child)
+
+    for rel in getattr(product, "HasAssociations", []) or []:
+        if rel.is_a("IfcRelAssociatesMaterial"):
+            collect(rel.RelatingMaterial)
+
+    # Type-level fallback
+    typ = ifcopenshell.util.element.get_type(product)
+    if typ:
+        for rel in getattr(typ, "HasAssociations", []) or []:
+            if rel.is_a("IfcRelAssociatesMaterial"):
+                collect(rel.RelatingMaterial)
+
+    return mapping
+
+
 # === PER-FACE MAPPING ===
 
 def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_instance) -> Dict[int, List[ifcopenshell.entity_instance]]:
@@ -204,12 +270,21 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
         return {}
 
     shape_styles: Dict[int, List[ifcopenshell.entity_instance]] = {}
+    aspect_name_by_item = _shape_aspect_name_map(product)
+    constituent_styles = _constituent_styles_by_name(product) if aspect_name_by_item else {}
 
     # Collect styles from the explicit representation tree.
     rep = product.Representation
     for shape_rep in getattr(rep, "Representations", []) or []:
         for item in getattr(shape_rep, "Items", []) or []:
             _collect_styled_items(item, shape_styles)
+            # If no explicit style, try matching shape aspect name to material constituent.
+            if id(item) not in shape_styles and aspect_name_by_item and constituent_styles:
+                aspect_name = aspect_name_by_item.get(id(item))
+                if aspect_name:
+                    styles = constituent_styles.get(aspect_name)
+                    if styles:
+                        shape_styles[id(item)] = styles
 
     # Merge in any styles provided via IfcStyledItem associations on the product.
     for styled in getattr(product, "StyledByItem", []) or []:
@@ -235,6 +310,22 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
                     shape_styles.setdefault(id(item), []).extend(styles)
 
     return shape_styles
+
+
+def _shape_aspect_name_map(product: ifcopenshell.entity_instance) -> Dict[int, str]:
+    """Return mapping from representation item id() to a sanitized shape-aspect label."""
+    mapping: Dict[int, str] = {}
+    aspects = getattr(product, "HasShapeAspects", None) or []
+    for aspect in aspects:
+        raw_name = getattr(aspect, "Name", None) or getattr(aspect, "Description", None)
+        if not raw_name:
+            continue
+        aspect_name = _sanitize_style_token(raw_name)
+        reps = getattr(aspect, "ShapeRepresentations", None) or []
+        for rep in reps:
+            for item in getattr(rep, "Items", None) or []:
+                mapping[id(item)] = aspect_name
+    return mapping
 
 
 def _collect_styled_items(item, mapping):
@@ -309,6 +400,17 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item) -
         resolved_style = _resolve_surface_style_entity(style) or style
         friendly_name = _friendly_style_name(resolved_style, shape_name_by_item.get(item_id))
         mat = _to_pbr(resolved_style, model=model, preferred_name=friendly_name)
+        if LOG.isEnabledFor(logging.DEBUG):
+            LOG.debug(
+                "Face style item=%s style=%s friendly=%s base=%s opacity=%.4f metallic=%.4f roughness=%.4f",
+                getattr(item, "GlobalId", None) or getattr(item, "id", None) or hex(item_id),
+                getattr(resolved_style, "id", lambda: None)(),
+                friendly_name,
+                tuple(round(c, 4) for c in mat.base_color),
+                mat.opacity,
+                getattr(mat, "metallic", 0.0),
+                getattr(mat, "roughness", 0.5),
+            )
         try:
             style_id = int(resolved_style.id())
         except Exception:
@@ -511,6 +613,16 @@ def _to_pbr(
     return pbr
 
 
+def pbr_from_surface_style(
+    style: ifcopenshell.entity_instance,
+    model: Optional[ifcopenshell.file] = None,
+    *,
+    preferred_name: Optional[str] = None,
+) -> PBRMaterial:
+    """Public wrapper for converting an IfcSurfaceStyle (or related) into PBRMaterial."""
+    return _to_pbr(style, model=model, preferred_name=preferred_name)
+
+
 def _log_style_resolution(style, rendering, shading, pbr) -> None:
     root_logger = logging.getLogger()
     logger: logging.Logger
@@ -644,14 +756,6 @@ def _as_rgb(col) -> Tuple[float, float, float]:
     g = float(getattr(col, "Green", 0.8))
     b = float(getattr(col, "Blue", 0.8))
     return (max(0.0, min(1.0, r)), max(0.0, min(1.0, g)), max(0.0, min(1.0, b)))
-
-
-def _color_from_texture(tex) -> Optional[Tuple[float, float, float]]:
-    for attr in ("DiffuseColour", "SpecularColour", "ReflectionColour", "TransmissionColour", "Colour"):
-        val = getattr(tex, attr, None)
-        if color := _color_or_factor(val):
-            return color
-    return None
 
 
 def _color_or_factor(val) -> Optional[Tuple[float, float, float]]:
