@@ -5194,64 +5194,6 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         face_style_groups = extract_face_style_groups(product) or {}
         if materials:
             materials = _normalize_geom_materials(materials, face_style_groups, ifc_file)
-        # If the iterator did not supply useful material colours, fall back to the resolved style material.
-        if style_material:
-            def _is_default_gray(mat: Any) -> bool:
-                if not isinstance(mat, PBRMaterial):
-                    return False
-                bc = getattr(mat, "base_color", None)
-                if not bc:
-                    return False
-                try:
-                    return (
-                        all(abs(float(c) - 0.8) <= 1e-3 for c in bc)
-                        and not mat.base_color_tex
-                        and abs(float(getattr(mat, "roughness", 0.5)) - 0.5) <= 1e-3
-                        and abs(float(getattr(mat, "metallic", 0.0)) - 0.0) <= 1e-3
-                    )
-                except Exception:
-                    return False
-            def _single_material_id(ids: list[int]) -> bool:
-                if not ids:
-                    return True
-                try:
-                    vals = {int(v) for v in ids}
-                    return len(vals) <= 1
-                except Exception:
-                    return False
-            def _color_delta(a: Any, b: Any, tol: float = 1e-3) -> Optional[float]:
-                if not (isinstance(a, PBRMaterial) and isinstance(b, PBRMaterial)):
-                    return None
-                ca = getattr(a, "base_color", None)
-                cb = getattr(b, "base_color", None)
-                if not ca or not cb:
-                    return None
-                try:
-                    return max(abs(float(ca[i]) - float(cb[i])) for i in range(3))
-                except Exception:
-                    return None
-            face_count_for_materials = face_count if 'face_count' in locals() else 0
-            if not materials:
-                materials = [style_material]
-                material_ids = [0] * max(1, face_count_for_materials)
-            elif (
-                _single_material_id(material_ids)
-                and materials
-                and all(_is_default_gray(m) for m in materials)
-                and (not face_style_groups)
-            ):
-                materials = [style_material]
-                material_ids = [0] * max(1, face_count_for_materials)
-            elif (
-                _single_material_id(material_ids)
-                and not face_style_groups
-                and len(materials) == 1
-                and isinstance(materials[0], PBRMaterial)
-            ):
-                delta = _color_delta(materials[0], style_material, tol=1e-3)
-                if delta is None or delta > 1e-3:
-                    materials = [style_material]
-                    material_ids = [0] * max(1, face_count_for_materials)
         style_token_by_style_id: Dict[int, str] = {}
         for token, entry in face_style_groups.items():
             style_id = entry.get("style_id")
