@@ -26,7 +26,13 @@ from typing import Dict, Optional, Union, Literal, List, Tuple, Any, TYPE_CHECKI
 from dataclasses import dataclass, field
 import hashlib
 
-from .ifc_visuals import PBRMaterial, build_material_for_product, extract_face_style_groups, get_face_styles
+from .ifc_visuals import (
+    PBRMaterial,
+    build_material_for_product,
+    extract_face_style_groups,
+    get_face_styles,
+    pbr_from_surface_style,
+)
 from . import occ_detail
 from .process_ifc_2d import AnnotationCurve, AnnotationHooks, extract_annotation_curves
 
@@ -176,6 +182,12 @@ def _normalize_geom_materials(materials, face_style_groups, ifc_file):
                 converted.append(existing)
                 continue
         fallback = sanitize_name(style_name, fallback=f"Material_{idx}")
+        if style_entity is not None:
+            pbr = pbr_from_surface_style(style_entity, model=ifc_file, preferred_name=fallback)
+            converted.append(pbr)
+            if style_id is not None:
+                style_lookup.setdefault(style_id, pbr)
+            continue
         pbr = _pbr_from_ifc_style(entry, fallback)
         converted.append(pbr)
         if style_id is not None:
