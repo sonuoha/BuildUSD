@@ -11,6 +11,11 @@ import ifcopenshell
 import ifcopenshell.util.element
 import ifcopenshell.util.representation
 
+try:
+    import webcolors  # type: ignore
+except Exception:  # pragma: no cover
+    webcolors = None
+
 __all__ = [
     "PBRMaterial",
     "build_material_for_product",
@@ -123,6 +128,18 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
         if rel.is_a("IfcRelAssociatesMaterial"):
             mat = rel.RelatingMaterial
             styles.extend(_styles_from_material_definition(mat))
+            if not styles:
+                # Fallback: try material style lookup via representation util when no MDR is present
+                try:
+                    contexts = ifcopenshell.util.representation.get_prioritised_contexts(model)
+                except Exception:
+                    contexts = []
+                if contexts:
+                    try:
+                        style_obj = ifcopenshell.util.representation.get_material_style(mat, contexts[0])
+                    except Exception:
+                        style_obj = None
+                    styles.extend(_surface_style_list(style_obj))
             if styles:
                 return styles
 
@@ -559,13 +576,38 @@ def _friendly_style_name(style: ifcopenshell.entity_instance, shape_name: Option
     """Readable token combining shape aspect name + material/style name."""
     model = getattr(style, "file", None)
     material = _get_material_for_style(model, style)
-    mat_name = getattr(material, "Name", None)
-    style_name = getattr(style, "Name", None)
+    def _clean_name(name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        text = str(name).strip()
+        if not text or text.lower() == "undefined":
+            return None
+        return text
+    mat_name = _clean_name(getattr(material, "Name", None))
+    style_name = _clean_name(getattr(style, "Name", None))
 
     if mat_name and style_name and style_name != mat_name:
         core = f"{mat_name} ({style_name})"
     else:
         core = mat_name or style_name or "Material"
+
+    # Append human-friendly colour hint when available (helps distinguish similar materials).
+    base_color = None
+    try:
+        elements = list(getattr(style, "Styles", []) or [])
+        rendering = next((e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None)
+        shading = next((e for e in elements if e.is_a("IfcSurfaceStyleShading")), None)
+        if rendering:
+            base_color = _rendering_base_color(rendering)
+        elif shading:
+            base_color = _as_rgb(getattr(shading, "SurfaceColour", None))
+    except Exception:
+        base_color = None
+
+    if base_color:
+        color_name = _color_name_from_rgb(base_color)
+        if color_name and color_name.lower() not in core.lower():
+            core = f"{core} - Colour {color_name.title()}"
 
     parts = [shape_name, core]
     raw = "_".join([p for p in parts if p])
@@ -582,13 +624,25 @@ def _to_pbr(
     material = _get_material_for_style(model or getattr(surface_style, "file", None), surface_style)
     mat_name = getattr(material, "Name", None)
     style_name = getattr(surface_style, "Name", None)
-    material_name = preferred_name or mat_name or style_name or "Unknown"
+    def _clean_name(name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        text = str(name).strip()
+        if not text:
+            return None
+        if text.lower() == "undefined":
+            return None
+        return text
+    material_name = preferred_name or _clean_name(mat_name) or _clean_name(style_name) or "Material"
     pbr = PBRMaterial(name=material_name)
 
     if surface_style is not None and surface_style.is_a("IfcSurfaceStyle"):
         elements = list(getattr(surface_style, "Styles", []) or [])
         rendering = next((e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None)
         shading = next((e for e in elements if e.is_a("IfcSurfaceStyleShading")), None)
+        texture_path = _texture_path_from_style(surface_style)
+        if texture_path:
+            pbr.base_color_tex = texture_path
         if rendering:
             base_color = _rendering_base_color(rendering)
             pbr.base_color = base_color
@@ -609,6 +663,9 @@ def _to_pbr(
             pbr.name = f"{mat_name} ({style_name})"
         elif mat_name:
             pbr.name = mat_name
+
+    # Append human-friendly colour naming to aid readability and debugging.
+    pbr.name = _name_with_color_hint(pbr.name, pbr.base_color)
 
     return pbr
 
@@ -701,11 +758,13 @@ def _shading_debug_snapshot(shading: Optional[ifcopenshell.entity_instance]) -> 
 
 
 def _rendering_base_color(rendering) -> Tuple[float, float, float]:
-    base = _color_or_factor(getattr(rendering, "SurfaceColour", None)) or (0.8, 0.8, 0.8)
+    surface = _color_or_factor(getattr(rendering, "SurfaceColour", None))
     diffuse = _color_or_factor(getattr(rendering, "DiffuseColour", None))
+    if surface:
+        return surface
     if diffuse:
-        base = tuple(_clamp01(base[i] * diffuse[i]) for i in range(3))
-    return base
+        return diffuse
+    return (0.8, 0.8, 0.8)
 
 
 def _rendering_opacity(rendering) -> float:
@@ -793,6 +852,105 @@ def _clamp01(value: float) -> float:
         return max(0.0, min(1.0, float(value)))
     except Exception:
         return 0.0
+
+
+# === COLOR NAMING HELPERS ===
+_CSS_FALLBACK_HEX = {
+    "black": "#000000",
+    "white": "#ffffff",
+    "gray": "#808080",
+    "red": "#ff0000",
+    "green": "#008000",
+    "blue": "#0000ff",
+    "yellow": "#ffff00",
+    "cyan": "#00ffff",
+    "magenta": "#ff00ff",
+    "orange": "#ffa500",
+    "brown": "#a52a2a",
+    "beige": "#f5f5dc",
+    "tan": "#d2b48c",
+    "pink": "#ffc0cb",
+    "purple": "#800080",
+    "navy": "#000080",
+    "teal": "#008080",
+    "olive": "#808000",
+}
+
+
+def _color_name_from_rgb(color: Tuple[float, float, float]) -> Optional[str]:
+    """Return a human-friendly colour name using webcolors when available."""
+    if color is None:
+        return None
+    try:
+        r = max(0, min(255, int(round(float(color[0]) * 255))))
+        g = max(0, min(255, int(round(float(color[1]) * 255))))
+        b = max(0, min(255, int(round(float(color[2]) * 255))))
+    except Exception:
+        return None
+    if webcolors is not None:
+        try:
+            hex_value = webcolors.rgb_to_hex((r, g, b))
+            return webcolors.hex_to_name(hex_value)
+        except Exception:
+            # Fall through to closest match
+            try:
+                min_dist = None
+                closest = None
+                for hex_code, name in webcolors.CSS3_HEX_TO_NAMES.items():
+                    cr, cg, cb = webcolors.hex_to_rgb(hex_code)
+                    dist = (cr - r) ** 2 + (cg - g) ** 2 + (cb - b) ** 2
+                    if min_dist is None or dist < min_dist:
+                        min_dist = dist
+                        closest = name
+                if closest:
+                    return closest
+            except Exception:
+                pass
+    # Fallback: coarse nearest match against a small palette.
+    min_dist = None
+    closest = None
+    for name, hex_code in _CSS_FALLBACK_HEX.items():
+        try:
+            hr = int(hex_code[1:3], 16)
+            hg = int(hex_code[3:5], 16)
+            hb = int(hex_code[5:7], 16)
+            dist = (hr - r) ** 2 + (hg - g) ** 2 + (hb - b) ** 2
+            if min_dist is None or dist < min_dist:
+                min_dist = dist
+                closest = name
+        except Exception:
+            continue
+    return closest.title() if closest else None
+
+
+def _name_with_color_hint(name: str, base_color: Tuple[float, float, float]) -> str:
+    color_name = _color_name_from_rgb(base_color)
+    if not color_name:
+        return name
+    if color_name.lower() in (name or "").lower():
+        return name
+    return f"{name} - Colour {color_name}"
+
+
+def _texture_path_from_style(surface_style: ifcopenshell.entity_instance) -> Optional[str]:
+    """Return a texture file path/URL when the style carries IfcSurfaceStyleWithTextures / IfcImageTexture."""
+    textures = []
+    try:
+        elements = getattr(surface_style, "Styles", []) or []
+        for elem in elements:
+            if hasattr(elem, "is_a") and elem.is_a("IfcSurfaceStyleWithTextures"):
+                textures.extend(getattr(elem, "Textures", []) or [])
+    except Exception:
+        pass
+    for tex in textures:
+        if tex is None:
+            continue
+        # IfcImageTexture.UrlReference is standard; try Location/URLReference as fallbacks.
+        for attr in ("UrlReference", "URLReference", "Location", "RelativePath"):
+            val = getattr(tex, attr, None)
+            if val:
+                return str(val)
+    return None
 
 
 # === FALLBACK NAMES ===

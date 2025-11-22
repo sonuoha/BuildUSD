@@ -267,7 +267,7 @@ def _variantize_face_groups(groups: Dict[str, Dict[str, Any]], suffix: str) -> D
     return variant
 
 
-def _instance_variant_kind(proto: Optional[MeshProto], materials: Any, face_style_groups: Dict[str, Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+def _instance_variant_kind(proto: Optional[MeshProto], materials: Any, face_style_groups: Dict[str, Dict[str, Any]], style_material: Optional[PBRMaterial]) -> Tuple[Optional[str], Optional[str]]:
     """Compare instance material/style with prototype to decide variant kind and suffix."""
     if proto is None:
         return None, None
@@ -306,6 +306,13 @@ def _instance_variant_kind(proto: Optional[MeshProto], materials: Any, face_styl
         if mat_diff:
             suffix = _variant_suffix("style", inst_map, inst_materials)
             return "style", suffix
+
+    # Consider object-level style material differences.
+    proto_style_sig = _pbr_signature(getattr(proto, "style_material", None))
+    inst_style_sig = _pbr_signature(style_material)
+    if inst_style_sig is not None and proto_style_sig is not None and inst_style_sig != proto_style_sig:
+        suffix = _variant_suffix("stylemat", inst_map, inst_materials)
+        return "style", suffix
 
     return None, None
 
@@ -5183,6 +5190,64 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         face_style_groups = extract_face_style_groups(product) or {}
         if materials:
             materials = _normalize_geom_materials(materials, face_style_groups, ifc_file)
+        # If the iterator did not supply useful material colours, fall back to the resolved style material.
+        if style_material:
+            def _is_default_gray(mat: Any) -> bool:
+                if not isinstance(mat, PBRMaterial):
+                    return False
+                bc = getattr(mat, "base_color", None)
+                if not bc:
+                    return False
+                try:
+                    return (
+                        all(abs(float(c) - 0.8) <= 1e-3 for c in bc)
+                        and not mat.base_color_tex
+                        and abs(float(getattr(mat, "roughness", 0.5)) - 0.5) <= 1e-3
+                        and abs(float(getattr(mat, "metallic", 0.0)) - 0.0) <= 1e-3
+                    )
+                except Exception:
+                    return False
+            def _single_material_id(ids: list[int]) -> bool:
+                if not ids:
+                    return True
+                try:
+                    vals = {int(v) for v in ids}
+                    return len(vals) <= 1
+                except Exception:
+                    return False
+            def _color_delta(a: Any, b: Any, tol: float = 1e-3) -> Optional[float]:
+                if not (isinstance(a, PBRMaterial) and isinstance(b, PBRMaterial)):
+                    return None
+                ca = getattr(a, "base_color", None)
+                cb = getattr(b, "base_color", None)
+                if not ca or not cb:
+                    return None
+                try:
+                    return max(abs(float(ca[i]) - float(cb[i])) for i in range(3))
+                except Exception:
+                    return None
+            face_count_for_materials = face_count if 'face_count' in locals() else 0
+            if not materials:
+                materials = [style_material]
+                material_ids = [0] * max(1, face_count_for_materials)
+            elif (
+                _single_material_id(material_ids)
+                and materials
+                and all(_is_default_gray(m) for m in materials)
+                and (not face_style_groups)
+            ):
+                materials = [style_material]
+                material_ids = [0] * max(1, face_count_for_materials)
+            elif (
+                _single_material_id(material_ids)
+                and not face_style_groups
+                and len(materials) == 1
+                and isinstance(materials[0], PBRMaterial)
+            ):
+                delta = _color_delta(materials[0], style_material, tol=1e-3)
+                if delta is None or delta > 1e-3:
+                    materials = [style_material]
+                    material_ids = [0] * max(1, face_count_for_materials)
         style_token_by_style_id: Dict[int, str] = {}
         for token, entry in face_style_groups.items():
             style_id = entry.get("style_id")
@@ -5302,6 +5367,18 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         mesh_dict = mesh_dict_base
         mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
         face_count = int(mesh_dict["faces"].shape[0]) if mesh_dict is not None and "faces" in mesh_dict else 0
+        if mesh_dict_base is not None:
+            try:
+                expected_corners = int(mesh_dict_base["faces"].size)
+            except Exception:
+                expected_corners = None
+            try:
+                uv_data = extract_uvs_for_product(product)
+            except Exception:
+                uv_data = None
+            if uv_data and expected_corners and len(uv_data.uvs) == expected_corners:
+                mesh_dict_base["uvs"] = uv_data.uvs
+                mesh_dict_base.pop("uv_indices", None)
         if face_count and material_ids and len(material_ids) != face_count:
             geom_attrs = [name for name in dir(geom) if name.startswith("material") or name.endswith("counts")]
             log.debug(
@@ -5623,7 +5700,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             and primary_key.kind in ("repmap", "repmap_detail")
         ):
             proto = repmaps.get(primary_key.identifier)
-            variant_kind, variant_suffix = _instance_variant_kind(proto, materials, face_style_groups)
+            variant_kind, variant_suffix = _instance_variant_kind(proto, materials, face_style_groups, style_material)
             if variant_suffix:
                 materials = _variantize_materials(materials, variant_suffix)
                 face_style_groups = _variantize_face_groups(face_style_groups, variant_suffix)
