@@ -80,6 +80,13 @@ Usage (CLI)
   - python -m buildusd --input C:\\path\\to\\dir --annotation-width-config src/buildusd/config/sample_annotation_widths.json
   - python -m buildusd --input C:\\path\\to\\dir --annotation-width-config src/buildusd/config/sample_annotation_widths.yaml
 
+Model offsets & anchoring
+- Stages stay in meters (metersPerUnit=1.0).
+- Iterator tessellation runs with use-world-coords=False; placements come from the iterator transform.
+- Per file we resolve a model offset from --anchor-mode: local -> Project/Base Point, site -> shared site point; converted to meters with basic unit scaling (m/mm/cm/dm).
+- The GeometrySettingsManager applies offset-type (default negative) to the raw offset and pushes the signed value into all ifcopenshell settings objects.
+- Each IFC file gets its own resolved offset; offsets are not shared across files.
+
 Usage (VS Code)
 - Press F5 and pick one of the provided launch configurations in .vscode/launch.json.
 - Modify args there to suit your inputs.
