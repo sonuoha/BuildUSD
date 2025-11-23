@@ -10,10 +10,11 @@ dependencies = [
     "polars",
     "numpy",
     "shapely",
-    "pythonocc-core>=7.9.0",
+    "webcolors>=1.12",
     ]
 [project.optional-dependencies]
 kit = ["omniverse-kit>=108.1", "usd-core>=25.8"]
+conda-extras = ["pythonocc-core==7.8.1"]
 test = ["pytest"]
 
 
