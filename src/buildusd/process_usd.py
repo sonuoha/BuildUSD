@@ -2259,27 +2259,70 @@ def author_prototype_layer(
             full_material_ids = list(getattr(proto, "material_ids", []) or [])
             full_style_groups = getattr(proto, "style_face_groups", None)
             full_materials = list(getattr(proto, "materials", []) or [])
+            semantic_parts_base = getattr(proto, "semantic_parts", {}) or {}
+            semantic_parts_detail = getattr(proto, "semantic_parts_detail", {}) or {}
 
             if has_detail and key.kind == "repmap_detail":
                 detail_parent = proto_path.AppendChild("Geom")
-                _author_occ_detail_meshes(
-                    stage,
-                    detail_parent,
-                    detail_payload,
-                    meters_per_unit=stage_meters_per_unit,
-                )
+                if semantic_parts_detail:
+                    for label, part in semantic_parts_detail.items():
+                        mesh_name = sanitize_name(label, fallback="Part")
+                        part_mesh_dict = {
+                            "vertices": np.asarray(part.get("vertices"), dtype=np.float32),
+                            "faces": np.asarray(part.get("faces"), dtype=np.int64),
+                        }
+                        part_material_ids = part.get("material_ids") or []
+                        write_usd_mesh(
+                            stage,
+                            detail_parent,
+                            mesh_name,
+                            part_mesh_dict,
+                            abs_mat=None,
+                            material_ids=part_material_ids if part_material_ids else None,
+                            style_groups=part.get("style_groups") or {},
+                            materials=full_materials,
+                            stage_meters_per_unit=stage_meters_per_unit,
+                        )
+                else:
+                    _author_occ_detail_meshes(
+                        stage,
+                        detail_parent,
+                        detail_payload,
+                        meters_per_unit=stage_meters_per_unit,
+                    )
             elif key.kind != "repmap_detail":
-                write_usd_mesh(
-                    stage,
-                    proto_path,
-                    "Geom",
-                    mesh_payload,
-                    abs_mat=None,
-                    material_ids=full_material_ids,
-                    style_groups=full_style_groups,
-                    materials=full_materials,
-                    stage_meters_per_unit=stage_meters_per_unit,
-                )
+                if semantic_parts_base:
+                    geom_parent = proto_path.AppendChild("Geom")
+                    for label, part in semantic_parts_base.items():
+                        mesh_name = sanitize_name(label, fallback="Part")
+                        part_mesh_dict = {
+                            "vertices": np.asarray(part.get("vertices"), dtype=np.float32),
+                            "faces": np.asarray(part.get("faces"), dtype=np.int64),
+                        }
+                        part_material_ids = part.get("material_ids") or []
+                        write_usd_mesh(
+                            stage,
+                            geom_parent,
+                            mesh_name,
+                            part_mesh_dict,
+                            abs_mat=None,
+                            material_ids=part_material_ids if part_material_ids else None,
+                            style_groups=part.get("style_groups") or {},
+                            materials=full_materials,
+                            stage_meters_per_unit=stage_meters_per_unit,
+                        )
+                else:
+                    write_usd_mesh(
+                        stage,
+                        proto_path,
+                        "Geom",
+                        mesh_payload,
+                        abs_mat=None,
+                        material_ids=full_material_ids,
+                        style_groups=full_style_groups,
+                        materials=full_materials,
+                        stage_meters_per_unit=stage_meters_per_unit,
+                    )
 
     return proto_layer, proto_paths
 
@@ -3690,6 +3733,18 @@ def author_instance_layer(
                 inst_prim.SetCustomDataByKey("ifc:instanceStepId", record.step_id)
             if getattr(record, "guid", None):
                 inst_prim.SetCustomDataByKey("ifc:guid", str(record.guid))
+                try:
+                    inst_prim.CreateAttribute("ifc:GlobalId", Sdf.ValueTypeNames.String).Set(str(record.guid))
+                except Exception:
+                    pass
+            if record.step_id is not None:
+                try:
+                    inst_prim.CreateAttribute("ifc:StepId", Sdf.ValueTypeNames.Int).Set(int(record.step_id))
+                except Exception:
+                    try:
+                        inst_prim.CreateAttribute("ifc:StepId", Sdf.ValueTypeNames.String).Set(str(record.step_id))
+                    except Exception:
+                        pass
 
             if record.transform is not None:
                 xform.AddTransformOp().Set(np_to_gf_matrix(record.transform))
@@ -3706,6 +3761,48 @@ def author_instance_layer(
             has_detail_mesh = bool(
                 detail_mode_enabled and detail_payload and getattr(detail_payload, "faces", None)
             )
+
+            semantic_parts = getattr(record, "semantic_parts", None) or {}
+
+            # Case: semantic sub-parts (no OCC detail mesh)
+            if semantic_parts and not has_detail_mesh:
+                geom_root = inst_path.AppendChild("Geom")
+                for label, part in semantic_parts.items():
+                    mesh_name = sanitize_name(label, fallback="Part")
+                    part_mesh_dict = {
+                        "vertices": np.asarray(part.get("vertices"), dtype=np.float32),
+                        "faces": np.asarray(part.get("faces"), dtype=np.int64),
+                    }
+                    part_material_ids = part.get("material_ids") or []
+                    mesh_geom = write_usd_mesh(
+                        stage,
+                        geom_root,
+                        mesh_name,
+                        part_mesh_dict,
+                        abs_mat=None,
+                        material_ids=part_material_ids if part_material_ids else None,
+                        materials=list(getattr(record, "materials", []) or []),
+                        stage_meters_per_unit=stage_meters_per_unit,
+                        style_groups=part.get("style_groups") or {},
+                    )
+                    if resolved_materials:
+                        _apply_material_bindings_to_prim(
+                            stage,
+                            mesh_geom.GetPrim(),
+                            resolved_materials,
+                            style_groups=style_groups,
+                            mesh_path=mesh_geom.GetPath(),
+                        )
+                    if resolved_color is not None:
+                        try:
+                            mesh_gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
+                            mesh_gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
+                        except Exception:
+                            pass
+                if resolved_color is not None:
+                    _apply_display_color_to_prim(inst_prim, resolved_color)
+                continue
+
             if has_detail_mesh:
                 detail_root = inst_path.AppendChild("Geom")
                 detail_entries = _author_occ_detail_meshes(
@@ -4238,7 +4335,13 @@ def apply_stage_anchor_transform(
     lonlat: Optional[GeodeticCoordinate] = None,
     **_unused,
 ) -> None:
-    """Anchor /World using the requested base-point context (local or shared site)."""
+    """Anchor metadata writer.
+
+    NEW BEHAVIOUR:
+      * Does NOT apply any transform ops to /World or the instance roots.
+      * All basepoint/map offsets are already baked into instance matrices.
+      * This function only writes anchor / geolocation attributes.
+    """
 
     if anchor_mode is None:
         return
@@ -4263,16 +4366,22 @@ def apply_stage_anchor_transform(
     if not world_prim:
         world_xf = UsdGeom.Xform.Define(stage, "/World")
         world_prim = world_xf.GetPrim()
+    # NOTE: do NOT ClearXformOpOrder or add any transform ops here anymore.
     world_xf = UsdGeom.Xformable(world_prim)
-    world_xf.ClearXformOpOrder()
 
     stage_meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
     if stage_meters_per_unit <= 0.0:
         stage_meters_per_unit = 1.0
 
     zero_base_point = BasePointConfig(easting=0.0, northing=0.0, height=0.0, unit="m")
-    shared_site_resolved = shared_site_base_point.with_fallback(zero_base_point) if shared_site_base_point else zero_base_point
-    base_point_resolved = base_point.with_fallback(shared_site_resolved) if base_point else shared_site_resolved
+    shared_site_resolved = (
+        shared_site_base_point.with_fallback(zero_base_point)
+        if shared_site_base_point
+        else zero_base_point
+    )
+    base_point_resolved = (
+        base_point.with_fallback(shared_site_resolved) if base_point else shared_site_resolved
+    )
 
     effective_mode = mode_normalised
     if effective_mode == "local" and base_point is None:
@@ -4280,8 +4389,15 @@ def apply_stage_anchor_transform(
     anchor_bp = shared_site_resolved if effective_mode == "site" else base_point_resolved
 
     anchor_easting_m, anchor_northing_m, anchor_height_m, anchor_unit = _base_point_components_in_meters(anchor_bp)
-    shared_easting_m, shared_northing_m, shared_height_m, shared_unit = _base_point_components_in_meters(shared_site_resolved)
-    model_bp_easting_m, model_bp_northing_m, model_bp_height_m, model_bp_unit = _base_point_components_in_meters(base_point_resolved)
+    shared_easting_m, shared_northing_m, shared_height_m, shared_unit = _base_point_components_in_meters(
+        shared_site_resolved
+    )
+    (
+        model_bp_easting_m,
+        model_bp_northing_m,
+        model_bp_height_m,
+        model_bp_unit,
+    ) = _base_point_components_in_meters(base_point_resolved)
 
     map_conv = getattr(caches, "map_conversion", None)
     translation_stage = Gf.Vec3d(0.0, 0.0, 0.0)
@@ -4298,6 +4414,7 @@ def apply_stage_anchor_transform(
         local_x = ax * d_e + ay * d_n
         local_y = -ay * d_e + ax * d_n
         local_z = anchor_height_m - ortho_height_m
+        # These are now metadata only; no transform ops applied.
         translation_stage = Gf.Vec3d(
             -local_x / stage_meters_per_unit,
             -local_y / stage_meters_per_unit,
@@ -4315,11 +4432,7 @@ def apply_stage_anchor_transform(
             -anchor_height_m / stage_meters_per_unit,
         )
 
-    anchor_matrix = Gf.Matrix4d(1.0)
-    if rotation_deg:
-        anchor_matrix.SetRotate(Gf.Rotation(Gf.Vec3d(0.0, 0.0, 1.0), rotation_deg))
-    anchor_matrix.SetTranslateOnly(translation_stage)
-
+    # NOTE: anchor_matrix is no longer used to transform any prims; we keep only metadata.
     base_geodetic = _derive_lonlat_from_base_point(base_point_resolved, projected_crs)
     site_geodetic = _derive_lonlat_from_base_point(shared_site_resolved, projected_crs)
     if lonlat is not None:
@@ -4429,11 +4542,9 @@ def apply_stage_anchor_transform(
     applied_to_instance = False
 
     def _apply_to_prim(prim: Usd.Prim, layer: Optional[Sdf.Layer]) -> None:
+        # NOTE: no transform ops are authored here; we only set attributes.
         context = Usd.EditContext(stage, layer) if layer is not None else nullcontext()
         with context:
-            xf = UsdGeom.Xformable(prim)
-            xf.ClearXformOpOrder()
-            xf.AddTransformOp().Set(anchor_matrix)
             for name, value_type, value in attr_values:
                 attr = prim.CreateAttribute(name, value_type)
                 attr.Set(value)
@@ -4446,9 +4557,10 @@ def apply_stage_anchor_transform(
         applied_to_instance = True
 
     if not applied_to_instance:
-        LOG.debug("Instance root not found; applying geo anchor transform on /World fallback.")
+        LOG.debug("Instance root not found; applying geo anchor metadata on /World fallback.")
         _apply_to_prim(world_prim, None)
     else:
+        # When we have an instance root, move the metadata off /World and onto the instance layer.
         root_layer = stage.GetRootLayer()
         cleanup_context = Usd.EditContext(stage, root_layer) if root_layer is not None else nullcontext()
         with cleanup_context:
@@ -4458,6 +4570,7 @@ def apply_stage_anchor_transform(
                         world_prim.RemoveProperty(name)
                     except Exception:
                         LOG.debug("Unable to remove world attribute %s during anchor relocation", name)
+
 
 # ---------------- Federated master view - stub (retain signature) ----------------
 
