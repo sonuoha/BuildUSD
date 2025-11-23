@@ -1,4 +1,4 @@
-"""IFC geometry inventory and prototype construction utilities.
+﻿"""IFC geometry inventory and prototype construction utilities.
 
 This module wraps a single iterator-driven pass over an IFC file and produces the
 data needed by the USD writer.  It handles:
@@ -33,6 +33,7 @@ from .ifc_visuals import (
     get_face_styles,
     pbr_from_surface_style,
 )
+from . import semantic_subcomponents
 from . import occ_detail
 from .process_ifc_2d import AnnotationCurve, AnnotationHooks, extract_annotation_curves
 
@@ -454,7 +455,16 @@ _BASE_GEOM_SETTINGS: Dict[str, Any] = {
     "apply-default-materials": True,
     "mesher-linear-deflection": 0.005,
     "mesher-angular-deflection": 0.5,
+    # NEW high-level controls (interpreted by GeometrySettingsManager)
+    # Model offset in *model units*; applied according to offset-type.
+    "model-offset": (0.0, 0.0, 0.0),
+    # "positive" → offset added; "negative" → supplied offset is negated.
+    "offset-type": "negative",
+    # Model rotation stored as quaternion (x, y, z, w). We accept axis+angle
+    # input in degrees and convert it to quaternion in the settings manager.
+    "model-rotation": (0.0, 0.0, 0.0, 1.0),
 }
+
 
 _HIGH_DETAIL_OVERRIDES: Dict[str, Any] = {
     "mesher-linear-deflection": 0.0015,
@@ -463,6 +473,270 @@ _HIGH_DETAIL_OVERRIDES: Dict[str, Any] = {
 
 _DEFAULT_LINEAR_DEF = float(_BASE_GEOM_SETTINGS["mesher-linear-deflection"])
 _DEFAULT_ANGULAR_DEF = float(_BASE_GEOM_SETTINGS["mesher-angular-deflection"])
+
+
+class GeometrySettingsManager:
+    """
+    Manage a coordinated trio of ifcopenshell geometry settings objects:
+
+        - default: iterator / “normal” mode (no OCC)
+        - occ:     same as default, but with Python OpenCascade enabled
+        - remesh:  OCC-enabled, with optional finer deflection overrides
+
+    Core behaviour
+    --------------
+    * Settings are initialised from a common base (e.g. _BASE_GEOM_SETTINGS).
+    * An optional remesh_overrides dict adjusts only the remesh settings.
+    * set(key, value) broadcasts to all settings unless a specific target
+      ("default" | "iterator" | "occ" | "remesh") is requested.
+    * get(key, source=...) reads a value from any of the managed settings.
+    * High-level keys "model-offset", "offset-type", "model-rotation" are
+      tracked in Python and not required to exist on ifcopenshell settings.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_settings: Mapping[str, Any],
+        remesh_overrides: Optional[Mapping[str, Any]] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        import ifcopenshell.geom  # local import
+
+        self._log = logger or log
+
+        # High-level state
+        self._offset_raw: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._offset_type: str = str(base_settings.get("offset-type", "positive")).lower()
+        if self._offset_type == "negative":
+            self._offset_signed = (-0.0, -0.0, -0.0)
+        else:
+            self._offset_signed = self._offset_raw
+        self._rotation_quat: Tuple[float, float, float, float] = tuple(
+            float(v) for v in base_settings.get("model-rotation", (0.0, 0.0, 0.0, 1.0))
+        )
+
+        # Underlying ifcopenshell settings
+        self._default = ifcopenshell.geom.settings()
+        self._occ = ifcopenshell.geom.settings()
+        self._remesh = ifcopenshell.geom.settings()
+
+        # Apply base config to all three
+        for s in (self._default, self._occ, self._remesh):
+            _apply_geom_settings(s, dict(base_settings))
+
+        # OCC toggles (never on default, always on occ/remesh)
+        self._occ_available = _enable_occ(self._occ)
+        if remesh_overrides:
+            remesh_base = dict(base_settings)
+            remesh_base.update(remesh_overrides)
+            _apply_geom_settings(self._remesh, remesh_base)
+        self._remesh_occ_available = _enable_occ(self._remesh)
+
+        # Re-apply the initial model offset using the current offset-type
+        # so the underlying settings carry the signed value.
+        self._set_model_offset(base_settings.get("model-offset", (0.0, 0.0, 0.0)))
+        self._apply_offset_to_settings()
+
+    # ---------------- properties ----------------
+
+    @property
+    def default_settings(self):
+        """Settings for the main iterator / normal mode (no OCC)."""
+        return self._default
+
+    @property
+    def iterator_settings(self):
+        return self._default
+
+    @property
+    def occ_settings(self):
+        """Settings with Python OpenCascade toggled on."""
+        return self._occ
+
+    @property
+    def remesh_settings(self):
+        """High-detail remesh settings (OCC + finer deflections)."""
+        return self._remesh
+
+    @property
+    def occ_available(self) -> bool:
+        return bool(self._occ_available)
+
+    @property
+    def remesh_occ_available(self) -> bool:
+        return bool(self._remesh_occ_available)
+
+    # ---------------- helpers for high-level keys ----------------
+
+    def _set_offset_type(self, value: Any) -> None:
+        text = str(value).strip().lower()
+        if text in {"positive", "pos", "+"}:
+            self._offset_type = "positive"
+        elif text in {"negative", "neg", "-"}:
+            self._offset_type = "negative"
+        else:
+            # keep previous, but log
+            self._log.debug("GeometrySettingsManager: unknown offset-type %r", value)
+            return
+
+        # Recompute signed offset whenever the type changes
+        self._update_signed_offset()
+        self._apply_offset_to_settings()
+
+    def _set_model_offset(self, value: Any) -> Tuple[float, float, float]:
+        try:
+            xs = list(value)
+        except Exception:
+            xs = [0.0, 0.0, 0.0]
+        xyz = [float(xs[i]) if i < len(xs) else 0.0 for i in range(3)]
+        self._offset_raw = (xyz[0], xyz[1], xyz[2])
+        self._update_signed_offset()
+        return self._offset_signed
+
+    def _update_signed_offset(self) -> None:
+        """Derive signed offset from raw offset and offset_type without double-applying."""
+        ox, oy, oz = self._offset_raw
+        if self._offset_type == "negative":
+            self._offset_signed = (-ox, -oy, -oz)
+        else:
+            self._offset_signed = (ox, oy, oz)
+
+    def _apply_offset_to_settings(self) -> None:
+        """Push the resolved signed offset into all managed settings objects."""
+        for s in (self._default, self._occ, self._remesh):
+            try:
+                s.set("model-offset", self._offset_signed)
+            except Exception:
+                try:
+                    s.set("MODEL_OFFSET", self._offset_signed)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _axis_angle_deg_to_quat(axis: Sequence[float], angle_deg: float) -> Tuple[float, float, float, float]:
+        """Convert an axis + angle (degrees) into an (x,y,z,w) quaternion."""
+        ax = list(axis)
+        if len(ax) < 3:
+            ax = [1.0, 0.0, 0.0]
+        x, y, z = float(ax[0]), float(ax[1]), float(ax[2])
+        length = math.sqrt(x * x + y * y + z * z) or 1.0
+        x /= length
+        y /= length
+        z /= length
+        half = math.radians(float(angle_deg)) * 0.5
+        s = math.sin(half)
+        c = math.cos(half)
+        return (x * s, y * s, z * s, c)
+
+    def _set_model_rotation(self, value: Any) -> None:
+        """
+        Accept either:
+          - axis + angle in degrees: (ax, ay, az, angle_deg)
+          - or a raw quaternion: (x, y, z, w)
+        """
+        try:
+            xs = list(value)
+        except Exception:
+            xs = [0.0, 0.0, 0.0, 1.0]
+
+        if len(xs) == 4:
+            # Heuristic: if last value looks like a large magnitude, treat as degrees
+            angle_deg = float(xs[3])
+            if abs(angle_deg) > 2.0 * math.pi:
+                quat = self._axis_angle_deg_to_quat(xs[:3], angle_deg)
+            else:
+                # Assume already quaternion
+                quat = (float(xs[0]), float(xs[1]), float(xs[2]), float(xs[3]))
+        else:
+            quat = (0.0, 0.0, 0.0, 1.0)
+        self._rotation_quat = quat
+
+    # ---------------- public API: set / get ----------------
+
+    def set(self, key: str, value: Any, *, target: Optional[str] = None) -> None:
+        """
+        Set a tessellation option.
+
+        - target=None (default) → broadcast to all (default/occ/remesh)
+        - target="default" or "iterator" → default only
+        - target="occ" → occ settings only
+        - target="remesh" → remesh settings only
+
+        High-level keys:
+        - "model-offset"  → stored in manager, broadcast as raw value
+        - "offset-type"   → "positive" / "negative"
+        - "model-rotation"→ axis+angle(deg) or quaternion; stored as quat
+        """
+        # Handle high-level keys first
+        lk = key.lower()
+        if lk == "offset-type":
+            self._set_offset_type(value)
+        elif lk == "model-offset":
+            # Apply sign according to current offset-type before broadcasting
+            value = self._set_model_offset(value)
+        elif lk == "model-rotation":
+            self._set_model_rotation(value)
+
+        if target is None:
+            targets = (self._default, self._occ, self._remesh)
+        else:
+            t = target.lower()
+            if t in {"default", "iterator"}:
+                targets = (self._default,)
+            elif t == "occ":
+                targets = (self._occ,)
+            elif t == "remesh":
+                targets = (self._remesh,)
+            else:
+                self._log.debug("GeometrySettingsManager.set: unknown target %r", target)
+                return
+
+        for s in targets:
+            try:
+                s.set(key, value)
+            except Exception:
+                try:
+                    alt_key = str(key).replace("-", "_").upper()
+                    s.set(alt_key, value)
+                except Exception:
+                    # silently ignore unknown keys on the underlying settings
+                    pass
+
+    def get(self, key: str, *, source: str = "default") -> Any:
+        """
+        Get a tessellation option from one of the managed settings objects.
+
+        source: "default" | "iterator" | "occ" | "remesh"
+
+        High-level keys:
+        - "model-offset" → returns signed offset according to offset-type
+        - "offset-type"  → returns "positive" or "negative"
+        - "model-rotation" → quaternion (x, y, z, w)
+        """
+        lk = key.lower()
+        if lk == "model-offset":
+            return self._offset_signed
+        if lk == "offset-type":
+            return self._offset_type
+        if lk == "model-rotation":
+            return self._rotation_quat
+
+        src = source.lower()
+        if src in {"default", "iterator"}:
+            settings_obj = self._default
+        elif src == "occ":
+            settings_obj = self._occ
+        else:  # "remesh" or anything else → remesh by default
+            settings_obj = self._remesh
+
+        try:
+            if hasattr(settings_obj, "get"):
+                return settings_obj.get(key)
+            return getattr(settings_obj, key, None)
+        except Exception:
+            return None
+
 
 _HIGH_DETAIL_CLASSES = {
     "IFCSTAIR",
@@ -530,6 +804,15 @@ def _enable_occ(settings) -> bool:
         )
         _OCC_WARNING_EMITTED = True
     return False
+
+
+def _disable_occ(settings) -> None:
+    """Best-effort helper to force iterator settings to avoid OCC."""
+    for key in ("use-python-opencascade", "USE_PYTHON_OPENCASCADE"):
+        try:
+            settings.set(key, False)
+        except Exception:
+            continue
 
 
 def _settings_fingerprint(settings) -> str:
@@ -680,6 +963,8 @@ class MeshProto:
     count: int = 0
     style_material: Optional[PBRMaterial] = None
     detail_mesh: Optional["OCCDetailMesh"] = None
+    semantic_parts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    semantic_parts_detail: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 @dataclass
 class HashProto:
@@ -728,6 +1013,10 @@ class ConversionOptions:
     detail_object_ids: Tuple[int, ...] = tuple()
     detail_object_guids: Tuple[str, ...] = tuple()
     enable_instance_material_variants: bool = True
+    enable_semantic_subcomponents: bool = False
+    # Optional overrides for geometry settings (fed from anchoring logic)
+    model_offset: Optional[Tuple[float, float, float]] = None
+    model_offset_type: Optional[str] = None
 
 @dataclass(frozen=True)
 class PrototypeKey:
@@ -779,6 +1068,7 @@ class InstanceRecord:
     style_material: Optional[PBRMaterial] = None
     style_face_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     detail_mesh: Optional["OCCDetailMesh"] = None
+    semantic_parts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 @dataclass
 class PrototypeCaches:
@@ -817,24 +1107,43 @@ class PrototypeBuildContext:
     detail_object_guids: Set[str] = field(default_factory=set)
     user_high_detail: bool = False
     object_scope_settings: Optional[Any] = None
+    fallback_settings_no_occ: Optional[Any] = None
 
     @classmethod
     def build(cls, ifc_file, options: Optional[ConversionOptions]) -> "PrototypeBuildContext":
         if options is None:
             options = ConversionOptions()
 
+        # Normalise detail scope / level
         detail_scope = getattr(options, "detail_scope", "none") or "none"
         if detail_scope not in ("none", "all", "object"):
             detail_scope = "none"
+
         detail_level = getattr(options, "detail_level", "subshape") or "subshape"
+        explicit_semantic = bool(getattr(options, "enable_semantic_subcomponents", False))
+
+        # "subcomponents" is a semantic request but uses same OCC detail level
+        if detail_level.lower() in ("subcomponent", "subcomponents"):
+            detail_level = "subshape"
+            explicit_semantic = True
+
         if detail_level not in ("subshape", "face"):
             detail_level = "subshape"
+
+        # Any non-"none" detail_scope implies semantics + detail
+        if detail_scope != "none":
+            explicit_semantic = True
+
+        options.enable_semantic_subcomponents = explicit_semantic
+
+        # Decode explicit object ids / guids
         detail_object_ids: Set[int] = set()
         for value in getattr(options, "detail_object_ids", tuple()) or tuple():
             try:
                 detail_object_ids.add(int(value))
             except Exception:
                 continue
+
         detail_object_guids: Set[str] = {
             str(value).strip().upper()
             for value in (getattr(options, "detail_object_guids", tuple()) or tuple())
@@ -843,36 +1152,49 @@ class PrototypeBuildContext:
 
         detail_mode_requested = detail_scope == "all"
         user_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
-        enable_high_detail = user_high_detail
-        if not enable_high_detail:
+
+        # Instantiate our unified settings manager
+        base_geom_settings = dict(_BASE_GEOM_SETTINGS)
+        if getattr(options, "model_offset", None) is not None:
+            base_geom_settings["model-offset"] = tuple(getattr(options, "model_offset"))
+        if getattr(options, "model_offset_type", None):
+            base_geom_settings["offset-type"] = str(getattr(options, "model_offset_type"))
+
+        settings_manager = GeometrySettingsManager(
+            base_settings=base_geom_settings,
+            remesh_overrides=_HIGH_DETAIL_OVERRIDES if user_high_detail else None,
+            logger=log,
+        )
+
+        # Iterator uses default settings (no OCC)
+        settings = settings_manager.iterator_settings
+
+        # High-detail remesh is available only when OCC is available on remesh
+        enable_high_detail = bool(user_high_detail and settings_manager.remesh_occ_available)
+        if user_high_detail and not enable_high_detail:
+            log.info(
+                "High-detail remeshing requested but Python OpenCascade is unavailable; "
+                "using iterator tessellation only."
+            )
+        if not user_high_detail:
             log.info("High-detail remeshing is DISABLED; using iterator tessellation only.")
         if detail_scope == "object":
-            log.info("Detail scope 'object': iterator meshes stay in base mode; OCC detail applies only to requested ids.")
-
-        settings = ifcopenshell.geom.settings()
-        _apply_geom_settings(settings, _BASE_GEOM_SETTINGS)
-
-        if enable_high_detail and not _enable_occ(settings):
             log.info(
-                "High-detail remeshing disabled: Python OpenCascade unavailable. Using iterator tessellation only."
+                "Detail scope 'object': iterator meshes stay in base mode; "
+                "OCC detail applies only to requested ids."
             )
-            enable_high_detail = False
 
-        high_detail_settings = None
-        if enable_high_detail:
-            high_detail_settings = ifcopenshell.geom.settings()
-            high_overrides = dict(_BASE_GEOM_SETTINGS)
-            high_overrides.update(_HIGH_DETAIL_OVERRIDES)
-            _apply_geom_settings(high_detail_settings, high_overrides)
-            if not _enable_occ(high_detail_settings):
-                log.info(
-                    "High-detail overrides disabled: Python OpenCascade unavailable. Using iterator tessellation only."
-                )
-                high_detail_settings = None
-                enable_high_detail = False
+        high_detail_settings = settings_manager.remesh_settings if enable_high_detail else None
 
         detail_mesh_cache: Dict[int, "OCCDetailMesh"] = {}
-        if detail_scope == "all" and occ_detail.is_available():
+        # For full-detail scope, precompute OCC meshes unless semantic subcomponents
+        # are enabled, in which case we skip prepass entirely.
+        if (
+            detail_scope == "all"
+            and enable_high_detail
+            and occ_detail.is_available()
+            and not getattr(options, "enable_semantic_subcomponents", False)
+        ):
             detail_prepass_settings = high_detail_settings or settings
             detail_mesh_cache = occ_detail.precompute_detail_meshes(
                 ifc_file,
@@ -883,10 +1205,13 @@ class PrototypeBuildContext:
                 logger=log,
             )
 
+        # Fingerprints
         settings_fp_base = _settings_fingerprint(settings)
         if enable_high_detail and high_detail_settings is not None:
             settings_fp_high = _settings_fingerprint(high_detail_settings)
-            settings_fp_brep = hashlib.md5(f"{settings_fp_high}|brep".encode("utf-8")).hexdigest()
+            settings_fp_brep = hashlib.md5(
+                f"{settings_fp_high}|brep".encode("utf-8")
+            ).hexdigest()
         else:
             settings_fp_high = settings_fp_base
             settings_fp_brep = settings_fp_base
@@ -904,12 +1229,10 @@ class PrototypeBuildContext:
 
         object_scope_settings = None
         if detail_scope == "object":
+            # Object-scope detail: use OCC settings with local coordinates enforced
             try:
-                object_scope_settings = ifcopenshell.geom.settings()
-                _apply_geom_settings(object_scope_settings, _BASE_GEOM_SETTINGS)
+                object_scope_settings = settings_manager.occ_settings
                 _force_local_coordinates(object_scope_settings)
-                if not _enable_occ(object_scope_settings):
-                    object_scope_settings = None
             except Exception:
                 object_scope_settings = None
 
@@ -923,6 +1246,12 @@ class PrototypeBuildContext:
             enable_high_detail=enable_high_detail,
             high_detail_settings=high_detail_settings,
             detail_mesh_cache=detail_mesh_cache,
+            repmaps={},
+            repmap_counts=Counter(),
+            hashes={},
+            step_keys={},
+            instances={},
+            hierarchy_cache={},
             annotation_hooks=annotation_hooks,
             detail_scope=detail_scope,
             detail_level=detail_level,
@@ -931,6 +1260,7 @@ class PrototypeBuildContext:
             user_high_detail=user_high_detail,
             object_scope_settings=object_scope_settings,
         )
+
 
     def wants_detail_for_product(self, step_id: Optional[int], guid: Optional[str]) -> bool:
         if self.detail_scope != "object":
@@ -5135,6 +5465,10 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     settings_fp_high = ctx.settings_fp_high
     settings_fp_brep = ctx.settings_fp_brep
     annotation_hooks = ctx.annotation_hooks
+    if getattr(options, "enable_semantic_subcomponents", False):
+        enable_high_detail = False
+        high_detail_settings = None
+        detail_mesh_cache = {}
 
     iterator = ifcopenshell.geom.iterator(settings, ifc_file, threads)
     if not iterator.initialize():
@@ -5212,6 +5546,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             default_material_key,
         )
         settings_fp_current = settings_fp_base
+        skip_occ_detail = False
 
         product_class = product.is_a() if hasattr(product, "is_a") else None
         product_class_upper = product_class.upper() if isinstance(product_class, str) else None
@@ -5522,16 +5857,61 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     if detail_settings_obj is high_detail_settings and high_detail_settings is not None:
                         settings_fp_current = settings_fp_high
 
+        # -------------------------------------------------------------
+        # Mesh + hash (robust, with salvage + explicit logging)
+        # -------------------------------------------------------------
         if mesh_dict is None:
-            continue
+            # Try to salvage a mesh directly from the iterator geometry
+            # to avoid silently dropping this element.
+            source_mesh = None
+            raw_geom = getattr(shape, "geometry", None)
+            if raw_geom is not None:
+                # Newer ifcopenshell may expose a convenient as_dict()
+                try:
+                    as_dict = getattr(raw_geom, "as_dict", None)
+                    if callable(as_dict):
+                        source_mesh = as_dict()
+                except Exception:
+                    source_mesh = None
+
+                # Fallback: build a minimal dict from verts/faces if present
+                if source_mesh is None and hasattr(raw_geom, "verts") and hasattr(raw_geom, "faces"):
+                    try:
+                        source_mesh = {
+                            "vertices": np.array(raw_geom.verts, dtype=float).reshape(-1, 3),
+                            "faces": np.array(raw_geom.faces, dtype=int).reshape(-1, 3),
+                        }
+                    except Exception:
+                        source_mesh = None
+
+            if source_mesh is not None:
+                mesh_dict = source_mesh
+                mesh_dict_base = source_mesh
+                mesh_stats = _mesh_stats(source_mesh)
+            else:
+                log.debug(
+                    "Dropping %s (GlobalId=%s, step=%s): no triangulated mesh "
+                    "from iterator or raw geometry.",
+                    product.is_a() if hasattr(product, "is_a") else "<IfcProduct>",
+                    getattr(product, "GlobalId", "unknown"),
+                    step_id,
+                )
+                continue
 
         try:
             mesh_hash = stable_mesh_hash(mesh_dict["vertices"], mesh_dict["faces"])
-        except Exception:
+        except Exception as exc:
+            log.debug(
+                "Dropping %s (GlobalId=%s, step=%s): stable_mesh_hash failed (%s).",
+                product.is_a() if hasattr(product, "is_a") else "<IfcProduct>",
+                getattr(product, "GlobalId", "unknown"),
+                step_id,
+                exc,
+            )
             continue
 
         guid_for_log = getattr(product, "GlobalId", None)
-        if enable_high_detail:
+        if enable_high_detail and not skip_occ_detail:
             if detail_mode in ("high", "brep"):
                 dims = mesh_stats.get("dims") if mesh_stats else None
                 faces_logged = mesh_stats.get("face_count") if mesh_stats else None
@@ -5571,8 +5951,37 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     info.material_ids = list(material_ids)
                 if not info.style_face_groups and face_style_groups:
                     info.style_face_groups = _clone_style_groups(face_style_groups)
+                if getattr(options, "enable_semantic_subcomponents", False):
+                    try:
+                        info.semantic_parts = semantic_subcomponents.split_product_by_semantic_roles(
+                            ifc_file=ifc_file,
+                            product=product,
+                            mesh_dict=mesh_dict,
+                            material_ids=material_ids,
+                            face_style_groups=face_style_groups,
+                            materials=materials,
+                        ) or {}
+                    except Exception:
+                        info.semantic_parts = {}
                 if info.detail_mesh is None and detail_mesh_data is not None and ctx.detail_scope != "object":
                     info.detail_mesh = detail_mesh_data
+                    if getattr(options, "enable_semantic_subcomponents", False):
+                        try:
+                            occ_mesh_dict = occ_detail.mesh_from_detail_mesh(detail_mesh_data)
+                        except Exception:
+                            occ_mesh_dict = None
+                        if occ_mesh_dict:
+                            try:
+                                info.semantic_parts_detail = semantic_subcomponents.split_product_by_semantic_roles(
+                                    ifc_file=ifc_file,
+                                    product=product,
+                                    mesh_dict=occ_mesh_dict,
+                                    material_ids=material_ids,
+                                    face_style_groups=face_style_groups,
+                                    materials=materials,
+                                ) or {}
+                            except Exception:
+                                info.semantic_parts_detail = {}
                 info.count = 0
 
             if (
@@ -5628,6 +6037,8 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 instance_mesh = mesh_dict
 
         detail_mesh_for_instance: Optional["OCCDetailMesh"] = detail_mesh_data
+        if skip_occ_detail:
+            detail_mesh_for_instance = None
         if primary_key is not None:
             prototype_bucket = None
             if primary_key.kind in ("repmap", "repmap_detail"):
@@ -5653,8 +6064,48 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 if style_material is not None:
                     style_material = _variantize_material(style_material, variant_suffix)
 
-        if primary_key is None and instance_mesh is None:
-            continue
+        # Semantic sub-component selection (prototype-driven when available)
+        semantic_parts: Dict[str, Dict[str, Any]] = {}
+        if getattr(options, "enable_semantic_subcomponents", False):
+            if primary_key is not None:
+                proto = None
+                if primary_key.kind in ("repmap", "repmap_detail"):
+                    proto = repmaps.get(primary_key.identifier)
+                elif primary_key.kind == "hash":
+                    proto = hashes.get(primary_key.identifier)
+                if proto is not None:
+                    if detail_mesh_for_instance is not None and getattr(proto, "semantic_parts_detail", None):
+                        semantic_parts = getattr(proto, "semantic_parts_detail", {}) or {}
+                    else:
+                        semantic_parts = getattr(proto, "semantic_parts", {}) or {}
+            elif mesh_dict is not None:
+                try:
+                    semantic_parts = semantic_subcomponents.split_product_by_semantic_roles(
+                        ifc_file=ifc_file,
+                        product=product,
+                        mesh_dict=mesh_dict,
+                        material_ids=material_ids,
+                        face_style_groups=face_style_groups,
+                        materials=materials,
+                    ) or {}
+                except Exception:
+                    semantic_parts = {}
+                if semantic_parts:
+                    instance_mesh = None
+                    skip_occ_detail = True
+                    detail_mesh_data = None
+
+        # If we have no prototype, no per-instance mesh, no detail, and no semantic parts,
+        # we still record an InstanceRecord so the element appears in the cache/scene
+        # (it will just be an empty Xform in USD). This avoids "silent" drops.
+        if primary_key is None and instance_mesh is None and not semantic_parts and detail_mesh_for_instance is None:
+            log.debug(
+                "Instance for %s (GlobalId=%s, step=%s) has no prototype, mesh, detail or semantic parts; "
+                "recording as geometry-less instance.",
+                product.is_a() if hasattr(product, "is_a") else "<IfcProduct>",
+                getattr(product, "GlobalId", "unknown"),
+                step_id,
+            )
 
         # Build InstanceRecord
         # step_id already computed above
@@ -5726,6 +6177,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             style_material=style_material,
             style_face_groups=_clone_style_groups(face_style_groups),
             detail_mesh=detail_mesh_for_instance,
+            semantic_parts=semantic_parts,
         )
 
     return PrototypeCaches(

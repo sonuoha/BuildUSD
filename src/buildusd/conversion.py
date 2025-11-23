@@ -65,6 +65,7 @@ OPTIONS = ConversionOptions(
     enable_high_detail_remesh=False,
     anchor_mode=None,
     split_topology_by_material=False,
+    enable_semantic_subcomponents=False,
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
 DEFAULT_USD_FORMAT = "usdc"
@@ -78,6 +79,37 @@ _FALLBACK_BASE_POINT = BasePointConfig(
     unit="m",
     epsg="EPSG:7855",
 )
+
+# Basic length unit factors to metres for base-point offsets
+_UNIT_FACTORS = {
+    "m": 1.0,
+    "meter": 1.0,
+    "meters": 1.0,
+    "mm": 0.001,
+    "millimeter": 0.001,
+    "millimeters": 0.001,
+    "cm": 0.01,
+    "centimeter": 0.01,
+    "centimeters": 0.01,
+    "dm": 0.1,
+    "decimeter": 0.1,
+    "decimeters": 0.1,
+}
+
+def _bp_offset_vector(bp: BasePointConfig) -> tuple[float, float, float]:
+    """Return (easting, northing, height) in metres from a BasePointConfig."""
+    if bp is None:
+        return (0.0, 0.0, 0.0)
+    unit = (bp.unit or "m").strip().lower()
+    factor = _UNIT_FACTORS.get(unit, 1.0)
+    try:
+        return (
+            float(bp.easting) * factor,
+            float(bp.northing) * factor,
+            float(bp.height) * factor,
+        )
+    except Exception:
+        return (0.0, 0.0, 0.0)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1252,8 +1284,33 @@ def _process_single_ifc(
         _ensure_not_cancelled(cancel_event)
         ifc = ifcopenshell.open(local_ifc.as_posix())
         _ensure_not_cancelled(cancel_event)
+
+        # Determine anchoring offsets before prototype build so tessellation
+        # uses the correct model-offset (PBP for local, survey for site).
+        anchor_mode_norm = _normalize_anchor_mode(getattr(options, "anchor_mode", None))
+        effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
+        shared_site_point = (
+            plan.shared_site_base_point
+            if plan and getattr(plan, "shared_site_base_point", None)
+            else DEFAULT_SHARED_BASE_POINT
+        )
+        offset_bp = None
+        if anchor_mode_norm == "local":
+            offset_bp = effective_base_point
+        elif anchor_mode_norm == "site":
+            offset_bp = shared_site_point or effective_base_point
+
+        options_for_build = options
+        if offset_bp is not None:
+            offset_tuple = _bp_offset_vector(offset_bp)
+            options_for_build = replace(
+                options,
+                model_offset=offset_tuple,
+                model_offset_type="negative",
+            )
+
         logger.info("Building prototypes for %s...", path_name(ifc_path))
-        caches = build_prototypes(ifc, options)
+        caches = build_prototypes(ifc, options_for_build)
         logger.info(
             "Prototype build complete: %d type prototypes, %d hashed prototypes, %d instances",
             len(caches.repmaps),
