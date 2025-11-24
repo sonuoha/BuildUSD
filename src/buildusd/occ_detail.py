@@ -385,20 +385,33 @@ def _shape_diagonal(shape: Any) -> float:
         return 1.0
     try:
         Bnd_Box = sym("Bnd_Box")
+        # Prefer the newer static method API on BRepBndLib, fall back to the
+        # older brepbndlib_Add function if needed.
         add_callable = None
+
+        # Try new-style BRepBndLib.Add first
         try:
             from OCC.Core import BRepBndLib as _BRepBndLib  # type: ignore
+        except ImportError:
+            _BRepBndLib = None
+        if _BRepBndLib is not None:
+            candidate = getattr(_BRepBndLib, "Add", None)
+            if callable(candidate):
+                add_callable = candidate
 
-            add_callable = getattr(_BRepBndLib, "Add", None)
-        except Exception:
-            add_callable = None
+        # Fallback: old-style brepbndlib_Add symbol
         if add_callable is None:
             add_callable = sym_optional("brepbndlib_Add")
-        box = Bnd_Box()
-        box.SetGap(0.0)
+
         if add_callable is None:
             raise RuntimeError("brepbndlib Add helper unavailable")
+
+        # Build the bounding box and compute its diagonal
+        box = Bnd_Box()
+        box.SetGap(0.0)
+        # Keep call signature consistent with previous behaviour (no extra args)
         add_callable(shape, box)
+
         xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
         dx = float(xmax - xmin)
         dy = float(ymax - ymin)
@@ -408,6 +421,7 @@ def _shape_diagonal(shape: Any) -> float:
             return 1.0
         return diag
     except Exception:
+        # Any failure -> conservative fallback
         return 1.0
 
 

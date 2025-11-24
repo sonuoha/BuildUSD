@@ -2262,6 +2262,28 @@ def author_prototype_layer(
             semantic_parts_base = getattr(proto, "semantic_parts", {}) or {}
             semantic_parts_detail = getattr(proto, "semantic_parts_detail", {}) or {}
 
+            # Semantic parts on the base prototype take precedence and short-circuit
+            if semantic_parts_base and key.kind != "repmap_detail":
+                geom_parent = proto_path.AppendChild("Geom")
+                for label, part in semantic_parts_base.items():
+                    mesh_name = sanitize_name(label, fallback="Part")
+                    part_mesh_dict = {
+                        "vertices": np.asarray(part.get("vertices"), dtype=np.float32),
+                        "faces": np.asarray(part.get("faces"), dtype=np.int64),
+                    }
+                    part_material_ids = part.get("material_ids") or []
+                    write_usd_mesh(
+                        stage,
+                        geom_parent,
+                        mesh_name,
+                        part_mesh_dict,
+                        abs_mat=None,
+                        material_ids=part_material_ids if part_material_ids else None,
+                        materials=full_materials,
+                        style_groups=part.get("style_groups") or {},
+                    )
+                continue
+
             if has_detail and key.kind == "repmap_detail":
                 detail_parent = proto_path.AppendChild("Geom")
                 if semantic_parts_detail:
@@ -3711,6 +3733,7 @@ def author_instance_layer(
         inst_root_xf.GetPrim().SetCustomDataByKey("ifc:sourceFile", base_name)
 
         for record in caches.instances.values():
+            has_prototype = record.prototype is not None
             parent_path = inst_root
             for label, step_id in record.hierarchy:
                 parent_path = _ensure_group(parent_path, label, step_id)
