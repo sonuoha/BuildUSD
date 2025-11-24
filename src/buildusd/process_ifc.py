@@ -220,6 +220,50 @@ def _pbr_signature(mat: Any) -> Optional[Tuple]:
     )
 
 
+def _log_semantic_attempt(product, mesh_dict, face_style_groups, materials, *, label: str) -> None:
+    """Emit a concise debug line before running semantic splitting."""
+    if not log.isEnabledFor(logging.DEBUG):
+        return
+    face_count = 0
+    try:
+        faces = mesh_dict.get("faces") if isinstance(mesh_dict, dict) else None
+        if faces is not None:
+            face_count = int(np.asarray(faces).shape[0])
+    except Exception:
+        face_count = 0
+    try:
+        aspect_names = [
+            _norm(getattr(a, "Name", None) or getattr(a, "Description", None) or getattr(a, "Identification", None))
+            for a in (getattr(product, "HasShapeAspects", []) or [])
+        ]
+        aspect_names = [a for a in aspect_names if a]
+    except Exception:
+        aspect_names = []
+    try:
+        rep_ids = []
+        rep_container = getattr(product, "Representation", None)
+        reps = getattr(rep_container, "Representations", []) or []
+        for rep in reps:
+            ident = getattr(rep, "RepresentationIdentifier", None)
+            if ident:
+                rep_ids.append(str(ident))
+        rep_ids = list(dict.fromkeys(rep_ids))
+    except Exception:
+        rep_ids = []
+    style_keys = list((face_style_groups or {}).keys())
+    log.debug(
+        "Semantic split [%s]: prod=%s guid=%s faces=%s style_groups=%d rep_ids=%s aspects=%s materials=%d",
+        label,
+        product.is_a() if hasattr(product, "is_a") else "<IfcProduct>",
+        getattr(product, "GlobalId", None),
+        face_count,
+        len(style_keys),
+        rep_ids,
+        aspect_names,
+        len(materials or []),
+    )
+
+
 def _face_group_map(groups: Dict[str, Dict[str, Any]]) -> Dict[Tuple[int, ...], Dict[str, Any]]:
     """Index face-style groups by face tuple for comparison."""
     mapping: Dict[Tuple[int, ...], Dict[str, Any]] = {}
@@ -1108,6 +1152,7 @@ class PrototypeBuildContext:
     user_high_detail: bool = False
     object_scope_settings: Optional[Any] = None
     fallback_settings_no_occ: Optional[Any] = None
+    occ_settings: Optional[Any] = None
 
     @classmethod
     def build(cls, ifc_file, options: Optional[ConversionOptions]) -> "PrototypeBuildContext":
@@ -1165,50 +1210,42 @@ class PrototypeBuildContext:
             remesh_overrides=_HIGH_DETAIL_OVERRIDES if user_high_detail else None,
             logger=log,
         )
+        occ_settings = settings_manager.occ_settings
 
-        # Iterator uses default settings (no OCC)
+        # Iterator uses default settings (no OCC); this is always the primary pipeline.
         settings = settings_manager.iterator_settings
 
-        # High-detail remesh is available only when OCC is available on remesh
-        enable_high_detail = bool(user_high_detail and settings_manager.remesh_occ_available)
-        if user_high_detail and not enable_high_detail:
-            log.info(
-                "High-detail remeshing requested but Python OpenCascade is unavailable; "
-                "using iterator tessellation only."
-            )
-        if not user_high_detail:
+        # High-detail remesh: we only use the remesh settings as a per-product fallback
+        # (via _remesh_product_geometry / occ_detail), never as a global prepass.
+        enable_high_detail = bool(user_high_detail)
+        if not enable_high_detail:
             log.info("High-detail remeshing is DISABLED; using iterator tessellation only.")
+        else:
+            log.info("High-detail remeshing is ENABLED: remesh settings will be used as a per-product fallback.")
+
         if detail_scope == "object":
             log.info(
-                "Detail scope 'object': iterator meshes stay in base mode; "
-                "OCC detail applies only to requested ids."
+                "Detail scope 'object': iterator + semantic subcomponents run first; "
+                "OCC detail will be attempted only for selected objects where needed."
+            )
+        elif detail_scope == "all":
+            log.info(
+                "Detail scope 'all': iterator + semantic subcomponents run for all products; "
+                "OCC detail will only be used as a fallback when semantic splitting fails."
             )
 
-        high_detail_settings = settings_manager.remesh_settings if enable_high_detail else None
+        fine_remesh_settings = settings_manager.remesh_settings if enable_high_detail else None
 
+        # OCC detail meshes are now built lazily per product (in build_prototypes)
+        # after semantic subcomponents have been attempted. We do not run a global
+        # OCC prepass here anymore.
         detail_mesh_cache: Dict[int, "OCCDetailMesh"] = {}
-        # For full-detail scope, precompute OCC meshes unless semantic subcomponents
-        # are enabled, in which case we skip prepass entirely.
-        if (
-            detail_scope == "all"
-            and enable_high_detail
-            and occ_detail.is_available()
-            and not getattr(options, "enable_semantic_subcomponents", False)
-        ):
-            detail_prepass_settings = high_detail_settings or settings
-            detail_mesh_cache = occ_detail.precompute_detail_meshes(
-                ifc_file,
-                detail_prepass_settings,
-                default_linear_def=_DEFAULT_LINEAR_DEF,
-                default_angular_def=_DEFAULT_ANGULAR_DEF,
-                detail_level=detail_level,
-                logger=log,
-            )
+
 
         # Fingerprints
         settings_fp_base = _settings_fingerprint(settings)
-        if enable_high_detail and high_detail_settings is not None:
-            settings_fp_high = _settings_fingerprint(high_detail_settings)
+        if enable_high_detail and fine_remesh_settings is not None:
+            settings_fp_high = _settings_fingerprint(fine_remesh_settings)
             settings_fp_brep = hashlib.md5(
                 f"{settings_fp_high}|brep".encode("utf-8")
             ).hexdigest()
@@ -1231,7 +1268,7 @@ class PrototypeBuildContext:
         if detail_scope == "object":
             # Object-scope detail: use OCC settings with local coordinates enforced
             try:
-                object_scope_settings = settings_manager.occ_settings
+                object_scope_settings = occ_settings
                 _force_local_coordinates(object_scope_settings)
             except Exception:
                 object_scope_settings = None
@@ -1244,7 +1281,7 @@ class PrototypeBuildContext:
             settings_fp_high=settings_fp_high,
             settings_fp_brep=settings_fp_brep,
             enable_high_detail=enable_high_detail,
-            high_detail_settings=high_detail_settings,
+            high_detail_settings=fine_remesh_settings,
             detail_mesh_cache=detail_mesh_cache,
             repmaps={},
             repmap_counts=Counter(),
@@ -1259,6 +1296,7 @@ class PrototypeBuildContext:
             detail_object_guids=detail_object_guids,
             user_high_detail=user_high_detail,
             object_scope_settings=object_scope_settings,
+            occ_settings=occ_settings,
         )
 
 
@@ -5461,6 +5499,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
     step_keys = ctx.step_keys
     instances = ctx.instances
     hierarchy_cache = ctx.hierarchy_cache
+    occ_settings = ctx.occ_settings
     settings_fp_base = ctx.settings_fp_base
     settings_fp_high = ctx.settings_fp_high
     settings_fp_brep = ctx.settings_fp_brep
@@ -5678,8 +5717,10 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         detail_source_obj: Any = shape
         detail_settings_obj = None
 
-        needs_high_detail = False
+        need_fine_remesh = False
         allow_brep_fallback = False
+        need_occ_detail = False
+        defer_occ_detail = bool(getattr(options, "enable_semantic_subcomponents", False))
 
         if detail_object_match:
             log.info(
@@ -5689,6 +5730,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 guid_for_log,
                 step_id,
             )
+            need_occ_detail = True
             detail_mode = "object"
             detail_mesh_data = _build_object_scope_detail_mesh(
                 ctx,
@@ -5709,13 +5751,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 detail_mesh_data = type_detail_mesh
         else:
             if ctx.detail_scope == "all":
-                needs_high_detail = True
-                allow_brep_fallback = True
+                need_occ_detail = True
                 detail_reasons.append("scope_all")
 
             if enable_high_detail and ctx.user_high_detail and product_class_upper:
                 if product_class_upper in _HIGH_DETAIL_CLASSES and "class_match" not in detail_reasons:
-                    needs_high_detail = True
+                    need_fine_remesh = True
                     detail_reasons.append("class_match")
                 if product_class_upper in _BREP_FALLBACK_CLASSES:
                     allow_brep_fallback = True
@@ -5723,17 +5764,17 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             if (
                 enable_high_detail
                 and ctx.user_high_detail
-                and not needs_high_detail
+                and not need_fine_remesh
                 and product_class_upper == "IFCBUILDINGELEMENTPROXY"
                 and mesh_stats is not None
             ):
                 proxy_needs_high_detail, proxy_reasons = occ_detail.proxy_requires_high_detail(mesh_stats)
                 if proxy_needs_high_detail:
-                    needs_high_detail = True
+                    need_fine_remesh = True
                     detail_reasons.extend(proxy_reasons)
 
-            if enable_high_detail and needs_high_detail and high_detail_settings is not None:
-                remeshed = _remesh_product_geometry(product, high_detail_settings)
+            if enable_high_detail and need_fine_remesh and fine_remesh_settings is not None:
+                remeshed = _remesh_product_geometry(product, fine_remesh_settings)
                 if remeshed is not None:
                     high_geom = getattr(remeshed, "geometry", remeshed)
                     high_mesh = _mesh_from_geom(high_geom)
@@ -5757,12 +5798,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
 
             if (
                 enable_high_detail
-                and high_detail_settings is not None
+                and fine_remesh_settings is not None
                 and (mesh_dict is None or mesh_dict["faces"].size == 0)
                 and allow_brep_fallback
             ):
                 detail_reasons.append("brep_fallback_triggered")
-                remeshed_brep = _remesh_product_geometry(product, high_detail_settings, use_brep=True)
+                remeshed_brep = _remesh_product_geometry(product, fine_remesh_settings, use_brep=True)
                 if remeshed_brep is not None:
                     brep_geom = getattr(remeshed_brep, "geometry", remeshed_brep)
                     brep_mesh = _mesh_from_geom(brep_geom)
@@ -5784,8 +5825,8 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     mesh_dict = mesh_dict_base
                     mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
 
-            if needs_high_detail and detail_mesh_data is None:
-                detail_settings_obj = high_detail_settings or settings
+            if need_occ_detail and detail_mesh_data is None and occ_settings is not None and not defer_occ_detail:
+                detail_settings_obj = occ_settings
                 detail_mesh_data = occ_detail.build_detail_mesh_payload(
                     detail_source_obj,
                     detail_settings_obj,
@@ -5953,6 +5994,13 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     info.style_face_groups = _clone_style_groups(face_style_groups)
                 if getattr(options, "enable_semantic_subcomponents", False):
                     try:
+                        _log_semantic_attempt(
+                            product,
+                            mesh_dict,
+                            face_style_groups,
+                            materials,
+                            label="proto/base",
+                        )
                         info.semantic_parts = semantic_subcomponents.split_product_by_semantic_roles(
                             ifc_file=ifc_file,
                             product=product,
@@ -5972,6 +6020,13 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                             occ_mesh_dict = None
                         if occ_mesh_dict:
                             try:
+                                _log_semantic_attempt(
+                                    product,
+                                    occ_mesh_dict,
+                                    face_style_groups,
+                                    materials,
+                                    label="proto/detail",
+                                )
                                 info.semantic_parts_detail = semantic_subcomponents.split_product_by_semantic_roles(
                                     ifc_file=ifc_file,
                                     product=product,
@@ -6080,6 +6135,13 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                         semantic_parts = getattr(proto, "semantic_parts", {}) or {}
             elif mesh_dict is not None:
                 try:
+                    _log_semantic_attempt(
+                        product,
+                        mesh_dict,
+                        face_style_groups,
+                        materials,
+                        label="instance",
+                    )
                     semantic_parts = semantic_subcomponents.split_product_by_semantic_roles(
                         ifc_file=ifc_file,
                         product=product,
@@ -6094,6 +6156,34 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     instance_mesh = None
                     skip_occ_detail = True
                     detail_mesh_data = None
+            # If semantic splitting produced nothing and OCC detail was requested, build it now.
+            if (
+                not semantic_parts
+                and need_occ_detail
+                and detail_mesh_for_instance is None
+                and occ_settings is not None
+            ):
+                detail_settings_obj = occ_settings
+                detail_mesh_data = occ_detail.build_detail_mesh_payload(
+                    detail_source_obj,
+                    detail_settings_obj,
+                    product=product,
+                    default_linear_def=_DEFAULT_LINEAR_DEF,
+                    default_angular_def=_DEFAULT_ANGULAR_DEF,
+                    logger=log,
+                    detail_level=ctx.detail_level,
+                    material_resolver=detail_material_resolver,
+                    reference_shape=shape,
+                )
+                detail_mesh_for_instance = detail_mesh_data
+                if detail_mesh_data is None:
+                    log.debug(
+                        "Detail mode (post-semantic): OCC mesh unavailable for %s guid=%s step=%s name=%s",
+                        product_class_upper or product_class or "<unknown>",
+                        getattr(product, "GlobalId", None),
+                        step_id,
+                        product_name,
+                    )
 
         # If we have no prototype, no per-instance mesh, no detail, and no semantic parts,
         # we still record an InstanceRecord so the element appears in the cache/scene
