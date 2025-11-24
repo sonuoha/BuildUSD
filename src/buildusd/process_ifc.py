@@ -5208,6 +5208,7 @@ def _object_placement_to_np(obj_placement) -> np.ndarray:
     except Exception:
         return np.eye(4, dtype=float)
     return _gf_matrix_to_np(gf_matrix)
+
 def _cartesian_transform_to_np(op) -> np.ndarray:
     """Convert an IfcCartesianTransformationOperator into a 4×4 matrix."""
     """Convert an IfcCartesianTransformationOperator into a numpy 4x4 matrix."""
@@ -5510,6 +5511,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         detail_mesh_cache = {}
 
     iterator = ifcopenshell.geom.iterator(settings, ifc_file, threads)
+
     if not iterator.initialize():
         # Fallback: still return caches for downstream authoring (empty)
         return PrototypeCaches(
@@ -5523,8 +5525,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         )
 
     while True:
-        if not iterator.next():
-            break
+
         shape = iterator.get()
         if shape is None:
             continue
@@ -5732,23 +5733,32 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             )
             need_occ_detail = True
             detail_mode = "object"
-            detail_mesh_data = _build_object_scope_detail_mesh(
-                ctx,
-                product,
-                material_resolver=detail_material_resolver,
-                reference_shape=shape,
-            )
-            if detail_mesh_data is None:
-                log.warning(
-                    "Detail scope object: OCC mesh unavailable for %s guid=%s step=%s name=%s",
-                    product_class_upper or product_class or "<unknown>",
-                    getattr(product, "GlobalId", None),
-                    step_id,
-                    product_name,
+            # When semantic subcomponents are enabled we *defer* the OCC detail
+            # build for object-scope detail until after semantic splitting has
+            # been attempted. This preserves the intended pipeline:
+            #   iterator → semantic split → OCC detail (fallback) → iterator mesh.
+            #
+            # If semantic splitting is disabled entirely, we can still build the
+            # object-scope OCC detail eagerly as before.
+            if not getattr(options, "enable_semantic_subcomponents", False):
+                detail_mesh_data = _build_object_scope_detail_mesh(
+                    ctx,
+                    product,
+                    material_resolver=detail_material_resolver,
+                    reference_shape=shape,
                 )
-            elif type_detail_mesh is not None and type_id is not None:
-                primary_key = PrototypeKey(kind="repmap_detail", identifier=type_id)
-                detail_mesh_data = type_detail_mesh
+                if detail_mesh_data is None:
+                    log.warning(
+                        "Detail scope object: OCC mesh unavailable for %s guid=%s step=%s name=%s",
+                        product_class_upper or product_class or "<unknown>",
+                        getattr(product, "GlobalId", None),
+                        step_id,
+                        product_name,
+                    )
+                elif type_detail_mesh is not None and type_id is not None:
+                    # Reuse canonical type-level OCC detail when available.
+                    primary_key = PrototypeKey(kind="repmap_detail", identifier=type_id)
+                    detail_mesh_data = type_detail_mesh
         else:
             if ctx.detail_scope == "all":
                 need_occ_detail = True
@@ -6157,33 +6167,52 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     skip_occ_detail = True
                     detail_mesh_data = None
             # If semantic splitting produced nothing and OCC detail was requested, build it now.
-            if (
-                not semantic_parts
-                and need_occ_detail
-                and detail_mesh_for_instance is None
-                and occ_settings is not None
-            ):
-                detail_settings_obj = occ_settings
-                detail_mesh_data = occ_detail.build_detail_mesh_payload(
-                    detail_source_obj,
-                    detail_settings_obj,
-                    product=product,
-                    default_linear_def=_DEFAULT_LINEAR_DEF,
-                    default_angular_def=_DEFAULT_ANGULAR_DEF,
-                    logger=log,
-                    detail_level=ctx.detail_level,
-                    material_resolver=detail_material_resolver,
-                    reference_shape=shape,
-                )
-                detail_mesh_for_instance = detail_mesh_data
-                if detail_mesh_data is None:
-                    log.debug(
-                        "Detail mode (post-semantic): OCC mesh unavailable for %s guid=%s step=%s name=%s",
-                        product_class_upper or product_class or "<unknown>",
-                        getattr(product, "GlobalId", None),
-                        step_id,
-                        product_name,
+            if not semantic_parts and need_occ_detail and detail_mesh_for_instance is None:
+                detail_mesh_data = None
+
+                if ctx.detail_scope == "object" and detail_object_match:
+                    if ctx.object_scope_settings is not None:
+                        detail_settings_obj = ctx.object_scope_settings
+                        detail_mesh_data = _build_object_scope_detail_mesh(
+                            ctx,
+                            product,
+                            material_resolver=detail_material_resolver,
+                            reference_shape=shape,
+                        )
+                        if detail_mesh_data is None:
+                            log.debug(
+                                "Detail scope object (post-semantic): OCC mesh unavailable for %s guid=%s step=%s name=%s",
+                                product_class_upper or product_class or "<unknown>",
+                                getattr(product, "GlobalId", None),
+                                step_id,
+                                product_name,
+                            )
+                        elif type_detail_mesh is not None and type_id is not None:
+                            primary_key = PrototypeKey(kind="repmap_detail", identifier=type_id)
+                            detail_mesh_data = type_detail_mesh
+                elif occ_settings is not None:
+                    detail_settings_obj = occ_settings
+                    detail_mesh_data = occ_detail.build_detail_mesh_payload(
+                        detail_source_obj,
+                        detail_settings_obj,
+                        product=product,
+                        default_linear_def=_DEFAULT_LINEAR_DEF,
+                        default_angular_def=_DEFAULT_ANGULAR_DEF,
+                        logger=log,
+                        detail_level=ctx.detail_level,
+                        material_resolver=detail_material_resolver,
+                        reference_shape=shape,
                     )
+                    if detail_mesh_data is None:
+                        log.debug(
+                            "Detail mode (post-semantic): OCC mesh unavailable for %s guid=%s step=%s name=%s",
+                            product_class_upper or product_class or "<unknown>",
+                            getattr(product, "GlobalId", None),
+                            step_id,
+                            product_name,
+                        )
+
+                detail_mesh_for_instance = detail_mesh_data
 
         # If we have no prototype, no per-instance mesh, no detail, and no semantic parts,
         # we still record an InstanceRecord so the element appears in the cache/scene
@@ -6269,8 +6298,12 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             detail_mesh=detail_mesh_for_instance,
             semantic_parts=semantic_parts,
         )
+        
+        if not iterator.next():
+            break
 
     return PrototypeCaches(
+        #Add the it break here
         repmaps=repmaps,
         repmap_counts=repmap_counts,
         hashes=hashes,
@@ -6279,3 +6312,4 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         annotations=extract_annotation_curves(ifc_file, hierarchy_cache, annotation_hooks),
         map_conversion=extract_map_conversion(ifc_file),
     )
+
