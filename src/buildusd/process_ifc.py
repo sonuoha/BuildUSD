@@ -5528,6 +5528,8 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
 
         shape = iterator.get()
         if shape is None:
+            if not iterator.next():
+                break
             continue
         try:
             step_id = int(getattr(shape, "id"))
@@ -5543,20 +5545,30 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     step_id = None
         if step_id is None:
             log.debug("Iterator returned shape without step id; skipping.")
+            if not iterator.next():
+                break
             continue
 
         product = ifc_file.by_id(step_id)
         if product is None:
+            if not iterator.next():
+                break
             continue
 
         if hasattr(product, "is_a") and product.is_a("IfcOpeningElement"):
+            if not iterator.next():
+                break
             continue
 
         if _entity_on_hidden_layer(product):
+            if not iterator.next():
+                break
             continue
 
         geom = getattr(shape, "geometry", None)
         if geom is None:
+            if not iterator.next():
+                break
             continue
 
         materials = _clone_materials(getattr(geom, "materials", None))
@@ -5947,6 +5959,8 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                     getattr(product, "GlobalId", "unknown"),
                     step_id,
                 )
+                if not iterator.next():
+                    break
                 continue
 
         try:
@@ -5959,6 +5973,8 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
                 step_id,
                 exc,
             )
+            if not iterator.next():
+                break
             continue
 
         guid_for_log = getattr(product, "GlobalId", None)
@@ -6266,19 +6282,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         hierarchy_nodes = hierarchy_cache.get(key) or _collect_spatial_hierarchy(product)
         hierarchy_cache[key] = hierarchy_nodes
 
-        " Debug Logging"
-        watch = {"Railing_3000mm_Hoarding_Retaining_Wall_7071173",
-                "Strip_Footing_SF1_2000W_x_1200_D_Acoustic_Shed_1736226"}
-        nm = getattr(product, "Name", None) or ""
-        if any(nm.startswith(tok) for tok in watch):
-            import math
-            mat = np.array(xf_tuple or np.eye(4)).reshape(4,4)
-            log.info("DBG %s step=%s T=(%.3f, %.3f, %.3f) | row3=(%.3f, %.3f, %.3f, %.3f)",
-                    nm, step_id, mat[0,3], mat[1,3], mat[2,3],
-                    mat[3,0], mat[3,1], mat[3,2], mat[3,3])
-
-
-
+ 
         guid = getattr(product, "GlobalId", None)
         instances[step_id] = InstanceRecord(
             step_id=step_id,
@@ -6298,7 +6302,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             detail_mesh=detail_mesh_for_instance,
             semantic_parts=semantic_parts,
         )
-        
+
         if not iterator.next():
             break
 
