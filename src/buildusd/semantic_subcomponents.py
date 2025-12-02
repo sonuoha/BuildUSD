@@ -465,11 +465,31 @@ def split_product_by_semantic_roles(
         )
         if sub_faces.size == 0:
             continue
+        # Reconstruct style groups from material IDs so process_usd can bind materials
+        sub_style_groups = {}
+        if sub_mat_ids and materials:
+            from collections import defaultdict
+            mat_to_faces = defaultdict(list)
+            for f_idx, m_id in enumerate(sub_mat_ids):
+                if m_id >= 0:
+                    mat_to_faces[m_id].append(f_idx)
+            
+            for m_id, f_indices in mat_to_faces.items():
+                if 0 <= m_id < len(materials):
+                    mat_obj = materials[m_id]
+                    # Use a consistent naming scheme for the style group
+                    group_name = f"Material_{m_id}"
+                    sub_style_groups[group_name] = {
+                        "material": mat_obj,
+                        "faces": f_indices,
+                        "name": _material_name(mat_obj)
+                    }
+
         parts[label] = {
             "vertices": sub_verts,
             "faces": sub_faces,
             "material_ids": sub_mat_ids,
-            "style_groups": {},
+            "style_groups": sub_style_groups,
         }
 
     return parts
