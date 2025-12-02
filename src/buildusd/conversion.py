@@ -1305,6 +1305,22 @@ def _process_single_ifc(
             offset_tuple = _bp_offset_vector(offset_bp)
             options_for_build = replace(
                 options,
+                model_offset=offset_tuple,
+                model_offset_type="negative",
+            )
+
+        logger.info("Building prototypes for %s...", path_name(ifc_path))
+        caches = build_prototypes(ifc, options_for_build, ifc_path=str(ifc_path))
+        logger.info(
+            "Prototype build complete: %d type prototypes, %d hashed prototypes, %d instances",
+            len(caches.repmaps),
+            len(caches.hashes),
+            len(caches.instances),
+        )
+        logger.info(
+            "IFC %s → %d type prototypes, %d hashed prototypes, %d instances",
+            path_name(ifc_path), len(caches.repmaps), len(caches.hashes), len(caches.instances),
+        )
         authoring_format = _normalise_usd_format(usd_format)
         if authoring_format == "auto":
             authoring_format, _ = _select_auto_usd_format(
@@ -1565,6 +1581,26 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             options_override,
             detail_object_guids=tuple(str(g) for g in detail_guids_arg),
         )
+
+    if getattr(args, "enable_semantic_subcomponents", False):
+        LOG.info("Semantic subcomponent splitting enabled.")
+        options_override = replace(options_override, enable_semantic_subcomponents=True)
+
+    semantic_tokens_path = getattr(args, "semantic_tokens_path", None)
+    if semantic_tokens_path:
+        try:
+            st_path = Path(semantic_tokens_path).resolve()
+            st_text = read_text(st_path)
+            st_payload = json.loads(st_text)
+            if isinstance(st_payload, dict):
+                LOG.info("Loaded semantic tokens from %s", st_path)
+                options_override = replace(options_override, semantic_tokens=st_payload)
+            else:
+                LOG.warning("Semantic tokens file %s must contain a JSON object; ignoring.", st_path)
+        except Exception as exc:
+            print(f"Error: Failed to load semantic tokens from {semantic_tokens_path}: {exc}", file=sys.stderr)
+            shutdown_usd_context()
+            raise SystemExit(2) from exc
     try:
         results = convert(
             args.input_path,
