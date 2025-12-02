@@ -34,6 +34,12 @@ _GLAZING_TOKENS = ("GLAZ", "GLASS", "IGU", "PANE")
 _HARDWARE_TOKENS = ("HANDLE", "HINGE", "LOCK", "LATCH", "KEEPER", "STRIKE")
 
 
+def _get_tokens(tokens_dict: Optional[Dict[str, Sequence[str]]], key: str, defaults: Sequence[str]) -> Sequence[str]:
+    if not tokens_dict:
+        return defaults
+    return tokens_dict.get(key) or defaults
+
+
 def _norm(text: Optional[str]) -> str:
     if not text:
         return ""
@@ -87,17 +93,17 @@ def _aspect_name(aspect: Any) -> str:
     return ""
 
 
-def _classify_aspect_role(aspect: Any) -> Optional[str]:
+def _classify_aspect_role(aspect: Any, tokens: Dict[str, Sequence[str]]) -> Optional[str]:
     name = _norm(_aspect_name(aspect))
     if not name:
         return None
-    if any(tok in name for tok in _PANEL_TOKENS):
+    if any(tok in name for tok in tokens["Panel"]):
         return "Panel"
-    if any(tok in name for tok in _FRAME_TOKENS):
+    if any(tok in name for tok in tokens["Frame"]):
         return "Frame"
-    if any(tok in name for tok in _GLAZING_TOKENS):
+    if any(tok in name for tok in tokens["Glazing"]):
         return "Glazing"
-    if any(tok in name for tok in _HARDWARE_TOKENS):
+    if any(tok in name for tok in tokens["Hardware"]):
         return "Hardware"
     return None
 
@@ -159,6 +165,7 @@ def split_product_by_semantic_roles(
     *,
     materials: Optional[Sequence[Any]] = None,
     min_faces_per_part: int = 16,
+    semantic_tokens: Optional[Dict[str, Sequence[str]]] = None,
 ) -> SemanticParts:
     """
     Best-effort split of a product's triangulated mesh into semantic parts.
@@ -170,8 +177,20 @@ def split_product_by_semantic_roles(
         return {}
 
     face_count = faces.shape[0]
+    if material_ids is not None and len(material_ids) != face_count:
+        # Safety check: mismatched material IDs can cause crashes or corruption.
+        material_ids = None
+
     if face_count < min_faces_per_part * 2:
         return {}
+
+    # Resolve tokens
+    tokens = {
+        "Panel": _get_tokens(semantic_tokens, "Panel", _PANEL_TOKENS),
+        "Frame": _get_tokens(semantic_tokens, "Frame", _FRAME_TOKENS),
+        "Glazing": _get_tokens(semantic_tokens, "Glazing", _GLAZING_TOKENS),
+        "Hardware": _get_tokens(semantic_tokens, "Hardware", _HARDWARE_TOKENS),
+    }
 
     ifc_cls = _ifc_class(product)
 
@@ -204,20 +223,81 @@ def split_product_by_semantic_roles(
             rep_role_hints[rep] = role
 
     aspect_roles: Dict[Any, str] = {}
+    aspect_by_guid: Dict[str, Any] = {}
     for aspect in getattr(product, "HasShapeAspects", []) or []:
-        role = _classify_aspect_role(aspect)
+        guid = getattr(aspect, "GlobalId", None)
+        if guid:
+            aspect_by_guid[guid] = aspect
+        role = _classify_aspect_role(aspect, tokens)
         if role:
             aspect_roles[aspect] = role
 
     if not rep_role_hints and not aspect_roles and not expected_roles:
         return {}
 
+    # Fallback: If we have no explicit style groups (e.g. from IfcStyledItem),
+    # but we DO have material IDs on faces, synthesize groups so we can check material names.
+    effective_style_groups = face_style_groups
+    if not effective_style_groups and material_ids is not None and materials:
+        from collections import defaultdict
+        mat_to_faces: Dict[int, List[int]] = defaultdict(list)
+        for f_idx, m_id in enumerate(material_ids):
+            if m_id >= 0:
+                mat_to_faces[m_id].append(f_idx)
+        
+        if mat_to_faces:
+            effective_style_groups = {}
+            for m_id, f_indices in mat_to_faces.items():
+                if 0 <= m_id < len(materials):
+                    mat_obj = materials[m_id]
+                    # Create a synthetic group entry compatible with _group_name inspection
+                    effective_style_groups[f"Material_{m_id}"] = {
+                        "material": mat_obj,
+                        "faces": f_indices,
+                        "name": _material_name(mat_obj) # Helper to ensure _group_name finds it easily
+                    }
+
     group_role: Dict[str, str] = {}
 
-    for group_key, entry in (face_style_groups or {}).items():
+    for group_key, entry in (effective_style_groups or {}).items():
+        # Robust linking: check for aspect GUIDs first
+        aspect_ids = entry.get("aspect_ids")
+        if aspect_ids:
+            found_role = None
+            for guid in aspect_ids:
+                aspect = aspect_by_guid.get(guid)
+                if aspect and aspect in aspect_roles:
+                    found_role = aspect_roles[aspect]
+                    break
+            if found_role:
+                group_role[group_key] = found_role
+                continue
+
         gname = _group_name(entry)
         if not gname:
+            # Fallback: construct granular label for unclassified parts
+            item_type = entry.get("item_type")
+            step_id = entry.get("step_id")
+            mat_name = _material_name(entry.get("material"))
+            
+            # Prioritize item info if available for granular splitting
+            if item_type and step_id:
+                # e.g. Unclassified_IfcExtrudedAreaSolid_123
+                # Clean up item type (remove 'Ifc' prefix if desired, but full name is safer)
+                clean_type = item_type[3:] if item_type.startswith("Ifc") else item_type
+                label = f"Unclassified_{clean_type}_{step_id}"
+                # Optionally append material for clarity? 
+                # User asked for "isolate the post, panel...". 
+                # Item type + ID is unique. Material is helpful context.
+                # Let's stick to unique ID for now.
+                group_role[group_key] = label
+                continue
+            
+            # Fallback to material name if no item info
+            if mat_name:
+                group_role[group_key] = f"Unclassified_{mat_name}"
             continue
+
         for aspect, role in aspect_roles.items():
             aname = _norm(_aspect_name(aspect))
             if aname and aname in gname:
@@ -231,23 +311,36 @@ def split_product_by_semantic_roles(
                 group_role[group_key] = role
                 break
 
-    for group_key, entry in (face_style_groups or {}).items():
+    for group_key, entry in (effective_style_groups or {}).items():
         if group_key in group_role:
             continue
         gname = _group_name(entry)
-        if not gname:
-            continue
-        if "Panel" in expected_roles and any(tok in gname for tok in _PANEL_TOKENS):
+        
+        # If we have a granular label already generated above (when gname was empty), use it?
+        # Wait, the logic above only runs if `not gname`. 
+        # If `gname` exists (e.g. material name), we still want to potentially use item info if no role matched.
+        
+        if "Panel" in expected_roles and any(tok in gname for tok in tokens["Panel"]):
             group_role[group_key] = "Panel"
-        elif "Frame" in expected_roles and any(tok in gname for tok in _FRAME_TOKENS):
+        elif "Frame" in expected_roles and any(tok in gname for tok in tokens["Frame"]):
             group_role[group_key] = "Frame"
-        elif "Glazing" in expected_roles and any(tok in gname for tok in _GLAZING_TOKENS):
+        elif "Glazing" in expected_roles and any(tok in gname for tok in tokens["Glazing"]):
             group_role[group_key] = "Glazing"
-        elif "Hardware" in expected_roles and any(tok in gname for tok in _HARDWARE_TOKENS):
+        elif "Hardware" in expected_roles and any(tok in gname for tok in tokens["Hardware"]):
             group_role[group_key] = "Hardware"
+        else:
+            # No semantic role matched. Use granular item label.
+            item_type = entry.get("item_type")
+            step_id = entry.get("step_id")
+            if item_type and step_id:
+                clean_type = item_type[3:] if item_type.startswith("Ifc") else item_type
+                group_role[group_key] = f"Unclassified_{clean_type}_{step_id}"
+            elif gname:
+                # Fallback to whatever gname is (likely material name)
+                group_role[group_key] = f"Unclassified_{gname}"
 
     face_role: List[Optional[str]] = [None] * face_count
-    for group_key, entry in (face_style_groups or {}).items():
+    for group_key, entry in (effective_style_groups or {}).items():
         role = group_role.get(group_key)
         if not role:
             continue
@@ -268,7 +361,9 @@ def split_product_by_semantic_roles(
 
     for i in range(face_count):
         if face_role[i] is None:
-            face_role[i] = default_label
+            # If we have other parts, mark this as Unclassified so it doesn't get merged into Body
+            # unless Body is the only thing.
+            face_role[i] = "Unclassified"
 
     label_to_faces: Dict[str, List[int]] = {}
     for idx, label in enumerate(face_role):
@@ -276,11 +371,33 @@ def split_product_by_semantic_roles(
             continue
         label_to_faces.setdefault(label, []).append(idx)
 
+    # Merge Unclassified into default_label if it's the only other part or if default_label exists
+    # Actually, simpler logic: if we have "Unclassified" and "Body", keep both?
+    # Or should "Unclassified" fallback to "Body"?
+    # Let's say: if we have explicit roles, Unclassified stays Unclassified.
+    # If we ONLY have Unclassified, it becomes Body.
+    
+    unique_labels = set(label_to_faces.keys())
+    if "Unclassified" in unique_labels:
+        if len(unique_labels) == 1:
+             # Only Unclassified -> rename to Body (or default_label)
+             label_to_faces[default_label] = label_to_faces.pop("Unclassified")
+        elif default_label in unique_labels:
+             # We have Body and Unclassified. Merge Unclassified into Body?
+             # User requested "Only merge Unclassified into Body if Body is the only other part"
+             # But here we have Body. So we merge?
+             # Let's keep them separate as requested: "Introduce Unclassified... Only merge if Body is the only other part"
+             # Wait, if Body is the only other part, then we have [Body, Unclassified]. 
+             # Merging them makes sense to avoid fragmentation.
+             # If we have [Frame, Panel, Unclassified], we keep Unclassified separate.
+             if len(unique_labels) == 2:
+                 label_to_faces[default_label].extend(label_to_faces.pop("Unclassified"))
+
     for label in list(label_to_faces.keys()):
         if len(label_to_faces[label]) < min_faces_per_part:
             if label != default_label:
                 label_to_faces.setdefault(default_label, []).extend(label_to_faces[label])
-            del label_to_faces[label]
+                del label_to_faces[label]
 
     effective_labels = [lbl for lbl in label_to_faces.keys()]
     if len(effective_labels) <= 1:

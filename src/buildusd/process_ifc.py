@@ -1058,6 +1058,7 @@ class ConversionOptions:
     detail_object_guids: Tuple[str, ...] = tuple()
     enable_instance_material_variants: bool = True
     enable_semantic_subcomponents: bool = False
+    semantic_tokens: Dict[str, List[str]] = field(default_factory=dict)
     # Optional overrides for geometry settings (fed from anchoring logic)
     model_offset: Optional[Tuple[float, float, float]] = None
     model_offset_type: Optional[str] = None
@@ -6035,6 +6036,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                             material_ids=material_ids,
                             face_style_groups=face_style_groups,
                             materials=materials,
+                            semantic_tokens=options.semantic_tokens,
                         ) or {}
                     except Exception:
                         info.semantic_parts = {}
@@ -6061,6 +6063,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                                     material_ids=material_ids,
                                     face_style_groups=face_style_groups,
                                     materials=materials,
+                                    semantic_tokens=options.semantic_tokens,
                                 ) or {}
                             except Exception:
                                 info.semantic_parts_detail = {}
@@ -6300,7 +6303,6 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             mesh=instance_mesh,
             guid=guid,
             style_material=style_material,
-            style_face_groups=_clone_style_groups(face_style_groups),
             style_face_groups=_clone_style_groups(face_style_groups),
             detail_mesh=detail_mesh_for_instance,
             semantic_parts=semantic_parts,
