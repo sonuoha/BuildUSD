@@ -1113,6 +1113,7 @@ class InstanceRecord:
     style_face_groups: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     detail_mesh: Optional["OCCDetailMesh"] = None
     semantic_parts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    ifc_path: Optional[str] = None
 
 @dataclass
 class PrototypeCaches:
@@ -5465,7 +5466,7 @@ def get_type_name(prod):
 # SINGLE-PASS iterator: build_prototypes()
 # ---------------------------------
 
-def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
+def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[str] = None) -> PrototypeCaches:
     """Run the ifcopenshell iterator and build prototype/instance caches.
 
     The iterator is evaluated exactly once.  Geometry is grouped by
@@ -6282,6 +6283,7 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
         hierarchy_nodes = hierarchy_cache.get(key) or _collect_spatial_hierarchy(product)
         hierarchy_cache[key] = hierarchy_nodes
 
+
  
         guid = getattr(product, "GlobalId", None)
         instances[step_id] = InstanceRecord(
@@ -6299,8 +6301,10 @@ def build_prototypes(ifc_file, options: ConversionOptions) -> PrototypeCaches:
             guid=guid,
             style_material=style_material,
             style_face_groups=_clone_style_groups(face_style_groups),
+            style_face_groups=_clone_style_groups(face_style_groups),
             detail_mesh=detail_mesh_for_instance,
             semantic_parts=semantic_parts,
+            ifc_path=ifc_path,
         )
 
         if not iterator.next():

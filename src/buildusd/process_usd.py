@@ -3769,6 +3769,12 @@ def author_instance_layer(
                     except Exception:
                         pass
 
+            if getattr(record, "ifc_path", None):
+                try:
+                    inst_prim.CreateAttribute("ifc:sourcePath", Sdf.ValueTypeNames.String).Set(str(record.ifc_path))
+                except Exception:
+                    pass
+
             if record.transform is not None:
                 xform.AddTransformOp().Set(np_to_gf_matrix(record.transform))
 
