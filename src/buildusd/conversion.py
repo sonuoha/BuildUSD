@@ -1305,22 +1305,6 @@ def _process_single_ifc(
             offset_tuple = _bp_offset_vector(offset_bp)
             options_for_build = replace(
                 options,
-                model_offset=offset_tuple,
-                model_offset_type="negative",
-            )
-
-        logger.info("Building prototypes for %s...", path_name(ifc_path))
-        caches = build_prototypes(ifc, options_for_build)
-        logger.info(
-            "Prototype build complete: %d type prototypes, %d hashed prototypes, %d instances",
-            len(caches.repmaps),
-            len(caches.hashes),
-            len(caches.instances),
-        )
-        logger.info(
-            "IFC %s → %d type prototypes, %d hashed prototypes, %d instances",
-            path_name(ifc_path), len(caches.repmaps), len(caches.hashes), len(caches.instances),
-        )
         authoring_format = _normalise_usd_format(usd_format)
         if authoring_format == "auto":
             authoring_format, _ = _select_auto_usd_format(
