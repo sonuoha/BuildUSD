@@ -209,5 +209,17 @@ def parse_args(
         metavar="GUID",
         help="GUIDs to remesh when --detail-scope object is used (space-separated list).",
     )
+    parser.add_argument(
+        "--enable-semantic-subcomponents",
+        dest="enable_semantic_subcomponents",
+        action="store_true",
+        help="Enable semantic subcomponent splitting (e.g. Panel, Frame, Glazing).",
+    )
+    parser.add_argument(
+        "--semantic-tokens",
+        dest="semantic_tokens_path",
+        default=None,
+        help="Path to a JSON file containing custom semantic tokens.",
+    )
 
     return parser.parse_args(argv)

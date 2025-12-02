@@ -329,19 +329,29 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
     return shape_styles
 
 
-def _shape_aspect_name_map(product: ifcopenshell.entity_instance) -> Dict[int, str]:
-    """Return mapping from representation item id() to a sanitized shape-aspect label."""
-    mapping: Dict[int, str] = {}
+def _map_items_to_aspects(product: ifcopenshell.entity_instance) -> Dict[int, List[ifcopenshell.entity_instance]]:
+    """Return mapping from representation item id() to list of IfcShapeAspects."""
+    mapping: Dict[int, List[ifcopenshell.entity_instance]] = {}
     aspects = getattr(product, "HasShapeAspects", None) or []
     for aspect in aspects:
-        raw_name = getattr(aspect, "Name", None) or getattr(aspect, "Description", None)
-        if not raw_name:
-            continue
-        aspect_name = _sanitize_style_token(raw_name)
         reps = getattr(aspect, "ShapeRepresentations", None) or []
         for rep in reps:
             for item in getattr(rep, "Items", None) or []:
-                mapping[id(item)] = aspect_name
+                mapping.setdefault(id(item), []).append(aspect)
+    return mapping
+
+
+def _shape_aspect_name_map(product: ifcopenshell.entity_instance) -> Dict[int, str]:
+    """Return mapping from representation item id() to a sanitized shape-aspect label."""
+    mapping: Dict[int, str] = {}
+    item_to_aspects = _map_items_to_aspects(product)
+    for item_id, aspects in item_to_aspects.items():
+        # Use the first aspect that has a valid name
+        for aspect in aspects:
+            raw_name = getattr(aspect, "Name", None) or getattr(aspect, "Description", None)
+            if raw_name:
+                mapping[item_id] = _sanitize_style_token(raw_name)
+                break
     return mapping
 
 
@@ -380,38 +390,75 @@ def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, A
         return {}
 
     shape_name_by_item = _shape_aspect_name_map(product)
+    item_to_aspects = _map_items_to_aspects(product)
     combined = {}
     face_offset = 0
     for item in _iter_representation_items(product):
-        item_groups, face_count = _face_style_groups_from_item(item, face_styles, model, shape_name_by_item)
+        item_groups, face_count = _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, item_to_aspects)
         for key, entry in item_groups.items():
             faces = [face_offset + idx for idx in entry.get("faces", [])]
             if not faces:
                 continue
+            
+            # Use step_id in key to prevent merging distinct items
+            step_id = entry.get("step_id")
+            unique_key = key + (step_id,) if step_id is not None else key
+
             grouped = combined.setdefault(
-                key,
-                {"material": entry["material"], "faces": [], "style_id": entry.get("style_id")},
+                unique_key,
+                {
+                    "material": entry["material"],
+                    "faces": [],
+                    "style_id": entry.get("style_id"),
+                    "aspect_ids": set(),
+                    "step_id": step_id,
+                    "item_type": entry.get("item_type"),
+                },
             )
             grouped["faces"].extend(faces)
+            if "aspect_ids" in entry:
+                grouped["aspect_ids"].update(entry["aspect_ids"])
         face_offset += face_count
 
     result = {}
     for i, (key, entry) in enumerate(combined.items()):
         mat = entry["material"]
         token = _sanitize_style_token(f"{mat.name}_{i}")
-        payload = {"material": mat, "faces": entry["faces"]}
+        payload = {
+            "material": mat,
+            "faces": entry["faces"],
+            "aspect_ids": list(entry["aspect_ids"]),
+            "step_id": entry.get("step_id"),
+            "item_type": entry.get("item_type"),
+        }
         if entry.get("style_id") is not None:
             payload["style_id"] = entry["style_id"]
         result[token] = payload
     return result
 
 
-def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item) -> Tuple[Dict, int]:
+def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, item_to_aspects=None) -> Tuple[Dict, int]:
     face_count = _face_count_from_item(item)
     if face_count == 0:
         return {}, 0
 
     item_id = id(item)
+    step_id = item.id()
+    item_type = item.is_a()
+    
+    aspect_ids = set()
+    if item_to_aspects:
+        for aspect in item_to_aspects.get(item_id, []):
+            guid = getattr(aspect, "GlobalId", None)
+            if guid:
+                aspect_ids.add(guid)
+
+    common_payload = {
+        "step_id": step_id,
+        "item_type": item_type,
+        "aspect_ids": aspect_ids
+    }
+
     if item_id in face_styles:
         style = face_styles[item_id][0]
         resolved_style = _resolve_surface_style_entity(style) or style
@@ -432,7 +479,14 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item) -
             style_id = int(resolved_style.id())
         except Exception:
             style_id = None
-        return {("styled", mat.name): {"material": mat, "faces": list(range(face_count)), "style_id": style_id}}, face_count
+        
+        payload = common_payload.copy()
+        payload.update({
+            "material": mat,
+            "faces": list(range(face_count)),
+            "style_id": style_id
+        })
+        return {("styled", mat.name): payload}, face_count
 
     # Fallback: IfcIndexedColourMap
     groups = {}
@@ -458,12 +512,24 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item) -
     if color_entries:
         for key, entry in color_entries.items():
             mat = PBRMaterial(name="Color", base_color=(key[0], key[1], key[2]))
-            groups[("color", key)] = {"material": mat, "faces": entry["faces"], "style_id": None}
+            payload = common_payload.copy()
+            payload.update({
+                "material": mat,
+                "faces": entry["faces"],
+                "style_id": None
+            })
+            groups[("color", key)] = payload
 
     unassigned = [i for i, f in enumerate(assigned) if not f]
     if unassigned:
         mat = PBRMaterial(name="Default")
-        groups[("default",)] = {"material": mat, "faces": unassigned, "style_id": None}
+        payload = common_payload.copy()
+        payload.update({
+            "material": mat,
+            "faces": unassigned,
+            "style_id": None
+        })
+        groups[("default",)] = payload
 
     return groups, face_count
 
