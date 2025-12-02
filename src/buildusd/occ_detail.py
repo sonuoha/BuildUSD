@@ -155,7 +155,6 @@ def build_detail_mesh(
     )
     return OCCDetailMesh(shape=topo_shape, subshapes=subshape_meshes)
 
-
 def _extract_topods_shape(shape_obj: Any, logger: Optional[logging.Logger] = None) -> Optional[Any]:
     """Best-effort conversion of ifcopenshell shapes to TopoDS_Shape."""
     if not is_available():
@@ -543,7 +542,14 @@ def _perform_meshing(
         return False
 
 
-def _collect_face_meshes(target_shape: Any, start_index: int, *, material_key: Optional[Any] = None) -> tuple[List[OCCFaceMesh], int]:
+def _collect_face_meshes(
+    target_shape: Any, 
+    start_index: int, 
+    *, 
+    material_key: Optional[Any] = None,
+    coord_to_vid: Optional[Dict[tuple, int]] = None,
+    tri_map: Optional[Dict[tuple, Dict[str, int]]] = None
+) -> tuple[List[OCCFaceMesh], int]:
     """Collect OCCFaceMesh entries for every face in ``target_shape``."""
     _require_occ_components()
     TopExp_Explorer = sym("TopExp_Explorer")
@@ -558,15 +564,180 @@ def _collect_face_meshes(target_shape: Any, start_index: int, *, material_key: O
             explorer.Next()
             face_index += 1
             continue
-        mesh = _triangulate_face(face)
-        if mesh is not None:
-            mesh.face_index = face_index
-            if material_key is not None and getattr(mesh, "material_key", None) is None:
-                mesh.material_key = material_key
-            faces.append(mesh)
+        
+        # If we have a canonical map, we might split this face into multiple meshes
+        if coord_to_vid and tri_map:
+            split_meshes = _triangulate_face_mapped(face, coord_to_vid, tri_map)
+            if split_meshes:
+                for mesh in split_meshes:
+                    mesh.face_index = face_index
+                    if material_key is not None and getattr(mesh, "material_key", None) is None:
+                        mesh.material_key = material_key
+                    faces.append(mesh)
+            else:
+                # Fallback if mapping fails or produces no mesh
+                mesh = _triangulate_face(face)
+                if mesh is not None:
+                    mesh.face_index = face_index
+                    if material_key is not None and getattr(mesh, "material_key", None) is None:
+                        mesh.material_key = material_key
+                    faces.append(mesh)
+        else:
+            mesh = _triangulate_face(face)
+            if mesh is not None:
+                mesh.face_index = face_index
+                if material_key is not None and getattr(mesh, "material_key", None) is None:
+                    mesh.material_key = material_key
+                faces.append(mesh)
+                
         explorer.Next()
         face_index += 1
     return faces, face_index
+
+
+def _triangulate_face_mapped(
+    face: Any, 
+    coord_to_vid: Dict[tuple, int], 
+    tri_map: Dict[tuple, Dict[str, int]]
+) -> List[OCCFaceMesh]:
+    """Triangulate a face and split it by canonical material/item IDs."""
+    TopLoc_Location = sym("TopLoc_Location")
+    BRep_Tool = sym("BRep_Tool")
+    loc = TopLoc_Location()
+    triangulation = BRep_Tool.Triangulation(face, loc)
+    if triangulation is None:
+        return []
+
+    def _iter_nodes():
+        nodes_fn = getattr(triangulation, "Nodes", None)
+        if callable(nodes_fn):
+            nodes_handle = nodes_fn()
+            if nodes_handle is None:
+                return []
+            length = nodes_handle.Length()
+            return [nodes_handle.Value(i) for i in range(1, length + 1)]
+        nb_nodes_fn = getattr(triangulation, "NbNodes", None)
+        node_fn = getattr(triangulation, "Node", None)
+        if callable(nb_nodes_fn) and callable(node_fn):
+            length = int(nb_nodes_fn())
+            return [node_fn(i) for i in range(1, length + 1)]
+        return []
+
+    def _iter_triangles():
+        triangles_fn = getattr(triangulation, "Triangles", None)
+        if callable(triangles_fn):
+            triangles_handle = triangles_fn()
+            if triangles_handle is None:
+                return []
+            length = triangles_handle.Length()
+            return [triangles_handle.Value(i) for i in range(1, length + 1)]
+        nb_triangles_fn = getattr(triangulation, "NbTriangles", None)
+        triangle_fn = getattr(triangulation, "Triangle", None)
+        if callable(nb_triangles_fn) and callable(triangle_fn):
+            length = int(nb_triangles_fn())
+            return [triangle_fn(i) for i in range(1, length + 1)]
+        return []
+
+    node_points = _iter_nodes()
+    triangle_handles = _iter_triangles()
+    if not node_points or not triangle_handles:
+        return []
+
+    use_transform = hasattr(loc, "IsIdentity") and not loc.IsIdentity()
+    transform = loc.Transformation() if use_transform else None
+    
+    # Extract vertices once
+    vertices = np.zeros((len(node_points), 3), dtype=np.float64)
+    for idx, point in enumerate(node_points):
+        if transform is not None:
+            try:
+                point = point.Transformed(transform)
+            except Exception:
+                pass
+        vertices[idx, :] = (point.X(), point.Y(), point.Z())
+
+    # Group triangles by (material_id, item_id)
+    # We need to re-index vertices for each group to keep meshes clean (optional but good)
+    # For simplicity, we can just slice the global vertex array if we want, 
+    # but usually we want compact vertex arrays for each sub-mesh.
+    # Let's just store indices into the full vertex array for now, 
+    # and maybe optimize later if needed. But OCCFaceMesh expects a vertex array.
+    # So we should probably subset the vertices.
+
+    # Tolerance for coordinate matching
+    TOL = 1e-6
+    def coord_key(p):
+        # We assume vertices are already float64
+        return tuple((np.round(p / TOL) * TOL).tolist())
+
+    # Pre-compute canonical VIDs for all OCC vertices
+    occ_vid_to_canon_vid = {}
+    for i, v in enumerate(vertices):
+        k = coord_key(v)
+        if k in coord_to_vid:
+            occ_vid_to_canon_vid[i] = coord_to_vid[k]
+
+    groups = {}  # (mat_id, item_id) -> list of (i1, i2, i3)
+
+    for tri in triangle_handles:
+        try:
+            i1, i2, i3 = tri.Get()
+            # OCC indices are 1-based
+            idx1, idx2, idx3 = int(i1)-1, int(i2)-1, int(i3)-1
+        except Exception:
+            continue
+        
+        # Map to canonical triangle
+        c1 = occ_vid_to_canon_vid.get(idx1)
+        c2 = occ_vid_to_canon_vid.get(idx2)
+        c3 = occ_vid_to_canon_vid.get(idx3)
+        
+        mat_id = -1
+        item_id = -1
+        
+        if c1 is not None and c2 is not None and c3 is not None:
+            tri_key = tuple(sorted((c1, c2, c3)))
+            if tri_key in tri_map:
+                info = tri_map[tri_key]
+                mat_id = info.get("material_id", -1)
+                item_id = info.get("item_id", -1)
+        
+        key = (mat_id, item_id)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append((idx1, idx2, idx3))
+
+    results = []
+    for (mat_id, item_id), tri_indices in groups.items():
+        # Create a subset of vertices for this group
+        # Find unique vertex indices used in this group
+        used_vids = sorted(list(set(idx for tri in tri_indices for idx in tri)))
+        vid_map = {old: new for new, old in enumerate(used_vids)}
+        
+        sub_vertices = vertices[used_vids]
+        sub_faces = np.array([[vid_map[i1], vid_map[i2], vid_map[i3]] for i1, i2, i3 in tri_indices], dtype=np.int32)
+        
+        # Construct material key (this will be used by semantic splitter later)
+        # We can pass a dict or tuple. The semantic splitter expects something it can understand.
+        # Currently OCCFaceMesh.material_key is used for grouping.
+        # We should probably pass a dict with 'material_id' and 'item_id'.
+        
+        # Note: The semantic splitter in process_ifc.py uses 'occ_mesh_dict' which comes from 'mesh_from_detail_mesh'.
+        # 'mesh_from_detail_mesh' aggregates everything.
+        # We need to ensure that the semantic splitter can access this info.
+        # The 'OCCFaceMesh' has 'material_key'.
+        
+        # Let's use a dict as the key, it's flexible.
+        mat_key = {"material_id": mat_id, "item_id": item_id}
+        
+        results.append(OCCFaceMesh(
+            face_index=0, # Will be set by caller
+            vertices=sub_vertices,
+            faces=sub_faces,
+            material_key=mat_key
+        ))
+        
+    return results
 
 
 def _triangulate_face(face: Any) -> Optional[OCCFaceMesh]:
@@ -1325,6 +1496,7 @@ def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict
             return None
     vert_arrays: List[np.ndarray] = []
     face_arrays: List[np.ndarray] = []
+    material_keys: List[Any] = []
     offset = 0
     for face in faces:
         verts = np.asarray(getattr(face, "vertices", None), dtype=np.float64)
@@ -1333,6 +1505,13 @@ def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict
             continue
         vert_arrays.append(verts)
         face_arrays.append(tris + offset)
+        
+        # Store material key for each face (triangle)
+        # We need to replicate the key for each triangle in this face mesh
+        mat_key = getattr(face, "material_key", None)
+        num_tris = tris.shape[0]
+        material_keys.extend([mat_key] * num_tris)
+        
         offset += verts.shape[0]
     if not vert_arrays or not face_arrays:
         return None
@@ -1347,7 +1526,7 @@ def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict
             vertices = _apply_matrix_to_vertices(vertices, pre_xform)
         except Exception:
             pass
-    return {"vertices": vertices, "faces": faces_arr}
+    return {"vertices": vertices, "faces": faces_arr, "material_keys": material_keys}
 
 
 def proxy_requires_high_detail(stats: Dict[str, float]) -> Tuple[bool, List[str]]:
