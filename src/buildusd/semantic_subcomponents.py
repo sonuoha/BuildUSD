@@ -232,13 +232,65 @@ def split_product_by_semantic_roles(
         if role:
             aspect_roles[aspect] = role
 
-    if not rep_role_hints and not aspect_roles and not expected_roles:
+    # Relaxed check: We proceed if we have hints, expected roles, OR if we have style groups/material keys
+    # that might allow for item-based splitting (even if unclassified).
+    has_geometry_info = bool(face_style_groups) or bool(mesh_dict.get("material_keys"))
+    
+    if not rep_role_hints and not aspect_roles and not expected_roles and not has_geometry_info:
         return {}
 
     # Fallback: If we have no explicit style groups (e.g. from IfcStyledItem),
     # but we DO have material IDs on faces, synthesize groups so we can check material names.
+    # Fallback: If we have no explicit style groups (e.g. from IfcStyledItem),
+    # but we DO have material IDs on faces, synthesize groups so we can check material names.
     effective_style_groups = face_style_groups
-    if not effective_style_groups and material_ids is not None and materials:
+    
+    # Check for material_keys (from OCC detail mesh)
+    material_keys = mesh_dict.get("material_keys")
+    if not effective_style_groups and material_keys:
+        from collections import defaultdict
+        key_to_faces = defaultdict(list)
+        for f_idx, key in enumerate(material_keys):
+            if key is not None:
+                # Key is expected to be a dict or hashable
+                # If it's a dict, we need to make it hashable for the map key
+                if isinstance(key, dict):
+                    # Use a tuple of sorted items as key
+                    map_key = tuple(sorted(key.items()))
+                else:
+                    map_key = key
+                key_to_faces[map_key].append(f_idx)
+        
+        if key_to_faces:
+            effective_style_groups = {}
+            for map_key, f_indices in key_to_faces.items():
+                # Reconstruct the original key info
+                if isinstance(map_key, tuple):
+                    info = dict(map_key)
+                else:
+                    info = {"material_key": map_key} # Fallback
+                
+                mat_id = info.get("material_id", -1)
+                item_id = info.get("item_id", -1)
+                
+                mat_obj = None
+                if materials and 0 <= mat_id < len(materials):
+                    mat_obj = materials[mat_id]
+                
+                # Create a synthetic group entry
+                # We include step_id (item_id) so the granular splitter can use it
+                group_key = f"MaterialKey_{mat_id}_{item_id}"
+                effective_style_groups[group_key] = {
+                    "material": mat_obj,
+                    "faces": f_indices,
+                    "name": _material_name(mat_obj),
+                    "step_id": item_id if item_id != -1 else None,
+                    # We could also pass item_type if we had it, but we only have ID.
+                    # The splitter will use step_id for granular naming.
+                    "item_type": "IfcRepresentationItem" if item_id != -1 else None 
+                }
+
+    elif not effective_style_groups and material_ids is not None and materials:
         from collections import defaultdict
         mat_to_faces: Dict[int, List[int]] = defaultdict(list)
         for f_idx, m_id in enumerate(material_ids):
@@ -338,6 +390,7 @@ def split_product_by_semantic_roles(
             elif gname:
                 # Fallback to whatever gname is (likely material name)
                 group_role[group_key] = f"Unclassified_{gname}"
+
 
     face_role: List[Optional[str]] = [None] * face_count
     for group_key, entry in (effective_style_groups or {}).items():

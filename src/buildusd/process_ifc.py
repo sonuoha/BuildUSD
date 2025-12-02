@@ -5851,6 +5851,38 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
 
             if need_occ_detail and detail_mesh_data is None and occ_settings is not None and not defer_occ_detail:
                 detail_settings_obj = occ_settings
+                # Generate canonical map from iterator mesh (Mode 1)
+                canonical_map = None
+                if mesh_dict_base and "vertices" in mesh_dict_base and "faces" in mesh_dict_base:
+                    try:
+                        # Reuse iterator data for canonical mapping
+                        # We need item IDs too, but iterator might not provide them directly in mesh_dict_base
+                        # However, we can use material_ids as a proxy or if we have item_ids available
+                        # The user's script uses ish.get_faces_representation_item_ids(g)
+                        # Here 'shape.geometry' is the ifcopenshell triangulation object 'g'
+                        
+                        g = shape.geometry
+                        c_verts = mesh_dict_base["vertices"]
+                        c_faces = mesh_dict_base["faces"]
+                        c_mat_ids = material_ids if material_ids else []
+                        
+                        # Try to get item IDs if possible
+                        c_item_ids = []
+                        try:
+                            import ifcopenshell.util.shape as ish
+                            c_item_ids = ish.get_faces_representation_item_ids(g)
+                        except Exception:
+                            pass
+                        
+                        canonical_map = {
+                            "vertices": c_verts,
+                            "faces": c_faces,
+                            "material_ids": c_mat_ids,
+                            "item_ids": c_item_ids
+                        }
+                    except Exception as exc:
+                        log.debug("Failed to build canonical map for %s: %s", product, exc)
+
                 detail_mesh_data = occ_detail.build_detail_mesh_payload(
                     detail_source_obj,
                     detail_settings_obj,
@@ -5861,6 +5893,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     detail_level=ctx.detail_level,
                     material_resolver=detail_material_resolver,
                     reference_shape=shape,
+                    canonical_map=canonical_map,
                 )
                 if detail_mesh_data is None:
                     log.debug(
