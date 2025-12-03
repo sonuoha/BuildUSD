@@ -222,4 +222,10 @@ def parse_args(
         help="Path to a JSON file containing custom semantic tokens.",
     )
 
+    parser.add_argument(
+        "--force-occ",
+        dest="force_occ",
+        action="store_true",
+        help="Bypass semantic splitting and force OCC detail generation for all objects.",
+    )
     return parser.parse_args(argv)

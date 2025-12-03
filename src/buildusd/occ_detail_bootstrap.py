@@ -26,7 +26,7 @@ _REQUIRED = [
     ("OCC.Core.TopLoc", "TopLoc_Location"),
     ("OCC.Core.BRep", "BRep_Tool"),
     ("OCC.Core.Bnd", "Bnd_Box"),
-    ("OCC.Core.BRepBndLib", "brepbndlib_Add"),
+    ("OCC.Core", "BRepBndLib"),
 ]
 
 _OPTIONAL: list[tuple[str, str]] = []
