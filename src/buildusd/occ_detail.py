@@ -108,12 +108,60 @@ def why_unavailable() -> str:
 
 
 
+def _build_canonical_maps(canonical_map: Dict[str, Any]) -> Tuple[Dict[tuple, int], Dict[tuple, Dict[str, int]]]:
+    """Build lookup maps from canonical mesh data."""
+    coord_to_vid: Dict[tuple, int] = {}
+    tri_map: Dict[tuple, Dict[str, int]] = {}
+    
+    verts = canonical_map.get("vertices")
+    faces = canonical_map.get("faces")
+    mat_ids = canonical_map.get("material_ids")
+    if mat_ids is None:
+        mat_ids = []
+    item_ids = canonical_map.get("item_ids")
+    if item_ids is None:
+        item_ids = []
+    
+    if verts is None or faces is None:
+        return coord_to_vid, tri_map
+        
+    # Tolerance for coordinate matching (should match what's used in _triangulate_face_mapped)
+    TOL = 1e-6
+    def coord_key(p):
+        return tuple((np.round(p / TOL) * TOL).tolist())
+
+    # Build vertex map
+    for i, v in enumerate(verts):
+        coord_to_vid[coord_key(v)] = i
+        
+    # Build triangle map
+    for i, face in enumerate(faces):
+        if len(face) != 3:
+            continue
+        # Sort vertex indices to make triangle key invariant to winding order (mostly)
+        # Actually, winding order matters for normals, but for identification, sorted indices are safer if we assume same vertices.
+        # However, we are mapping *canonical* VIDs.
+        tri_key = tuple(sorted((int(face[0]), int(face[1]), int(face[2]))))
+        
+        info = {}
+        if i < len(mat_ids):
+            info["material_id"] = int(mat_ids[i])
+        if i < len(item_ids):
+            info["item_id"] = int(item_ids[i])
+            
+        tri_map[tri_key] = info
+        
+    return coord_to_vid, tri_map
+
+
 def build_detail_mesh(
     shape_obj: Any,
     *,
     linear_deflection: float,
     angular_deflection_rad: float,
     logger: Optional[logging.Logger] = None,
+    coord_to_vid: Optional[Dict[tuple, int]] = None,
+    tri_map: Optional[Dict[tuple, Dict[str, int]]] = None,
 ) -> Optional[OCCDetailMesh]:
     """Return OCC meshes grouped by logical sub-shapes, when OCC is available."""
     if not is_available() or shape_obj is None:
@@ -125,13 +173,24 @@ def build_detail_mesh(
         return None
     linear_tol = max(float(linear_deflection), 1e-6)
     angular_tol = max(float(angular_deflection_rad), math.radians(0.1))
-    if not _perform_meshing(topo_shape, linear_tol, angular_tol, logger=logger, ifc_entity=getattr(shape_obj, "id", lambda: None)()):
+    if not _perform_meshing(
+        topo_shape, 
+        linear_tol, 
+        angular_tol, 
+        logger=logger, 
+        ifc_entity=getattr(shape_obj, "id", lambda: None)()
+    ):
         return None
     subshape_shapes = _primary_subshape_list(topo_shape)
     subshape_meshes: List[OCCSubshapeMesh] = []
     face_counter = 0
     for idx, (label, subshape) in enumerate(subshape_shapes):
-        faces, face_counter = _collect_face_meshes(subshape, face_counter)
+        faces, face_counter = _collect_face_meshes(
+            subshape, 
+            face_counter,
+            coord_to_vid=coord_to_vid,
+            tri_map=tri_map
+        )
         if faces:
             subshape_meshes.append(
                 OCCSubshapeMesh(
@@ -142,7 +201,12 @@ def build_detail_mesh(
                 )
             )
     if not subshape_meshes:
-        faces, _ = _collect_face_meshes(topo_shape, 0)
+        faces, _ = _collect_face_meshes(
+            topo_shape, 
+            0,
+            coord_to_vid=coord_to_vid,
+            tri_map=tri_map
+        )
         if not faces:
             return None
         subshape_meshes.append(
@@ -379,48 +443,25 @@ def _set_bool_flag(params, candidates: Tuple[str, ...], value: bool) -> None:
             return
 
 
-def _shape_diagonal(shape: Any) -> float:
+
+
+
+def _get_bounding_box_diag(shape: Any) -> float:
     if not is_available():
         return 1.0
     try:
         Bnd_Box = sym("Bnd_Box")
-        # Prefer the newer static method API on BRepBndLib, fall back to the
-        # older brepbndlib_Add function if needed.
-        add_callable = None
-
-        # Try new-style BRepBndLib.Add first
-        try:
-            from OCC.Core import BRepBndLib as _BRepBndLib  # type: ignore
-        except ImportError:
-            _BRepBndLib = None
-        if _BRepBndLib is not None:
-            candidate = getattr(_BRepBndLib, "Add", None)
-            if callable(candidate):
-                add_callable = candidate
-
-        # Fallback: old-style brepbndlib_Add symbol
-        if add_callable is None:
-            add_callable = sym_optional("brepbndlib_Add")
-
-        if add_callable is None:
-            raise RuntimeError("brepbndlib Add helper unavailable")
-
-        # Build the bounding box and compute its diagonal
+        BRepBndLib = sym("BRepBndLib")
         box = Bnd_Box()
         box.SetGap(0.0)
-        # Keep call signature consistent with previous behaviour (no extra args)
-        add_callable(shape, box)
-
+        BRepBndLib.Add(shape, box)
         xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
         dx = float(xmax - xmin)
         dy = float(ymax - ymin)
         dz = float(zmax - zmin)
         diag = math.sqrt(max(dx, 0.0) ** 2 + max(dy, 0.0) ** 2 + max(dz, 0.0) ** 2)
-        if not math.isfinite(diag) or diag <= 0.0:
-            return 1.0
-        return diag
+        return float(diag) if diag > 0 else 1.0
     except Exception:
-        # Any failure -> conservative fallback
         return 1.0
 
 
@@ -480,17 +521,30 @@ def safe_mesh_shape(
         except Exception:
             active_log.debug("Detail mesher: sewing failed for %s", ifc_entity, exc_info=True)
 
-    diag = _shape_diagonal(occ_shape)
-    linear_deflection = min(base_linear_deflection, diag * 0.001)
+    # Use absolute deflection from settings to ensure consistency with IfcOpenShell/process_ifc
+    linear_deflection = base_linear_deflection
     angular_deflection = base_angular_deflection
 
+    # Dynamic deflection logic:
+    # Calculate diagonal to determine appropriate scale
+    diag = _get_bounding_box_diag(occ_shape)
+    
+    # Target 0.1% of diagonal as relative deflection
+    # But clamp to the absolute setting (don't exceed what user asked for)
+    # And clamp to a safe minimum (1e-5)
+    relative_deflection = diag * 0.001
+    effective_linear = min(linear_deflection, relative_deflection)
+    effective_linear = max(effective_linear, 1e-5)
+
     params = IMeshTools_Parameters()
-    _set_linear_deflection(params, linear_deflection)
+    _set_linear_deflection(params, effective_linear)
     _set_angular_deflection(params, angular_deflection)
+    
+    # Enforce absolute deflection (SetRelative=False) to match process_ifc.py intent
     _set_bool_flag(
         params,
         ("SetRelative", "SetRelativeMode", "SetRelativeFlag"),
-        True,
+        False,
     )
     _set_bool_flag(
         params,
@@ -506,9 +560,10 @@ def safe_mesh_shape(
     try:
         mesher = BRepMesh_IncrementalMesh(occ_shape, params)
         active_log.debug(
-            "Detail mesher: meshed %s (diag=%.3f, defl=%.5f, angle=%.2f)",
+            "Detail mesher: meshed %s (diag=%.3f, defl=%.5f [req=%.5f], angle=%.2f)",
             ifc_entity,
             diag,
+            effective_linear,
             linear_deflection,
             angular_deflection,
         )
@@ -960,6 +1015,7 @@ def build_detail_mesh_payload(
     material_resolver: Optional[Callable[[Any], Any]] = None,
     reference_shape: Optional[Any] = None,
     unit_scale: float = 1.0,
+    canonical_map: Optional[Dict[int, Any]] = None,
 ) -> Optional[OCCDetailMesh]:
     """Construct OCC face meshes for detail-mode geometry."""
     logref = logger or log
@@ -975,6 +1031,24 @@ def build_detail_mesh_payload(
     except Exception:
         angular_rad = math.radians(default_angular_def)
 
+    # Prepare canonical mapping data if available
+    coord_to_vid: Optional[Dict[tuple, int]] = None
+    tri_map: Optional[Dict[tuple, Dict[str, int]]] = None
+    
+    if canonical_map and "vertices" in canonical_map and "faces" in canonical_map:
+        try:
+            coord_to_vid, tri_map = _build_canonical_maps(canonical_map)
+            if logref:
+                logref.debug(
+                    "OCC detail: prepared canonical map with %d verts and %d triangles for %s",
+                    len(coord_to_vid),
+                    len(tri_map),
+                    getattr(product, "GlobalId", None),
+                )
+        except Exception as exc:
+            if logref:
+                logref.debug("OCC detail: failed to build canonical maps: %s", exc)
+
     def _run_occ_detail(source_obj, source_label: str) -> Optional[OCCDetailMesh]:
         if source_obj is None:
             return None
@@ -983,6 +1057,8 @@ def build_detail_mesh_payload(
             linear_deflection=float(linear_def),
             angular_deflection_rad=angular_rad,
             logger=logref,
+            coord_to_vid=coord_to_vid,
+            tri_map=tri_map,
         )
         if detail is None and logref:
             logref.debug(
@@ -1043,6 +1119,7 @@ def build_detail_mesh_payload(
             material_resolver=material_resolver,
             unit_scale=unit_scale,
         )
+        # Note: fallback representation mesh doesn't support canonical mapping yet as it processes items individually
         if detail_mesh is not None and logref:
             logref.debug(
                 "OCC detail: fallback per-representation extraction succeeded for %s (guid=%s)",
@@ -1526,7 +1603,24 @@ def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict
             vertices = _apply_matrix_to_vertices(vertices, pre_xform)
         except Exception:
             pass
-    return {"vertices": vertices, "faces": faces_arr, "material_keys": material_keys}
+            
+    # Extract integer material IDs for standard pipeline compatibility
+    material_ids = []
+    for k in material_keys:
+        if isinstance(k, dict):
+            # Use -1 for missing/invalid material ID
+            material_ids.append(int(k.get("material_id", -1)))
+        elif isinstance(k, int):
+            material_ids.append(k)
+        else:
+            material_ids.append(-1)
+            
+    return {
+        "vertices": vertices, 
+        "faces": faces_arr, 
+        "material_keys": material_keys,
+        "material_ids": material_ids
+    }
 
 
 def proxy_requires_high_detail(stats: Dict[str, float]) -> Tuple[bool, List[str]]:

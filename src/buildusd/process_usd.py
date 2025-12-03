@@ -259,35 +259,76 @@ Vec2 = Tuple[float, float]
 
 
 def _reindex_for_uv_seams(
-    points: List[Vec3],
-    normals: Optional[List[Vec3]],
-    face_vertex_indices: List[int],
-    uv_per_corner: List[Vec2],
-) -> Tuple[List[Vec3], Optional[List[Vec3]], List[int], List[Vec2]]:
-    """Duplicate vertices at UV seams so st can use vertex interpolation."""
-    assert len(face_vertex_indices) == len(uv_per_corner), "UV corners must match vertex index count."
-    key_to_new_index: Dict[Tuple[int, float, float], int] = {}
-    new_points: List[Vec3] = []
-    new_normals: Optional[List[Vec3]] = [] if normals is not None else None
-    new_indices: List[int] = []
-    new_uvs: List[Vec2] = []
-
-    for corner_idx, original_index in enumerate(face_vertex_indices):
-        uv = uv_per_corner[corner_idx]
-        key = (int(original_index), float(uv[0]), float(uv[1]))
-        existing = key_to_new_index.get(key)
-        if existing is None:
-            new_index = len(new_points)
-            key_to_new_index[key] = new_index
-            new_points.append(points[original_index])
-            if new_normals is not None and normals is not None:
-                new_normals.append(normals[original_index])
-            new_uvs.append((float(uv[0]), float(uv[1])))
-        else:
-            new_index = existing
-        new_indices.append(new_index)
-
-    return new_points, new_normals, new_indices, new_uvs
+    points: np.ndarray,
+    normals: Optional[np.ndarray],
+    face_vertex_indices: np.ndarray,
+    uv_per_corner: np.ndarray,
+) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray, np.ndarray]:
+    """Duplicate vertices at UV seams using vectorized operations."""
+    # Combine vertex index and UV coordinates into a unique key for each corner
+    # We use a structured array or lexsort to find unique combinations
+    
+    # Create a composite key array: (original_index, u, v)
+    # We need to ensure float UVs are handled correctly (precision issues might occur, but typically exact match is needed for seams)
+    
+    # Stack data to form rows of [original_index, u, v]
+    # original_index is int, u,v are floats. We can view all as float64 or similar for sorting if indices fit.
+    # Safer to use structured array or lexsort.
+    
+    # Let's use lexsort.
+    # keys: v, u, original_index
+    u = uv_per_corner[:, 0]
+    v = uv_per_corner[:, 1]
+    orig_idx = face_vertex_indices
+    
+    # Lexsort keys (last key is primary)
+    # We want to group by (orig_idx, u, v)
+    # So we sort by v, then u, then orig_idx
+    sort_order = np.lexsort((v, u, orig_idx))
+    
+    # Apply sort
+    sorted_orig_idx = orig_idx[sort_order]
+    sorted_u = u[sort_order]
+    sorted_v = v[sort_order]
+    
+    # Find unique changes
+    # A row is different if any of orig_idx, u, v changed
+    diff_orig = np.diff(sorted_orig_idx) != 0
+    diff_u = np.diff(sorted_u) != 0
+    diff_v = np.diff(sorted_v) != 0
+    
+    # Combine diffs (boolean OR)
+    diff_mask = diff_orig | diff_u | diff_v
+    
+    # Prepend True for the first element
+    unique_mask = np.concatenate(([True], diff_mask))
+    
+    # These are the unique vertices we need to create
+    # The number of unique vertices is the sum of unique_mask
+    num_unique = np.sum(unique_mask)
+    
+    # We need to map from the sorted position to the new unique index
+    # cumsum of unique_mask gives the new index for each sorted entry (0-based if we subtract 1)
+    new_indices_sorted = np.cumsum(unique_mask) - 1
+    
+    # Now we need to map back to the original order
+    # We can create an array that maps 'sort_order' back to original positions
+    # Or simply scatter 'new_indices_sorted' back to their original positions
+    new_indices = np.empty_like(face_vertex_indices)
+    new_indices[sort_order] = new_indices_sorted
+    
+    # Extract the unique data to form the new vertex arrays
+    # We can just take the values at the unique positions in the sorted arrays
+    unique_orig_indices = sorted_orig_idx[unique_mask]
+    unique_uvs = np.column_stack((sorted_u[unique_mask], sorted_v[unique_mask]))
+    
+    new_points = points[unique_orig_indices]
+    
+    new_normals = None
+    if normals is not None:
+        new_normals = normals[unique_orig_indices]
+        
+    return new_points, new_normals, new_indices, unique_uvs
 
 
 def _material_name_from_entry(entry: Any) -> Optional[str]:
@@ -417,18 +458,18 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
         LOG.debug("Unsupported face array shape %s; skipping mesh.", faces_np.shape)
         return None
 
-    face_vertex_counts = [faces_np.shape[1]] * faces_np.shape[0]
-    face_vertex_indices = faces_np.reshape(-1).astype(int).tolist()
-    points = [tuple(map(float, row)) for row in verts_np.tolist()]
+    face_vertex_counts = np.full(faces_np.shape[0], faces_np.shape[1], dtype=np.int32)
+    face_vertex_indices = faces_np.reshape(-1).astype(np.int32)
+    points = verts_np
 
     normals_interp: Optional[str] = None
-    normals_values: Optional[List[Vec3]] = None
+    normals_values: Optional[np.ndarray] = None
     normals_src = mesh_data.get("normals")
     if normals_src is not None:
         try:
             normals_np = np.asarray(normals_src, dtype=np.float32).reshape(-1, 3)
             if normals_np.shape[0] == verts_np.shape[0]:
-                normals_values = [tuple(map(float, row)) for row in normals_np.tolist()]
+                normals_values = normals_np
                 normals_interp = UsdGeom.Tokens.vertex
         except Exception:
             LOG.debug("Unable to process normals; continuing without them.", exc_info=True)
@@ -441,7 +482,7 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
     uv_values = _first_available("uvs", "uv_coords", "uvcoordinates", "uv", "texcoords")
     uv_indices = _first_available("uv_indices", "uv_index", "uvs_indices", "uvfaces", "uv_faces")
-    st_values: Optional[List[Vec2]] = None
+    st_values: Optional[np.ndarray] = None
     st_interp: Optional[str] = None
 
     if uv_values is not None:
@@ -453,16 +494,16 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 uv_np = uv_np.reshape(-1, 2)
             elif uv_np.ndim >= 2:
                 uv_np = uv_np.reshape(-1, uv_np.shape[-1])[:, :2]
-            uv_per_corner: Optional[List[Vec2]] = None
+            uv_per_corner: Optional[np.ndarray] = None
             if uv_indices is not None:
                 uv_idx_np = np.asarray(uv_indices, dtype=np.int64).flatten()
-                if uv_idx_np.size == len(face_vertex_indices):
-                    uv_per_corner = [tuple(map(float, uv_np[idx])) for idx in uv_idx_np]
+                if uv_idx_np.size == face_vertex_indices.size:
+                    uv_per_corner = uv_np[uv_idx_np]
             else:
-                if uv_np.shape[0] == len(face_vertex_indices):
-                    uv_per_corner = [tuple(map(float, row)) for row in uv_np]
+                if uv_np.shape[0] == face_vertex_indices.size:
+                    uv_per_corner = uv_np
                 elif uv_np.shape[0] == verts_np.shape[0]:
-                    st_values = [tuple(map(float, row)) for row in uv_np]
+                    st_values = uv_np
                     st_interp = UsdGeom.Tokens.vertex
 
             if uv_per_corner is not None:
@@ -472,7 +513,7 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 )
                 points = new_points
                 face_vertex_indices = new_indices
-                face_vertex_counts = [3] * (len(face_vertex_indices) // 3)
+                face_vertex_counts = np.full(new_indices.size // 3, 3, dtype=np.int32)
                 st_values = new_st
                 st_interp = UsdGeom.Tokens.vertex
                 if new_normals is not None:
@@ -3451,10 +3492,21 @@ def _bind_detail_materials(
     resolved_materials: Dict[Any, Sdf.Path],
 ) -> None:
     mesh_path = mesh_geom.GetPath()
+    # print(f"DEBUG: _bind_detail_materials keys={face_material_keys}")
     if not resolved_materials:
         _bind_ifc_named_materials(stage, mesh_path)
         return
     keys = list(face_material_keys or [])
+    
+    # Normalize keys (handle dicts from OCC detail)
+    normalized_keys = []
+    for k in keys:
+        if isinstance(k, dict):
+            normalized_keys.append(int(k.get("material_id", -1)))
+        else:
+            normalized_keys.append(k)
+    keys = normalized_keys
+    
     valid_keys = [key for key in keys if key in resolved_materials]
     if not valid_keys:
         _apply_material_bindings_to_prim(stage, mesh_geom.GetPrim(), resolved_materials, mesh_path=mesh_path)

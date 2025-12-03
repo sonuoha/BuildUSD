@@ -367,6 +367,7 @@ def _build_object_scope_detail_mesh(
     *,
     material_resolver,
     reference_shape=None,
+    canonical_map=None,
 ) -> Optional["OCCDetailMesh"]:
     if ctx.object_scope_settings is None:
         return None
@@ -404,6 +405,7 @@ def _build_object_scope_detail_mesh(
         detail_level=ctx.detail_level,
         material_resolver=material_resolver,
         reference_shape=reference_shape,
+        canonical_map=canonical_map,
     )
 
 
@@ -1059,6 +1061,7 @@ class ConversionOptions:
     enable_instance_material_variants: bool = True
     enable_semantic_subcomponents: bool = False
     semantic_tokens: Dict[str, List[str]] = field(default_factory=dict)
+    force_occ: bool = False
     # Optional overrides for geometry settings (fed from anchoring logic)
     model_offset: Optional[Tuple[float, float, float]] = None
     model_offset_type: Optional[str] = None
@@ -1199,6 +1202,19 @@ class PrototypeBuildContext:
 
         detail_mode_requested = detail_scope == "all"
         user_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
+        force_occ = getattr(options, "force_occ", False)
+
+        if force_occ:
+            # Force OCC requires high detail generation (enforced by CLI/conversion)
+            
+            if detail_scope in ("none", "all"):
+                log.info("Force OCC enabled: applying OCC pipeline to ALL products (Global Run).")
+                detail_scope = "all"
+                # We also disable semantic subcomponents implicitly for the global run if they weren't explicitly requested?
+                # The user said: "bypass the semantic decoposition step".
+                # My logic in build_prototypes handles the bypass.
+            elif detail_scope == "object":
+                log.info("Force OCC enabled: bypassing semantic splitting for detailed objects.")
 
         # Instantiate our unified settings manager
         base_geom_settings = dict(_BASE_GEOM_SETTINGS)
@@ -5467,6 +5483,178 @@ def get_type_name(prod):
 # SINGLE-PASS iterator: build_prototypes()
 # ---------------------------------
 
+def _build_recursive_ifc_mesh(product, settings, logger=None):
+    """
+    Recursively decompose a product's representation to generate a granular mesh.
+    
+    This traverses IfcMappedItem and IfcBooleanResult to reach leaf items (Extrusions, etc.),
+    generating separate meshes for each leaf and tagging them with the leaf's Item ID.
+    This allows semantic splitting to distinguish parts even within mapped representations.
+    """
+    import ifcopenshell.util.placement
+    import ifcopenshell.geom
+
+    # Simple cache to avoid re-processing the same product/representation multiple times
+    # Key: product.id()
+    if not hasattr(_build_recursive_ifc_mesh, "_cache"):
+        _build_recursive_ifc_mesh._cache = {}
+    
+    prod_id = product.id()
+    if prod_id in _build_recursive_ifc_mesh._cache:
+        return _build_recursive_ifc_mesh._cache[prod_id]
+
+    # Collect all leaf items with their accumulated transforms
+    leaves = []
+    
+    def _process_item(item, parent_xf):
+        if item.is_a("IfcMappedItem"):
+            source = item.MappingSource
+            target = item.MappingTarget
+            
+            # Convert target operator to matrix
+            try:
+                # This function handles IfcAxis2Placement3D/2D and IfcCartesianTransformationOperator3D/2D
+                # Note: get_operator_matrix is available in recent ifcopenshell versions
+                xf = ifcopenshell.util.placement.get_operator_matrix(target)
+            except (AttributeError, Exception):
+                # Fallback: try to construct it manually or assume identity if failing
+                # For now, let's assume identity to be safe, but log warning
+                xf = np.eye(4)
+                # We could try to use get_local_placement if it was a placement, but it's an operator.
+
+            # Combine with parent transform
+            combined_xf = parent_xf @ xf
+            
+            # Recurse into source representation
+            if source.MappedRepresentation:
+                for sub_item in source.MappedRepresentation.Items:
+                    _process_item(sub_item, combined_xf)
+                    
+        elif item.is_a("IfcBooleanResult"):
+            # Treat BooleanResult as a leaf to preserve the boolean operation result,
+            # unless we explicitly want to decompose operands (which might be geometrically invalid).
+            leaves.append((item, parent_xf))
+            
+        else:
+            # Leaf item (Extrusion, Brep, etc.)
+            leaves.append((item, parent_xf))
+
+    # Start traversal
+    reps = []
+    if hasattr(product, "is_a"):
+        if product.is_a("IfcProduct"):
+             if product.Representation:
+                 reps = product.Representation.Representations
+        elif product.is_a("IfcShapeRepresentation"):
+             reps = [product]
+        elif product.is_a("IfcProductDefinitionShape"):
+             reps = product.Representations
+    
+    if not reps:
+        return None
+
+    for rep in reps:
+        for item in rep.Items:
+            _process_item(item, np.eye(4))
+
+    if not leaves:
+        return None
+
+    # Generate meshes for leaves
+    all_verts = []
+    all_faces = []
+    all_mat_ids = []
+    all_item_ids = []
+    
+    materials_list = []
+    material_cache = {} # name -> index
+
+    total_verts = 0
+    
+    for item, xf in leaves:
+        try:
+            # Create shape for the leaf item using the same settings
+            shape = ifcopenshell.geom.create_shape(settings, item)
+            if not shape:
+                continue
+                
+            # Extract geometry
+            verts = shape.geometry.verts # flat list of floats
+            faces = shape.geometry.faces # flat list of ints
+            
+            if not verts or not faces:
+                continue
+                
+            # Convert to numpy
+            verts_np = np.array(verts).reshape(-1, 3)
+            faces_np = np.array(faces).reshape(-1, 3)
+            
+            # Apply transform
+            # xf is 4x4, verts is Nx3
+            verts_h = np.hstack([verts_np, np.ones((verts_np.shape[0], 1))])
+            verts_transformed = (verts_h @ xf.T)[:, :3]
+            
+            # Offset faces
+            faces_offset = faces_np + total_verts
+            
+            # Handle materials
+            item_mat_ids = shape.geometry.material_ids
+            if not item_mat_ids:
+                item_mat_ids = [-1] * faces_np.shape[0]
+            
+            # Map item materials to our global list
+            mapped_mat_ids = []
+            for m_id in item_mat_ids:
+                if m_id < 0:
+                    mapped_mat_ids.append(-1)
+                    continue
+                    
+                if m_id < len(shape.geometry.materials):
+                    mat = shape.geometry.materials[m_id]
+                    # Use name as key (or id if available, but these are wrappers)
+                    # mat.name is usually reliable
+                    mat_key = mat.name
+                    if mat_key not in material_cache:
+                        material_cache[mat_key] = len(materials_list)
+                        materials_list.append(mat)
+                    mapped_mat_ids.append(material_cache[mat_key])
+                else:
+                    mapped_mat_ids.append(-1)
+
+            # Store data
+            all_verts.append(verts_transformed)
+            all_faces.append(faces_offset)
+            all_mat_ids.extend(mapped_mat_ids)
+            # Tag every face with the leaf item ID
+            all_item_ids.extend([item.id()] * faces_np.shape[0])
+            
+            total_verts += verts_transformed.shape[0]
+            
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to process leaf item {item.id()}: {e}")
+            continue
+
+    if not all_verts:
+        _build_recursive_ifc_mesh._cache[prod_id] = None
+        return None
+
+    # Combine all
+    final_verts = np.vstack(all_verts)
+    final_faces = np.vstack(all_faces)
+    final_mat_ids = np.array(all_mat_ids, dtype=np.int32)
+    final_item_ids = np.array(all_item_ids, dtype=np.int32)
+    
+    result = {
+        "vertices": final_verts,
+        "faces": final_faces,
+        "material_ids": final_mat_ids,
+        "item_ids": final_item_ids,
+        "materials": materials_list
+    }
+    _build_recursive_ifc_mesh._cache[prod_id] = result
+    return result
+
 def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[str] = None) -> PrototypeCaches:
     """Run the ifcopenshell iterator and build prototype/instance caches.
 
@@ -5526,7 +5714,15 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             map_conversion=extract_map_conversion(ifc_file),
         )
 
+    import time
+    start_time = time.perf_counter()
+    processed_count = 0
+
     while True:
+        processed_count += 1
+        if processed_count % 100 == 0:
+            elapsed = time.perf_counter() - start_time
+            log.info(f"Processed {processed_count} products in {elapsed:.2f}s ({processed_count/elapsed:.1f} products/s)")
 
         shape = iterator.get()
         if shape is None:
@@ -5734,8 +5930,13 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
 
         need_fine_remesh = False
         allow_brep_fallback = False
+        force_occ = getattr(options, "force_occ", False)
         need_occ_detail = False
-        defer_occ_detail = bool(getattr(options, "enable_semantic_subcomponents", False))
+        defer_occ_detail = bool(getattr(options, "enable_semantic_subcomponents", False)) and not force_occ
+
+        if force_occ and ctx.detail_scope != "object":
+            need_occ_detail = True
+            detail_reasons.append("force_occ")
 
         if detail_object_match:
             log.info(
@@ -6184,23 +6385,93 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
 
         # Semantic sub-component selection (prototype-driven when available)
         semantic_parts: Dict[str, Dict[str, Any]] = {}
-        if getattr(options, "enable_semantic_subcomponents", False):
+        
+        # Determine if we should attempt semantic splitting
+        should_attempt_semantic = getattr(options, "enable_semantic_subcomponents", False)
+        if getattr(options, "force_occ", False):
+            # If force_occ is on, we skip semantic ONLY if this object is targeted for OCC detail
+            if ctx.detail_scope == "all":
+                should_attempt_semantic = False
+            elif ctx.detail_scope == "object" and detail_object_match:
+                should_attempt_semantic = False
+        
+        if product_id_int in (461286, 577409, 573013):
+            log.info(f"DEBUG: Product {product_id_int} match={detail_object_match} force_occ={getattr(options, 'force_occ', False)} scope={ctx.detail_scope} semantic={should_attempt_semantic} ids={ctx.detail_object_ids}")
+
+        if should_attempt_semantic:
             if primary_key is not None:
                 proto = None
                 if primary_key.kind in ("repmap", "repmap_detail"):
                     proto = repmaps.get(primary_key.identifier)
                 elif primary_key.kind == "hash":
                     proto = hashes.get(primary_key.identifier)
+                
                 if proto is not None:
+                    # Check if prototype needs granular upgrade (if missing semantic parts)
+                    if not getattr(proto, "semantic_parts", None):
+                        # Try to upgrade prototype with granular mesh
+                        rep_map_source = None
+                        if product.Representation:
+                            for rep in product.Representation.Representations:
+                                for item in rep.Items:
+                                    if item.is_a("IfcMappedItem"):
+                                        # Check if this mapped item matches the prototype identifier
+                                        # For repmap, identifier is usually the ID of the mapped representation
+                                        source_rep = item.MappingSource.MappedRepresentation
+                                        if source_rep and source_rep.id() == primary_key.identifier:
+                                            rep_map_source = source_rep
+                                            break
+                                if rep_map_source: break
+                        
+                        if rep_map_source:
+                            try:
+                                rec_mesh = _build_recursive_ifc_mesh(rep_map_source, settings, logger=log)
+                                if rec_mesh:
+                                    # Normalize materials
+                                    rec_materials = _normalize_geom_materials(rec_mesh["materials"], {}, ifc_file)
+                                    
+                                    # Split it using instance properties
+                                    parts = semantic_subcomponents.split_product_by_semantic_roles(
+                                        ifc_file=ifc_file,
+                                        product=product,
+                                        mesh_dict=rec_mesh,
+                                        material_ids=rec_mesh["material_ids"],
+                                        face_style_groups={}, # Use material IDs
+                                        materials=rec_materials,
+                                    )
+                                    if parts:
+                                        proto.semantic_parts = parts
+                            except Exception:
+                                pass
+
                     if detail_mesh_for_instance is not None and getattr(proto, "semantic_parts_detail", None):
                         semantic_parts = getattr(proto, "semantic_parts_detail", {}) or {}
                     else:
                         semantic_parts = getattr(proto, "semantic_parts", {}) or {}
+                    
+                    # If force_occ is enabled, we must ignore prototype semantic parts for targeted objects
+                    if getattr(options, "force_occ", False):
+                        if ctx.detail_scope == "all":
+                            semantic_parts = {}
+                        elif ctx.detail_scope == "object" and detail_object_match:
+                            semantic_parts = {}
             elif mesh_dict is not None:
                 try:
+                    # Attempt recursive build for granular items
+                    recursive_mesh = _build_recursive_ifc_mesh(product, settings, logger=log)
+                    
+                    target_mesh = recursive_mesh if recursive_mesh else mesh_dict
+                    target_mat_ids = recursive_mesh["material_ids"] if recursive_mesh else material_ids
+                    
+                    target_materials = materials
+                    if recursive_mesh:
+                        target_materials = _normalize_geom_materials(recursive_mesh["materials"], {}, ifc_file)
+                    
+                    effective_style_groups = face_style_groups if not recursive_mesh else {}
+
                     _log_semantic_attempt(
                         product,
-                        mesh_dict,
+                        target_mesh,
                         face_style_groups,
                         materials,
                         label="instance",
@@ -6208,10 +6479,10 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     semantic_parts = semantic_subcomponents.split_product_by_semantic_roles(
                         ifc_file=ifc_file,
                         product=product,
-                        mesh_dict=mesh_dict,
-                        material_ids=material_ids,
-                        face_style_groups=face_style_groups,
-                        materials=materials,
+                        mesh_dict=target_mesh,
+                        material_ids=target_mat_ids,
+                        face_style_groups=effective_style_groups,
+                        materials=target_materials,
                     ) or {}
                 except Exception:
                     semantic_parts = {}
@@ -6222,6 +6493,33 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             # If semantic splitting produced nothing and OCC detail was requested, build it now.
             if not semantic_parts and need_occ_detail and detail_mesh_for_instance is None:
                 detail_mesh_data = None
+                
+                # Generate canonical map from iterator mesh (Mode 1)
+                canonical_map = None
+                if mesh_dict_base and "vertices" in mesh_dict_base and "faces" in mesh_dict_base:
+                    try:
+                        # Reuse iterator data for canonical mapping
+                        g = shape.geometry
+                        c_verts = mesh_dict_base["vertices"]
+                        c_faces = mesh_dict_base["faces"]
+                        c_mat_ids = material_ids if material_ids else []
+                        
+                        # Try to get item IDs if possible
+                        c_item_ids = []
+                        try:
+                            import ifcopenshell.util.shape as ish
+                            c_item_ids = ish.get_faces_representation_item_ids(g)
+                        except Exception:
+                            pass
+                            
+                        canonical_map = {
+                            "vertices": c_verts,
+                            "faces": c_faces,
+                            "material_ids": c_mat_ids,
+                            "item_ids": c_item_ids
+                        }
+                    except Exception:
+                        pass
 
                 if ctx.detail_scope == "object" and detail_object_match:
                     if ctx.object_scope_settings is not None:
@@ -6231,6 +6529,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                             product,
                             material_resolver=detail_material_resolver,
                             reference_shape=shape,
+                            canonical_map=canonical_map,
                         )
                         if detail_mesh_data is None:
                             log.debug(
@@ -6245,6 +6544,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                             detail_mesh_data = type_detail_mesh
                 elif occ_settings is not None:
                     detail_settings_obj = occ_settings
+
                     detail_mesh_data = occ_detail.build_detail_mesh_payload(
                         detail_source_obj,
                         detail_settings_obj,
@@ -6255,6 +6555,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                         detail_level=ctx.detail_level,
                         material_resolver=detail_material_resolver,
                         reference_shape=shape,
+                        canonical_map=canonical_map,
                     )
                     if detail_mesh_data is None:
                         log.debug(
