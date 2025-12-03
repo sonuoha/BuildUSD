@@ -5953,9 +5953,9 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             # been attempted. This preserves the intended pipeline:
             #   iterator → semantic split → OCC detail (fallback) → iterator mesh.
             #
-            # If semantic splitting is disabled entirely, we can still build the
-            # object-scope OCC detail eagerly as before.
-            if not getattr(options, "enable_semantic_subcomponents", False):
+            # If semantic splitting is disabled entirely OR force_occ is on, we build
+            # the object-scope OCC detail eagerly.
+            if not getattr(options, "enable_semantic_subcomponents", False) or force_occ:
                 detail_mesh_data = _build_object_scope_detail_mesh(
                     ctx,
                     product,
@@ -6454,7 +6454,12 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                         if ctx.detail_scope == "all":
                             semantic_parts = {}
                         elif ctx.detail_scope == "object" and detail_object_match:
+                            log.info("DEBUG: Force-OCC clearing semantic parts for %s (proto has %d parts)", product.id(), len(semantic_parts))
                             semantic_parts = {}
+                    
+                    if detail_object_match:
+                        log.info("DEBUG: Object %s detail_match=True. semantic_parts=%d, detail_mesh=%s", 
+                                 product.id(), len(semantic_parts), "YES" if detail_mesh_for_instance else "NO")
             elif mesh_dict is not None:
                 try:
                     # Attempt recursive build for granular items

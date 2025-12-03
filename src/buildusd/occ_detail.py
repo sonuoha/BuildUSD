@@ -517,6 +517,7 @@ def safe_mesh_shape(
         TopAbs_SOLID = None
         TopAbs_SHELL = None
 
+    sewed_performed = False
     if BRepBuilderAPI_Sewing is not None:
         # Optimization: skip sewing if the shape is already a solid or shell
         # Sewing is expensive and mostly needed for compounds of faces.
@@ -537,6 +538,7 @@ def safe_mesh_shape(
                 sewn = sewing.SewedShape()
                 if sewn is not None and not sewn.IsNull():
                     occ_shape = sewn
+                sewed_performed = True
             except Exception:
                 active_log.debug("Detail mesher: sewing failed for %s", ifc_entity, exc_info=True)
 
@@ -576,8 +578,34 @@ def safe_mesh_shape(
         True,
     )
 
+    mesher = None
+    success = False
+    
+    # First meshing attempt
     try:
         mesher = BRepMesh_IncrementalMesh(occ_shape, params)
+        success = True
+    except Exception as exc:
+        active_log.debug("Detail mesher: first pass failed for %s: %s", ifc_entity, exc)
+
+    # Fallback: if failed and we skipped sewing, try sewing now
+    if not success and not sewed_performed and BRepBuilderAPI_Sewing is not None:
+        active_log.info("Detail mesher: fallback to sewing for %s", ifc_entity)
+        try:
+            sewing = BRepBuilderAPI_Sewing(1e-6)
+            sewing.Add(occ_shape)
+            sewing.Perform()
+            sewn = sewing.SewedShape()
+            if sewn is not None and not sewn.IsNull():
+                occ_shape = sewn
+                # Retry meshing
+                mesher = BRepMesh_IncrementalMesh(occ_shape, params)
+                success = True
+        except Exception as exc:
+             active_log.warning("Detail mesher: fallback sewing/meshing failed for %s: %s", ifc_entity, exc)
+             return False, None
+
+    if success and mesher:
         active_log.debug(
             "Detail mesher: meshed %s (diag=%.3f, defl=%.5f [req=%.5f], angle=%.2f)",
             ifc_entity,
@@ -587,8 +615,8 @@ def safe_mesh_shape(
             angular_deflection,
         )
         return True, mesher
-    except Exception as exc:
-        active_log.warning("Detail mesher: OCC meshing failed for %s: %s", ifc_entity, exc)
+    else:
+        active_log.warning("Detail mesher: OCC meshing failed for %s", ifc_entity)
         return False, None
 
 
