@@ -510,16 +510,35 @@ def safe_mesh_shape(
     except Exception:
         active_log.debug("Detail mesher: BRepCheck analyzer failed for %s", ifc_entity, exc_info=True)
 
+    try:
+        TopAbs_SOLID = sym("TopAbs_SOLID")
+        TopAbs_SHELL = sym("TopAbs_SHELL")
+    except Exception:
+        TopAbs_SOLID = None
+        TopAbs_SHELL = None
+
     if BRepBuilderAPI_Sewing is not None:
-        try:
-            sewing = BRepBuilderAPI_Sewing(1e-6)
-            sewing.Add(occ_shape)
-            sewing.Perform()
-            sewn = sewing.SewedShape()
-            if sewn is not None and not sewn.IsNull():
-                occ_shape = sewn
-        except Exception:
-            active_log.debug("Detail mesher: sewing failed for %s", ifc_entity, exc_info=True)
+        # Optimization: skip sewing if the shape is already a solid or shell
+        # Sewing is expensive and mostly needed for compounds of faces.
+        should_sew = True
+        if TopAbs_SOLID is not None and TopAbs_SHELL is not None:
+            try:
+                st = occ_shape.ShapeType()
+                if st == TopAbs_SOLID or st == TopAbs_SHELL:
+                    should_sew = False
+            except Exception:
+                pass
+        
+        if should_sew:
+            try:
+                sewing = BRepBuilderAPI_Sewing(1e-6)
+                sewing.Add(occ_shape)
+                sewing.Perform()
+                sewn = sewing.SewedShape()
+                if sewn is not None and not sewn.IsNull():
+                    occ_shape = sewn
+            except Exception:
+                active_log.debug("Detail mesher: sewing failed for %s", ifc_entity, exc_info=True)
 
     # Use absolute deflection from settings to ensure consistency with IfcOpenShell/process_ifc
     linear_deflection = base_linear_deflection
