@@ -3507,6 +3507,9 @@ def _bind_detail_materials(
             normalized_keys.append(k)
     keys = normalized_keys
     
+    # DEBUG: Check what we have
+    LOG.info(f"DEBUG: _bind_detail_materials normalized_keys sample={keys[:5]} resolved_keys={list(resolved_materials.keys())}")
+    
     valid_keys = [key for key in keys if key in resolved_materials]
     if not valid_keys:
         _apply_material_bindings_to_prim(stage, mesh_geom.GetPrim(), resolved_materials, mesh_path=mesh_path)
