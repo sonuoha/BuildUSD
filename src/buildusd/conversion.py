@@ -1564,6 +1564,10 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         if not detail_scope_arg:
             detail_scope_arg = "all"
     if detail_scope_arg:
+        if detail_scope_arg != "none" and not getattr(args, "detail_mode", False):
+            print("Error: --detail-scope requires --detail-mode to be enabled.", file=sys.stderr)
+            shutdown_usd_context()
+            raise SystemExit(2)
         LOG.info("Detail scope override: %s", detail_scope_arg)
         options_override = replace(options_override, detail_scope=detail_scope_arg)
     detail_level_arg = getattr(args, "detail_level", None)
@@ -1585,6 +1589,14 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     if getattr(args, "enable_semantic_subcomponents", False):
         LOG.info("Semantic subcomponent splitting enabled.")
         options_override = replace(options_override, enable_semantic_subcomponents=True)
+
+    if getattr(args, "force_occ", False):
+        if not getattr(args, "detail_mode", False):
+            print("Error: --force-occ requires --detail-mode to be enabled.", file=sys.stderr)
+            shutdown_usd_context()
+            raise SystemExit(2)
+        LOG.info("Force OCC enabled: bypassing semantic splitting.")
+        options_override = replace(options_override, force_occ=True)
 
     semantic_tokens_path = getattr(args, "semantic_tokens_path", None)
     if semantic_tokens_path:
