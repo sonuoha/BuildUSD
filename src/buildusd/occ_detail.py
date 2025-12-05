@@ -1232,6 +1232,7 @@ def build_detail_mesh_payload(
     reference_shape: Optional[Any] = None,
     unit_scale: float = 1.0,
     canonical_map: Optional[Dict[int, Any]] = None,
+    face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[OCCDetailMesh]:
     """Construct OCC face meshes for detail-mode geometry."""
     logref = logger or log
@@ -1326,6 +1327,7 @@ def build_detail_mesh_payload(
             detail_level=detail_level,
             material_resolver=material_resolver,
             unit_scale=unit_scale,
+            face_style_groups=face_style_groups,
         )
 
     # Prefer product-local OCC so we stay in the product's native local frame.
@@ -1351,6 +1353,7 @@ def build_detail_mesh_payload(
             detail_level=detail_level,
             material_resolver=material_resolver,
             unit_scale=unit_scale,
+            face_style_groups=face_style_groups,
         )
         # Note: fallback representation mesh doesn't support canonical mapping yet as it processes items individually
         if detail_mesh is not None and logref:
@@ -1479,12 +1482,14 @@ def _build_representation_detail_mesh(
     detail_level: Literal["subshape", "face"] = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     unit_scale: float = 1.0,
+    face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     """Fallback OCC extraction that tessellates each representation item directly."""
     representation = getattr(product, "Representation", None)
     if representation is None:
         return None
     item_meshes: List[OCCDetailMesh] = []
+    face_offset = 0
     for rep_index, item_index, item, xform in _iter_representation_items(product):
         detail_mesh = _detail_mesh_for_item(
             item,
@@ -1499,9 +1504,14 @@ def _build_representation_detail_mesh(
             material_resolver=material_resolver,
             unit_scale=unit_scale,
             transform=xform,
+            face_style_groups=face_style_groups,
+            face_offset=face_offset,
         )
         if detail_mesh is None:
             continue
+        # Track cumulative face count for next item
+        if hasattr(detail_mesh, 'face_count'):
+            face_offset += detail_mesh.face_count
         item_meshes.append(detail_mesh)
     if not item_meshes:
         return None
@@ -1590,6 +1600,8 @@ def _detail_mesh_for_item(
     material_resolver: Optional[Callable[[Any], Any]] = None,
     unit_scale: float = 1.0,
     transform: Optional[np.ndarray] = None,
+    face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
+    face_offset: int = 0,
 ):
     if item is None:
         return None
@@ -1615,6 +1627,34 @@ def _detail_mesh_for_item(
         logger=logger or log,
     )
     material_key = material_resolver(item) if material_resolver else None
+    
+    # Build per-face material mapping from face_style_groups
+    face_material_map: Optional[Dict[int, Any]] = None
+    if face_style_groups:
+        face_material_map = {}
+        for token, group_entry in face_style_groups.items():
+            material_obj = group_entry.get("material")
+            faces = group_entry.get("faces", [])
+            if material_obj and hasattr(material_obj, "name"):
+                mat_token = material_obj.name
+                for face_idx in faces:
+                    # Map global face index to item-local face index
+                    local_face_idx = face_idx - face_offset
+                    # Include faces that belong to this item (face_idx >= face_offset)
+                    # We'll check validity when we iterate through actual OCC faces
+                    if local_face_idx >= 0:
+                        face_material_map[local_face_idx] = mat_token
+        
+        if logger and face_material_map:
+            logger.debug(
+                "Detail mesh item: found %d faces with per-face materials for item rep=%s/%s (face_offset=%d, mapped_faces=%s)",
+                len(face_material_map),
+                rep_index,
+                item_index,
+                face_offset,
+                sorted(face_material_map.keys())[:10],
+            )
+    
     if detail_mesh is None and logger:
         logger.debug(
             "Detail mode: OCC tessellation yielded no faces for product=%s step=%s item=%s rep=%s/%s",
@@ -1625,7 +1665,7 @@ def _detail_mesh_for_item(
             item_index,
         )
     elif detail_mesh is not None:
-        _apply_material_key(detail_mesh, material_key)
+        _apply_material_key(detail_mesh, material_key, face_material_map=face_material_map)
         if detail_level == "face":
             detail_mesh = _explode_to_faces(detail_mesh)
         if product is not None and rep_index is not None and item_index is not None:
@@ -1803,16 +1843,32 @@ def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index:
                 face.material_key = material_key
 
 
-def _apply_material_key(detail_mesh, material_key: Optional[Any]) -> None:
-    if material_key is None:
+def _apply_material_key(detail_mesh, material_key: Optional[Any], face_material_map: Optional[Dict[int, Any]] = None) -> None:
+    """Apply material keys to mesh faces.
+    
+    Args:
+        detail_mesh: The OCCDetailMesh to update
+        material_key: Single material key to apply to all faces (if face_material_map is None)
+        face_material_map: Optional mapping of face indices to material keys for per-face assignment
+    """
+    if material_key is None and not face_material_map:
         return
+    
     subshapes = getattr(detail_mesh, "subshapes", None) or []
+    face_index = 0
+    
     for subshape in subshapes:
-        if getattr(subshape, "material_key", None) is None:
+        if getattr(subshape, "material_key", None) is None and material_key is not None:
             subshape.material_key = material_key
+        
         for face in getattr(subshape, "faces", None) or []:
-            if getattr(face, "material_key", None) is None:
+            if face_material_map and face_index in face_material_map:
+                # Use per-face material assignment from mapping
+                face.material_key = face_material_map[face_index]
+            elif getattr(face, "material_key", None) is None and material_key is not None:
+                # Fall back to single material key
                 face.material_key = material_key
+            face_index += 1
 
 
 def _normalize_detail_indices(detail_mesh):

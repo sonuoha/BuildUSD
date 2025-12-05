@@ -3485,6 +3485,66 @@ def _apply_material_bindings_to_prim(
     return primary_path
 
 
+def _canonical_material_key(k: Any) -> Any:
+    """Normalize various material key shapes into a consistent, hashable form.
+
+    Supported inputs seen in the pipeline:
+      - int (material index)
+      - tuple like (index, label)
+      - dict (commonly {'material_id':..., 'item_id':..., ...}) -> material_id normalized to int
+      - strings (style tokens)
+      - PBRMaterial or dict material object -> try to extract stable identifier
+    """
+    # None stays None
+    if k is None:
+        return None
+    # ints and simple scalars pass through
+    if isinstance(k, (int, str)):
+        return k
+    # Already a tuple -> keep as-is (common: (index,label))
+    if isinstance(k, tuple):
+        return k
+    # dict -> tuple of sorted items (stable ordering)
+    if isinstance(k, dict):
+        try:
+            # try to prioritise material_id / item_id if present
+            if "material_id" in k:
+                mid = k.get("material_id")
+                try:
+                    mid_val = int(mid)
+                except Exception:
+                    mid_val = mid
+                # OCC detail meshes emit {'material_id': X, 'item_id': Y}; normalise to the same slot key used by iterator meshes.
+                return mid_val
+            if "item_id" in k:
+                iid = k.get("item_id")
+                try:
+                    iid_val = int(iid)
+                except Exception:
+                    iid_val = iid
+                return ("dict", ("item_id", iid_val))
+            # fallback: sorted items tuple
+            return ("dict",) + tuple(sorted((str(a), k[a]) for a in k.keys()))
+        except Exception:
+            return tuple(sorted(k.items()))
+    # try to extract index/Name from objects (e.g. PBRMaterial, ifcopenshell material)
+    try:
+        # PBRMaterial-like
+        name = getattr(k, "name", None)
+        if name:
+            return ("name", str(name))
+        # numeric id accessor
+        if hasattr(k, "id"):
+            try:
+                return ("id", int(k.id()))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Fallback to str(key)
+    return ("str", str(k))
+
+
 def _bind_detail_materials(
     stage: Usd.Stage,
     mesh_geom: UsdGeom.Mesh,
@@ -3492,49 +3552,72 @@ def _bind_detail_materials(
     resolved_materials: Dict[Any, Sdf.Path],
 ) -> None:
     mesh_path = mesh_geom.GetPath()
-    # print(f"DEBUG: _bind_detail_materials keys={face_material_keys}")
     if not resolved_materials:
         _bind_ifc_named_materials(stage, mesh_path)
         return
+
     keys = list(face_material_keys or [])
+
+    # Normalize keys (handle dicts from OCC detail) into canonical forms
+    normalized_keys = [_canonical_material_key(k) for k in keys]
+
+    # Build canonical lookup for resolved_materials
+    resolved_canonical: Dict[Any, Sdf.Path] = {}
+    for rk, rp in resolved_materials.items():
+        ck = _canonical_material_key(rk)
+        # Avoid overwriting earlier entries—keep first mapping (deterministic)
+        if ck not in resolved_canonical:
+            resolved_canonical[ck] = rp
+
+    valid_keys = [k for k in normalized_keys if k in resolved_canonical]
     
-    # Normalize keys (handle dicts from OCC detail)
-    normalized_keys = []
-    for k in keys:
-        if isinstance(k, dict):
-            normalized_keys.append(int(k.get("material_id", -1)))
-        else:
-            normalized_keys.append(k)
-    keys = normalized_keys
+    if LOG.isEnabledFor(logging.DEBUG):
+        LOG.debug(
+            "Detail material binding: mesh=%s face_keys_sample=%s resolved_keys_sample=%s",
+            mesh_path,
+            normalized_keys[:5],
+            list(resolved_canonical.keys())[:5]
+        )
+        # If no matches, also log ALL keys for debugging
+        if not valid_keys:
+            LOG.debug(
+                "No material key matches for mesh %s. All normalized_keys: %s. All resolved_keys: %s",
+                mesh_path,
+                set(normalized_keys),
+                set(resolved_canonical.keys())
+            )
     
-    # DEBUG: Check what we have
-    LOG.info(f"DEBUG: _bind_detail_materials normalized_keys sample={keys[:5]} resolved_keys={list(resolved_materials.keys())}")
-    
-    valid_keys = [key for key in keys if key in resolved_materials]
     if not valid_keys:
-        _apply_material_bindings_to_prim(stage, mesh_geom.GetPrim(), resolved_materials, mesh_path=mesh_path)
+        LOG.debug("No valid material keys after canonicalization; skipping detail material binding for %s", mesh_path)
+        _bind_ifc_named_materials(stage, mesh_path)
         return
+
+    # preserve order while removing duplicates
     order: List[Any] = []
     seen: Set[Any] = set()
-    for key in valid_keys:
-        if key in seen:
+    for k in valid_keys:
+        if k in seen:
             continue
-        seen.add(key)
-        order.append(key)
-    if len(order) == 1:
-        _apply_material_bindings_to_prim(stage, mesh_geom.GetPrim(), resolved_materials, mesh_path=mesh_path)
+        seen.add(k)
+        order.append(k)
+
+    if len(order) == 0:
+        _bind_ifc_named_materials(stage, mesh_path)
         return
 
     binding_api = UsdShade.MaterialBindingAPI(mesh_geom)
     binding_api.UnbindAllBindings()
+
     primary_key = order[0]
-    primary_material = UsdShade.Material.Get(stage, resolved_materials.get(primary_key))
+    primary_material = UsdShade.Material.Get(stage, resolved_canonical.get(primary_key))
     if not primary_material:
+        LOG.debug("Primary material not found for key %s on mesh %s", primary_key, mesh_path)
         _bind_ifc_named_materials(stage, mesh_path)
         return
+
     binding_api.Bind(primary_material)
     mesh_prim = mesh_geom.GetPrim()
-    primary_material_path = resolved_materials.get(primary_key)
+    primary_material_path = resolved_canonical.get(primary_key)
     if primary_material_path:
         mesh_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(
             str(primary_material_path)
@@ -3543,30 +3626,44 @@ def _bind_detail_materials(
 
     family_name = "materialBind"
     face_lookup: Dict[Any, List[int]] = {}
-    for face_index, key in enumerate(keys):
-        if key not in resolved_materials:
-            continue
-        face_lookup.setdefault(key, []).append(face_index)
+    for face_index, nk in enumerate(normalized_keys):
+        face_lookup.setdefault(nk, []).append(face_index)
 
-    for key, indices in face_lookup.items():
-        if not indices or key == primary_key:
+    # create subsets for each canonical key present
+    for ck, indices in face_lookup.items():
+        # Skip creating a subset for the primary material if it covers everything or is handled by default
+        if ck == primary_key and len(order) == 1:
             continue
-        subset_token = _subset_token_for_material(key)
-        subset_path = mesh_path.AppendChild(subset_token)
-        subset = UsdGeom.Subset.Define(stage, subset_path)
-        UsdGeom.Subset.SetElementType(subset, UsdGeom.Tokens.face)
-        subset.CreateIndicesAttr(indices)
-        subset_material = UsdShade.Material.Get(stage, resolved_materials.get(key))
-        if subset_material:
-            subset_prim = subset.GetPrim()
-            mat_name = _material_name_from_usd_material(subset_material)
-            _set_subset_material_name(subset_prim, mat_name)
-            UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
-            subset_path_val = subset_material.GetPath()
-            subset_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(
-                str(subset_path_val)
+
+        mat_path = resolved_canonical.get(ck)
+        if not mat_path:
+            continue
+        try:
+            subset_token = _subset_token_for_material(ck)
+            
+            # Use CreateUniqueGeomSubset for per-face material binding
+            subset = UsdGeom.Subset.CreateUniqueGeomSubset(
+                UsdGeom.Imageable(mesh_prim),
+                indices,
+                familyName=family_name,
+                elementType=UsdGeom.Tokens.face,
+                subsetName=subset_token,
             )
-            _propagate_subset_metadata_to_material(stage, subset_prim, subset_path_val)
+            
+            subset_material = UsdShade.Material.Get(stage, mat_path)
+            if subset_material:
+                subset_prim = subset.GetPrim()
+                mat_name = _material_name_from_usd_material(subset_material)
+                _set_subset_material_name(subset_prim, mat_name)
+                UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
+                subset_path_val = subset_material.GetPath()
+                subset_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(
+                    str(subset_path_val)
+                )
+                _propagate_subset_metadata_to_material(stage, subset_prim, subset_path_val)
+        except Exception as exc:
+            LOG.debug("Failed to create subset for material key %s on %s: %s", ck, mesh_path, exc)
+
     try:
         UsdGeom.Subset.SetFamilyType(mesh_geom, family_name, UsdGeom.Tokens.nonOverlapping)
     except Exception:
