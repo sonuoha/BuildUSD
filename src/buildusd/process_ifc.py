@@ -419,6 +419,7 @@ def _build_detail_material_resolver(
     default_material_key: Optional[Any],
     type_product=None,
     face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
+    item_material_token_map: Optional[Dict[int, str]] = None,
 ):
     """Build a material resolver that returns per-face material keys from IFC style groups.
     
@@ -430,6 +431,7 @@ def _build_detail_material_resolver(
         default_material_key: Default fallback material key
         type_product: Optional type product for fallback
         face_style_groups: Per-face material grouping from extract_face_style_groups()
+        item_material_token_map: Per-item material token overrides derived from iterator mesh
     """
     face_styles_cache: Optional[Dict[int, List[Any]]] = None
     type_styles_cache: Optional[Dict[int, List[Any]]] = None
@@ -448,6 +450,23 @@ def _build_detail_material_resolver(
     def _resolver(item) -> Optional[Any]:
         nonlocal face_styles_cache, type_styles_cache
         
+        # 0. Primary override: Check item_material_token_map from iterator
+        if item_material_token_map:
+            try:
+                # Use item.id() because the map is keyed by integer Step IDs
+                # Note: item might be a wrapper, verify ID access
+                i_id = None
+                if isinstance(item, int):
+                    i_id = item
+                elif hasattr(item, "id"):
+                     try: i_id = int(item.id())
+                     except: pass
+                
+                if i_id and i_id in item_material_token_map:
+                     return item_material_token_map[i_id]
+            except Exception:
+                pass
+
         # 1. Check product styles
         if face_styles_cache is None:
             try:
@@ -5841,6 +5860,38 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                 continue
         default_material_key = material_ids[0] if material_ids else None
 
+        # Build Item ID -> Material Token mapping from iterator mesh
+        item_material_token_map: Dict[int, str] = {}
+        try:
+            import ifcopenshell.util.shape as ish
+            # Note: get_faces_representation_item_ids returns a list of item IDs corresponding to faces
+            face_item_ids = ish.get_faces_representation_item_ids(geom)
+            if face_item_ids and len(face_item_ids) == len(material_ids):
+                for f_idx, item_id in enumerate(face_item_ids):
+                    if item_id <= 0:
+                        continue
+                    mat_id_idx = material_ids[f_idx]
+                    if mat_id_idx < 0 or mat_id_idx >= len(materials):
+                        continue
+                    mat_obj = materials[mat_id_idx]
+                    # Try to match material object to a style token
+                    # We look for a style entry where entry["material"].name == mat_obj.name
+                    # or replicate the lookup logic.
+                    # Fast path: use style_token_by_style_id if we can map mat_obj back to style_id?
+                    # Actually, face_style_groups maps Token -> {material:..., style_id:...}
+                    # We need Material -> Token.
+                    best_token = None
+                    for tok, grp in face_style_groups.items():
+                         m = grp.get("material")
+                         if m is not None and getattr(m, "name", None) == getattr(mat_obj, "name", None):
+                             best_token = tok
+                             break
+                    
+                    if best_token:
+                        item_material_token_map[item_id] = best_token
+        except Exception:
+            pass # Fallback to standard resolution if extraction fails
+
         type_ref = None
         type_guid = None
         type_name = None
@@ -5865,6 +5916,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             default_material_key,
             type_product=type_ref,
             face_style_groups=face_style_groups,
+            item_material_token_map=item_material_token_map,
         )
         settings_fp_current = settings_fp_base
         skip_occ_detail = False
