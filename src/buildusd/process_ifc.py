@@ -420,9 +420,10 @@ def _build_detail_material_resolver(
     type_product=None,
     face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
     item_material_token_map: Optional[Dict[int, str]] = None,
+    item_material_id_map: Optional[Dict[int, int]] = None,
 ):
     """Build a material resolver that returns per-face material keys from IFC style groups.
-    
+
     Args:
         ifc_file: The IFC model file
         product: The product being processed
@@ -432,10 +433,11 @@ def _build_detail_material_resolver(
         type_product: Optional type product for fallback
         face_style_groups: Per-face material grouping from extract_face_style_groups()
         item_material_token_map: Per-item material token overrides derived from iterator mesh
+        item_material_id_map: Per-item dominant material_id overrides derived from iterator mesh
     """
     face_styles_cache: Optional[Dict[int, List[Any]]] = None
     type_styles_cache: Optional[Dict[int, List[Any]]] = None
-    
+
     # Build face index to material token mapping from face_style_groups
     face_to_material_token: Dict[int, str] = {}
     if face_style_groups:
@@ -449,23 +451,30 @@ def _build_detail_material_resolver(
 
     def _resolver(item) -> Optional[Any]:
         nonlocal face_styles_cache, type_styles_cache
-        
-        # 0. Primary override: Check item_material_token_map from iterator
+
+        # Helper to grab a stable item id
+        def _item_id(val) -> Optional[int]:
+            if isinstance(val, int):
+                return val
+            if hasattr(val, "id"):
+                try:
+                    return int(val.id())
+                except Exception:
+                    return None
+            return None
+
+        item_id_int = _item_id(item)
+
+        # 0a. Primary override: per-item material_id from iterator (dominant)
+        if item_material_id_map and item_id_int is not None:
+            mat_id_override = item_material_id_map.get(item_id_int)
+            if mat_id_override is not None:
+                return mat_id_override
+
+        # 0b. Secondary override: per-item material token from iterator
         if item_material_token_map:
-            try:
-                # Use item.id() because the map is keyed by integer Step IDs
-                # Note: item might be a wrapper, verify ID access
-                i_id = None
-                if isinstance(item, int):
-                    i_id = item
-                elif hasattr(item, "id"):
-                     try: i_id = int(item.id())
-                     except: pass
-                
-                if i_id and i_id in item_material_token_map:
-                     return item_material_token_map[i_id]
-            except Exception:
-                pass
+            if item_id_int is not None and item_id_int in item_material_token_map:
+                return item_material_token_map[item_id_int]
 
         # 1. Check product styles
         if face_styles_cache is None:
@@ -5908,19 +5917,8 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             except Exception:
                 type_id = None
             break
-        detail_material_resolver = _build_detail_material_resolver(
-            ifc_file,
-            product,
-            style_token_by_style_id,
-            bool(style_material),
-            default_material_key,
-            type_product=type_ref,
-            face_style_groups=face_style_groups,
-            item_material_token_map=item_material_token_map,
-        )
         settings_fp_current = settings_fp_base
         skip_occ_detail = False
-
         product_class = product.is_a() if hasattr(product, "is_a") else None
         product_class_upper = product_class.upper() if isinstance(product_class, str) else None
         product_name = getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<unnamed>"
@@ -5931,7 +5929,103 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
         except Exception:
             product_id_int = None
 
+        primary_key: Optional[PrototypeKey] = None
 
+        def _mesh_from_geom(candidate_geom):
+            try:
+                tri = triangulated_to_dict(candidate_geom)
+                if tri["faces"].size == 0:
+                    return None
+                return tri
+            except Exception:
+                return None
+
+        detail_object_match = ctx.wants_detail_for_product(product_id_int, guid_for_log)
+        detail_mesh = detail_mesh_cache.get(product_id_int) if product_id_int is not None else None
+
+        mesh_hash = None
+        mesh_dict_base = _mesh_from_geom(geom)
+        mesh_dict = mesh_dict_base
+        mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
+        face_count = int(mesh_dict["faces"].shape[0]) if mesh_dict is not None and "faces" in mesh_dict else 0
+        if mesh_dict_base is not None:
+            try:
+                expected_corners = int(mesh_dict_base["faces"].size)
+            except Exception:
+                expected_corners = None
+            try:
+                uv_data = extract_uvs_for_product(product)
+            except Exception:
+                uv_data = None
+            if uv_data and expected_corners and len(uv_data.uvs) == expected_corners:
+                mesh_dict_base["uvs"] = uv_data.uvs
+                mesh_dict_base.pop("uv_indices", None)
+        if face_count and material_ids and len(material_ids) != face_count:
+            geom_attrs = [name for name in dir(geom) if name.startswith("material") or name.endswith("counts")]
+            log.debug(
+                "Material mismatch for %s (%s): faces=%d material_ids=%d geom_attrs=%s style=%s styledFaces=%d",
+                getattr(product, "GlobalId", None),
+                product.is_a() if hasattr(product, "is_a") else "IfcProduct",
+                face_count,
+                len(material_ids),
+                geom_attrs,
+                getattr(style_material, "name", None),
+                sum(len(entry.get("faces", [])) for entry in face_style_groups.values()),
+            )
+        # Canonical map (iterator → OCC) and per-item material overrides
+        canonical_map_base: Optional[Dict[str, Any]] = None
+        item_material_id_map: Dict[int, int] = {}
+        face_item_ids: List[int] = []
+        if mesh_dict_base is not None and face_count > 0:
+            try:
+                import ifcopenshell.util.shape as ish
+                face_item_ids = ish.get_faces_representation_item_ids(geom) or []
+            except Exception:
+                face_item_ids = []
+            if face_item_ids and len(face_item_ids) != face_count:
+                log.debug(
+                    "Iterator face_item_ids length mismatch for %s (%s): faces=%d item_ids=%d",
+                    getattr(product, "GlobalId", None),
+                    product.is_a() if hasattr(product, "is_a") else "IfcProduct",
+                    face_count,
+                    len(face_item_ids),
+                )
+                face_item_ids = []
+            # Build dominant material id per item (helps when canonical_map is unavailable downstream)
+            if face_item_ids and material_ids and len(material_ids) == face_count:
+                by_item: Dict[int, Counter] = {}
+                for iid, mid in zip(face_item_ids, material_ids):
+                    try:
+                        iid_int = int(iid)
+                        mid_int = int(mid)
+                    except Exception:
+                        continue
+                    if iid_int <= 0 or mid_int < 0:
+                        continue
+                    by_item.setdefault(iid_int, Counter()).update([mid_int])
+                for iid_int, counter in by_item.items():
+                    top = counter.most_common(1)
+                    if top:
+                        item_material_id_map[iid_int] = top[0][0]
+            # Build canonical map when material_ids align to faces
+            if material_ids and len(material_ids) == face_count:
+                canonical_map_base = {
+                    "vertices": mesh_dict_base.get("vertices"),
+                    "faces": mesh_dict_base.get("faces"),
+                    "material_ids": list(material_ids),
+                    "item_ids": list(face_item_ids) if face_item_ids else [],
+                }
+        detail_material_resolver = _build_detail_material_resolver(
+            ifc_file,
+            product,
+            style_token_by_style_id,
+            bool(style_material),
+            default_material_key,
+            type_product=type_ref,
+            face_style_groups=face_style_groups,
+            item_material_token_map=item_material_token_map,
+            item_material_id_map=item_material_id_map,
+        )
 
         type_info: Optional[MeshProto] = None
         type_detail_mesh: Optional["OCCDetailMesh"] = None
@@ -5986,50 +6080,6 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     log.debug("Canonical OCC detail build failed for type step=%s", type_id, exc_info=True)
             type_info = info
             type_detail_mesh = getattr(info, "detail_mesh", None)
-
-        primary_key: Optional[PrototypeKey] = None
-
-        def _mesh_from_geom(candidate_geom):
-            try:
-                tri = triangulated_to_dict(candidate_geom)
-                if tri["faces"].size == 0:
-                    return None
-                return tri
-            except Exception:
-                return None
-
-        detail_object_match = ctx.wants_detail_for_product(product_id_int, guid_for_log)
-        detail_mesh = detail_mesh_cache.get(product_id_int) if product_id_int is not None else None
-
-        mesh_hash = None
-        mesh_dict_base = _mesh_from_geom(geom)
-        mesh_dict = mesh_dict_base
-        mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
-        face_count = int(mesh_dict["faces"].shape[0]) if mesh_dict is not None and "faces" in mesh_dict else 0
-        if mesh_dict_base is not None:
-            try:
-                expected_corners = int(mesh_dict_base["faces"].size)
-            except Exception:
-                expected_corners = None
-            try:
-                uv_data = extract_uvs_for_product(product)
-            except Exception:
-                uv_data = None
-            if uv_data and expected_corners and len(uv_data.uvs) == expected_corners:
-                mesh_dict_base["uvs"] = uv_data.uvs
-                mesh_dict_base.pop("uv_indices", None)
-        if face_count and material_ids and len(material_ids) != face_count:
-            geom_attrs = [name for name in dir(geom) if name.startswith("material") or name.endswith("counts")]
-            log.debug(
-                "Material mismatch for %s (%s): faces=%d material_ids=%d geom_attrs=%s style=%s styledFaces=%d",
-                getattr(product, "GlobalId", None),
-                product.is_a() if hasattr(product, "is_a") else "IfcProduct",
-                face_count,
-                len(material_ids),
-                geom_attrs,
-                getattr(style_material, "name", None),
-                sum(len(entry.get("faces", [])) for entry in face_style_groups.values()),
-            )
         detail_reasons: List[str] = []
         detail_mode = "base"
         detail_mesh_data: Optional["OCCDetailMesh"] = detail_mesh
@@ -6069,6 +6119,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     product,
                     material_resolver=detail_material_resolver,
                     reference_shape=shape,
+                    canonical_map=canonical_map_base,
                     face_style_groups=face_style_groups,
                 )
                 if detail_mesh_data is None:
@@ -6161,34 +6212,15 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
 
             if need_occ_detail and detail_mesh_data is None and occ_settings is not None and not defer_occ_detail:
                 detail_settings_obj = occ_settings
-                # Generate canonical map from iterator mesh (Mode 1)
-                canonical_map = None
-                if mesh_dict_base and "vertices" in mesh_dict_base and "faces" in mesh_dict_base:
+                # Prefer the precomputed canonical map from iterator mesh (Mode 1)
+                canonical_map = canonical_map_base
+                if canonical_map is None and mesh_dict_base and "vertices" in mesh_dict_base and "faces" in mesh_dict_base:
                     try:
-                        # Reuse iterator data for canonical mapping
-                        # We need item IDs too, but iterator might not provide them directly in mesh_dict_base
-                        # However, we can use material_ids as a proxy or if we have item_ids available
-                        # The user's script uses ish.get_faces_representation_item_ids(g)
-                        # Here 'shape.geometry' is the ifcopenshell triangulation object 'g'
-                        
-                        g = shape.geometry
-                        c_verts = mesh_dict_base["vertices"]
-                        c_faces = mesh_dict_base["faces"]
-                        c_mat_ids = material_ids if material_ids else []
-                        
-                        # Try to get item IDs if possible
-                        c_item_ids = []
-                        try:
-                            import ifcopenshell.util.shape as ish
-                            c_item_ids = ish.get_faces_representation_item_ids(g)
-                        except Exception:
-                            pass
-                        
                         canonical_map = {
-                            "vertices": c_verts,
-                            "faces": c_faces,
-                            "material_ids": c_mat_ids,
-                            "item_ids": c_item_ids
+                            "vertices": mesh_dict_base["vertices"],
+                            "faces": mesh_dict_base["faces"],
+                            "material_ids": list(material_ids) if material_ids else [],
+                            "item_ids": [],
                         }
                     except Exception as exc:
                         log.debug("Failed to build canonical map for %s: %s", product, exc)
@@ -6609,28 +6641,14 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                 detail_mesh_data = None
                 
                 # Generate canonical map from iterator mesh (Mode 1)
-                canonical_map = None
-                if mesh_dict_base and "vertices" in mesh_dict_base and "faces" in mesh_dict_base:
+                canonical_map = canonical_map_base
+                if canonical_map is None and mesh_dict_base and "vertices" in mesh_dict_base and "faces" in mesh_dict_base:
                     try:
-                        # Reuse iterator data for canonical mapping
-                        g = shape.geometry
-                        c_verts = mesh_dict_base["vertices"]
-                        c_faces = mesh_dict_base["faces"]
-                        c_mat_ids = material_ids if material_ids else []
-                        
-                        # Try to get item IDs if possible
-                        c_item_ids = []
-                        try:
-                            import ifcopenshell.util.shape as ish
-                            c_item_ids = ish.get_faces_representation_item_ids(g)
-                        except Exception:
-                            pass
-                            
                         canonical_map = {
-                            "vertices": c_verts,
-                            "faces": c_faces,
-                            "material_ids": c_mat_ids,
-                            "item_ids": c_item_ids
+                            "vertices": mesh_dict_base["vertices"],
+                            "faces": mesh_dict_base["faces"],
+                            "material_ids": list(material_ids) if material_ids else [],
+                            "item_ids": [],
                         }
                     except Exception:
                         pass
