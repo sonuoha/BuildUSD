@@ -1053,8 +1053,13 @@ def _texture_path_from_style(surface_style: ifcopenshell.entity_instance) -> Opt
                 try:
                     import urllib.parse as _up
                     parsed = _up.urlparse(str(val))
-                    if parsed.scheme and parsed.scheme.lower() not in allowed_schemes:
+                    scheme = parsed.scheme.lower() if parsed.scheme else ""
+                    if scheme and scheme not in allowed_schemes:
                         continue
+                    if scheme == "file":
+                        # Allow only relative file paths to avoid arbitrary filesystem access
+                        if parsed.path and os.path.isabs(parsed.path):
+                            continue
                 except Exception:
                     pass
                 return str(val)

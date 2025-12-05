@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Literal, Set, Callable
@@ -1854,6 +1855,9 @@ def _create_occ_product_shape(settings, product, *, logger: Optional[logging.Log
     return geometry or shape_obj
 
 
+_CLEAN_RE = re.compile(r"[^A-Za-z0-9_]+")
+
+
 def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index: int, item, material_key: Optional[Any] = None):
     """Tag OCC subshape labels so downstream USD meshes remain traceable."""
     subshapes = getattr(detail_mesh, "subshapes", None) or []
@@ -1867,8 +1871,7 @@ def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index:
     )
     def _clean(text: str) -> str:
         try:
-            import re as _re
-            token = _re.sub(r"[^A-Za-z0-9_]+", "_", str(text)).strip("_") or "Part"
+            token = _CLEAN_RE.sub("_", str(text)).strip("_") or "Part"
             if len(token) > 64:
                 token = f"{token[:48]}_{hash(token) & 0xFFFF:04x}"
             return token
