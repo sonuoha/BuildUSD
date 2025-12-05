@@ -1574,29 +1574,42 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     if detail_level_arg:
         LOG.info("Detail level override: %s", detail_level_arg)
         options_override = replace(options_override, detail_level=detail_level_arg)
-    detail_ids_arg = getattr(args, "detail_object_ids", None)
-    if detail_ids_arg:
-        LOG.info("Detail object ids override: %s", detail_ids_arg)
-        options_override = replace(options_override, detail_object_ids=tuple(int(i) for i in detail_ids_arg))
-    detail_guids_arg = getattr(args, "detail_object_guids", None)
-    if detail_guids_arg:
-        LOG.info("Detail object GUIDs override: %s", detail_guids_arg)
-        options_override = replace(
-            options_override,
-            detail_object_guids=tuple(str(g) for g in detail_guids_arg),
-        )
+    detail_objects_arg = getattr(args, "detail_objects", None)
+    if detail_objects_arg:
+        ids: list[int] = []
+        guids: list[str] = []
+        for token in detail_objects_arg:
+            try:
+                ids.append(int(token))
+                continue
+            except Exception:
+                pass
+            if token and isinstance(token, str):
+                guids.append(str(token).strip())
+        if ids:
+            LOG.info("Detail object ids override: %s", ids)
+            options_override = replace(options_override, detail_object_ids=tuple(ids))
+        if guids:
+            LOG.info("Detail object GUIDs override: %s", guids)
+            options_override = replace(options_override, detail_object_guids=tuple(guids))
 
     if getattr(args, "enable_semantic_subcomponents", False):
         LOG.info("Semantic subcomponent splitting enabled.")
         options_override = replace(options_override, enable_semantic_subcomponents=True)
 
-    if getattr(args, "force_occ", False):
-        if not getattr(args, "detail_mode", False):
-            print("Error: --force-occ requires --detail-mode to be enabled.", file=sys.stderr)
-            shutdown_usd_context()
-            raise SystemExit(2)
-        LOG.info("Force OCC enabled: bypassing semantic splitting.")
-        options_override = replace(options_override, force_occ=True)
+    raw_engine_arg = getattr(args, "detail_engine", "default") or "default"
+    norm_engine = raw_engine_arg.lower()
+    if norm_engine == "opencascade":
+        norm_engine = "occ"
+    elif norm_engine in ("ifc-subcomponents", "ifc-parts"):
+        norm_engine = "semantic"
+    force_engine_arg = norm_engine
+    # Normalize deprecated force-occ (removed) into detail-engine if present in options_override
+    if getattr(options_override, "force_occ", False):
+        force_engine_arg = "occ"
+        options_override = replace(options_override, force_occ=False)
+    if getattr(options_override, "force_engine", "default") != force_engine_arg:
+        options_override = replace(options_override, force_engine=force_engine_arg)
 
     semantic_tokens_path = getattr(args, "semantic_tokens_path", None)
     if semantic_tokens_path:

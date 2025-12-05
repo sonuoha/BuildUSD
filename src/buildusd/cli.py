@@ -193,21 +193,12 @@ def parse_args(
         help="Granularity of OCC detail meshes when enabled ('subshape' groups or per 'face').",
     )
     parser.add_argument(
-        "--detail-object-ids",
-        dest="detail_object_ids",
-        type=int,
+        "--detail-objects",
+        dest="detail_objects",
         nargs="+",
         default=None,
-        metavar="STEP_ID",
-        help="STEP ids to remesh when --detail-scope object is used (space-separated list).",
-    )
-    parser.add_argument(
-        "--detail-object-guids",
-        dest="detail_object_guids",
-        nargs="+",
-        default=None,
-        metavar="GUID",
-        help="GUIDs to remesh when --detail-scope object is used (space-separated list).",
+        metavar="STEP_OR_GUID",
+        help="STEP ids or GUIDs to remesh when --detail-scope object is used (space-separated list).",
     )
     parser.add_argument(
         "--enable-semantic-subcomponents",
@@ -223,9 +214,15 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--force-occ",
-        dest="force_occ",
-        action="store_true",
-        help="Bypass semantic splitting and force OCC detail generation for all objects.",
+        "--detail-engine",
+        dest="detail_engine",
+        choices=("default", "occ", "opencascade", "semantic", "ifc-subcomponents", "ifc-parts"),
+        default="default",
+        help=(
+            "Select detail pipeline behavior: 'default' tries IFC subcomponents then OCC; "
+            "'occ'/'opencascade' skips subcomponents and goes straight to OCC; "
+            "'semantic'/'ifc-subcomponents'/'ifc-parts' runs IFC subcomponent splitting only (no OCC fallback)."
+        ),
     )
+
     return parser.parse_args(argv)

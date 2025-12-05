@@ -1195,6 +1195,7 @@ class ConversionOptions:
     enable_semantic_subcomponents: bool = False
     semantic_tokens: Dict[str, List[str]] = field(default_factory=dict)
     force_occ: bool = False
+    force_engine: Literal["default", "occ", "semantic"] = "default"
     # Optional overrides for geometry settings (fed from anchoring logic)
     model_offset: Optional[Tuple[float, float, float]] = None
     model_offset_type: Optional[str] = None
@@ -1335,19 +1336,16 @@ class PrototypeBuildContext:
 
         detail_mode_requested = detail_scope == "all"
         user_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
-        force_occ = getattr(options, "force_occ", False)
+        force_engine = getattr(options, "force_engine", "default") or "default"
+        force_occ = force_engine == "occ"
+        force_semantic_only = force_engine == "semantic"
 
         if force_occ:
-            # Force OCC requires high detail generation (enforced by CLI/conversion)
-            
             if detail_scope in ("none", "all"):
-                log.info("Force OCC enabled: applying OCC pipeline to ALL products (Global Run).")
+                log.info("Detail engine OCC: applying OCC pipeline to ALL products.")
                 detail_scope = "all"
-                # We also disable semantic subcomponents implicitly for the global run if they weren't explicitly requested?
-                # The user said: "bypass the semantic decoposition step".
-                # My logic in build_prototypes handles the bypass.
             elif detail_scope == "object":
-                log.info("Force OCC enabled: bypassing semantic splitting for detailed objects.")
+                log.info("Detail engine OCC: bypassing semantic splitting for detailed objects.")
 
         # Instantiate our unified settings manager
         base_geom_settings = dict(_BASE_GEOM_SETTINGS)
@@ -6151,15 +6149,17 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
 
         need_fine_remesh = False
         allow_brep_fallback = False
-        force_occ = getattr(options, "force_occ", False)
+        force_engine = getattr(options, "force_engine", "default") or "default"
+        force_occ = force_engine == "occ"
+        force_semantic_only = force_engine == "semantic"
         need_occ_detail = False
-        defer_occ_detail = bool(getattr(options, "enable_semantic_subcomponents", False)) and not force_occ
+        defer_occ_detail = bool(getattr(options, "enable_semantic_subcomponents", False)) and not force_occ and not force_semantic_only
 
         if force_occ and ctx.detail_scope != "object":
             need_occ_detail = True
             detail_reasons.append("force_occ")
 
-        if detail_object_match:
+        if detail_object_match and not force_semantic_only:
             log.info(
                 "Detail scope object hit: %s name=%s guid=%s step=%s",
                 product_class_upper or product_class or "<unknown>",
@@ -6175,8 +6175,8 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             #   iterator → semantic split → OCC detail (fallback) → iterator mesh.
             #
             # If semantic splitting is disabled entirely OR force_occ is on, we build
-            # the object-scope OCC detail eagerly.
-            if not getattr(options, "enable_semantic_subcomponents", False) or force_occ:
+            # the object-scope OCC detail eagerly (unless semantic-only is requested).
+            if not force_semantic_only and (not getattr(options, "enable_semantic_subcomponents", False) or force_occ):
                 detail_mesh_data = _build_object_scope_detail_mesh(
                     ctx,
                     product,
@@ -6198,7 +6198,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     primary_key = PrototypeKey(kind="repmap_detail", identifier=type_id)
                     detail_mesh_data = type_detail_mesh
         else:
-            if ctx.detail_scope == "all":
+            if ctx.detail_scope == "all" and not force_semantic_only:
                 need_occ_detail = True
                 detail_reasons.append("scope_all")
 
@@ -6273,7 +6273,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     mesh_dict = mesh_dict_base
                     mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
 
-            if need_occ_detail and detail_mesh_data is None and occ_settings is not None and not defer_occ_detail:
+            if not force_semantic_only and need_occ_detail and detail_mesh_data is None and occ_settings is not None and not defer_occ_detail:
                 detail_settings_obj = occ_settings
                 # Prefer the precomputed canonical map from iterator mesh (Mode 1)
                 canonical_map = canonical_map_base
@@ -6592,16 +6592,23 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
         
         # Determine if we should attempt semantic splitting
         detail_requested = getattr(options, "detail_mode", False) or (ctx.detail_scope in ("all", "object"))
-        should_attempt_semantic = detail_requested or getattr(options, "enable_semantic_subcomponents", False)
-        if getattr(options, "force_occ", False):
-            # If force_occ is on, we skip semantic ONLY when detail was requested for this object
-            if ctx.detail_scope == "all":
-                should_attempt_semantic = False
-            elif ctx.detail_scope == "object" and detail_object_match:
-                should_attempt_semantic = False
+        force_engine = getattr(options, "force_engine", "default") or "default"
+        force_occ = force_engine == "occ" or getattr(options, "force_occ", False)
+        force_semantic_only = force_engine == "semantic"
+        should_attempt_semantic = force_semantic_only or detail_requested or getattr(options, "enable_semantic_subcomponents", False)
+        if force_occ and detail_requested:
+            should_attempt_semantic = False
         
         if product_id_int in (461286, 577409, 573013):
-            log.info(f"DEBUG: Product {product_id_int} match={detail_object_match} force_occ={getattr(options, 'force_occ', False)} scope={ctx.detail_scope} semantic={should_attempt_semantic} ids={ctx.detail_object_ids}")
+            log.info(
+                "DEBUG: Product %s match=%s force_engine=%s scope=%s semantic=%s ids=%s",
+                product_id_int,
+                detail_object_match,
+                force_engine,
+                ctx.detail_scope,
+                should_attempt_semantic,
+                ctx.detail_object_ids,
+            )
 
         if should_attempt_semantic:
             if primary_key is not None:
@@ -6655,7 +6662,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                         semantic_parts = getattr(proto, "semantic_parts", {}) or {}
                     
                     # If force_occ is enabled, we must ignore prototype semantic parts for targeted objects
-                    if getattr(options, "force_occ", False):
+                    if force_occ:
                         if ctx.detail_scope == "all":
                             semantic_parts = {}
                         elif ctx.detail_scope == "object" and detail_object_match:
@@ -6701,7 +6708,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     skip_occ_detail = True
                     detail_mesh_data = None
             # If semantic splitting produced nothing and OCC detail was requested, build it now.
-            if not semantic_parts and need_occ_detail and detail_mesh_for_instance is None:
+            if not force_semantic_only and not semantic_parts and need_occ_detail and detail_mesh_for_instance is None:
                 detail_mesh_data = None
                 
                 # Generate canonical map from iterator mesh (Mode 1)
