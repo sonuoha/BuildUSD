@@ -139,7 +139,8 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
                         style_obj = ifcopenshell.util.representation.get_material_style(mat, contexts[0])
                     except Exception:
                         style_obj = None
-                    styles.extend(_surface_style_list(style_obj))
+                    if style_obj:
+                        styles.append(style_obj)
             if styles:
                 return styles
 
@@ -277,7 +278,6 @@ def _constituent_styles_by_name(product: ifcopenshell.entity_instance) -> Dict[s
             if rel.is_a("IfcRelAssociatesMaterial"):
                 collect(rel.RelatingMaterial)
 
-    LOG.info(f"DEBUG: _constituent_styles_by_name for {product.id()} found keys: {list(mapping.keys())}")
     return mapping
 
 
@@ -286,15 +286,10 @@ def _constituent_styles_by_name(product: ifcopenshell.entity_instance) -> Dict[s
 def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_instance) -> Dict[int, List[ifcopenshell.entity_instance]]:
     if not product:
         return {}
-    
-    LOG.info(f"DEBUG: get_face_styles START for {product.id()} ({product.is_a()})")
 
     shape_styles: Dict[int, List[ifcopenshell.entity_instance]] = {}
     aspect_name_by_item = _shape_aspect_name_map(product)
     constituent_styles = _constituent_styles_by_name(product)
-    
-    if constituent_styles:
-        LOG.info(f"DEBUG: Found {len(constituent_styles)} constituent style groups for {product.id()}")
 
     # Collect styles from the explicit representation tree.
     reps = []
@@ -314,8 +309,6 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
             except Exception:
                 item_id = 0
             
-            LOG.info(f"DEBUG: get_face_styles visiting item {item_id} ({item.is_a()})")
-            
             if item_id and item_id not in shape_styles and constituent_styles:
                 # 1. Try Aspect Name
                 aspect_name = aspect_name_by_item.get(item_id) if aspect_name_by_item else None
@@ -323,7 +316,6 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
                     styles = constituent_styles.get(aspect_name)
                     if styles:
                         shape_styles[item_id] = styles
-                        LOG.info(f"DEBUG: Mapped aspect '{aspect_name}' to styles for item {item_id}")
                 
                 # 2. Fallback: Try Item Name
                 if item_id not in shape_styles:
@@ -333,9 +325,6 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
                         styles = constituent_styles.get(sanitized_name)
                         if styles:
                             shape_styles[item_id] = styles
-                            LOG.info(f"DEBUG: Mapped item name '{item_name}' to styles for item {item_id}")
-
-    LOG.info(f"DEBUG: get_face_styles collected {len(shape_styles)} entries. Keys: {list(shape_styles.keys())}")
 
     # Merge in any styles provided via IfcStyledItem associations on the product.
     for styled in getattr(product, "StyledByItem", []) or []:
@@ -371,7 +360,6 @@ def _map_items_to_aspects(product: ifcopenshell.entity_instance) -> Dict[int, Li
     """Return mapping from representation item id() to list of IfcShapeAspects."""
     mapping: Dict[int, List[ifcopenshell.entity_instance]] = {}
     aspects = getattr(product, "HasShapeAspects", None) or []
-    LOG.info(f"DEBUG: _map_items_to_aspects for {product.id()} has {len(aspects)} aspects")
     for aspect in aspects:
         reps = getattr(aspect, "ShapeRepresentations", None) or []
         for rep in reps:
@@ -379,7 +367,6 @@ def _map_items_to_aspects(product: ifcopenshell.entity_instance) -> Dict[int, Li
                 try:
                     item_id = item.id()
                     mapping.setdefault(item_id, []).append(aspect)
-                    LOG.info(f"DEBUG: Mapped item {item_id} to aspect {aspect.Name}")
                 except Exception:
                     continue
     return mapping
@@ -412,7 +399,6 @@ def _collect_styled_items(item, mapping):
         if styles:
             try:
                 mapping[item.id()] = styles
-                LOG.info(f"DEBUG: Found explicit style for item {item.id()} ({item.is_a()})")
             except Exception:
                 pass
 

@@ -368,6 +368,7 @@ def _build_object_scope_detail_mesh(
     material_resolver,
     reference_shape=None,
     canonical_map=None,
+    face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional["OCCDetailMesh"]:
     if ctx.object_scope_settings is None:
         return None
@@ -406,6 +407,7 @@ def _build_object_scope_detail_mesh(
         material_resolver=material_resolver,
         reference_shape=reference_shape,
         canonical_map=canonical_map,
+        face_style_groups=face_style_groups,
     )
 
 
@@ -416,9 +418,32 @@ def _build_detail_material_resolver(
     has_instance_style: bool,
     default_material_key: Optional[Any],
     type_product=None,
+    face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
+    """Build a material resolver that returns per-face material keys from IFC style groups.
+    
+    Args:
+        ifc_file: The IFC model file
+        product: The product being processed
+        style_token_by_style_id: Mapping of style IDs to tokens
+        has_instance_style: Whether instance has style material
+        default_material_key: Default fallback material key
+        type_product: Optional type product for fallback
+        face_style_groups: Per-face material grouping from extract_face_style_groups()
+    """
     face_styles_cache: Optional[Dict[int, List[Any]]] = None
     type_styles_cache: Optional[Dict[int, List[Any]]] = None
+    
+    # Build face index to material token mapping from face_style_groups
+    face_to_material_token: Dict[int, str] = {}
+    if face_style_groups:
+        for token, group_entry in face_style_groups.items():
+            material_obj = group_entry.get("material")
+            faces = group_entry.get("faces", [])
+            if material_obj and hasattr(material_obj, "name"):
+                mat_token = material_obj.name
+                for face_idx in faces:
+                    face_to_material_token[face_idx] = mat_token
 
     def _resolver(item) -> Optional[Any]:
         nonlocal face_styles_cache, type_styles_cache
@@ -436,10 +461,6 @@ def _build_detail_material_resolver(
             item_id = 0
             
         styles = face_styles_cache.get(item_id) if face_styles_cache else None
-        
-        # DEBUG: Trace resolution
-        # item_desc = str(item)
-        print(f"DEBUG: Resolving item {item_id} ({item.is_a()}). Instance styles: {styles}")
 
         # 2. Fallback: Check type product styles (for mapped items defined in Type)
         if not styles and type_product:
@@ -449,7 +470,6 @@ def _build_detail_material_resolver(
                 except Exception:
                     type_styles_cache = {}
             styles = type_styles_cache.get(item_id) if type_styles_cache else None
-            print(f"DEBUG: Type styles for item {item_id}: {styles}")
 
         if styles:
             for style in styles:
@@ -460,13 +480,13 @@ def _build_detail_material_resolver(
                 if style_id is not None:
                     token = style_token_by_style_id.get(style_id)
                     if token:
-                        print(f"DEBUG: Resolved to {token}")
                         return token
         if has_instance_style:
             return "__style__instance"
-        print(f"DEBUG: Fallback to default {default_material_key}")
         return default_material_key
 
+    # Return resolver with access to per-face mappings
+    _resolver.face_to_material_token = face_to_material_token  # type: ignore
     return _resolver
 
 # USD-lite vector/matrix shim for placement helpers
@@ -5605,9 +5625,14 @@ def _build_recursive_ifc_mesh(product, settings, logger=None):
             if not shape:
                 continue
                 
-            # Extract geometry
-            verts = shape.geometry.verts # flat list of floats
-            faces = shape.geometry.faces # flat list of ints
+            # Extract geometry (handle both wrapper and direct triangulation)
+            if hasattr(shape, "geometry"):
+                geom = shape.geometry
+            else:
+                geom = shape
+
+            verts = geom.verts # flat list of floats
+            faces = geom.faces # flat list of ints
             
             if not verts or not faces:
                 continue
@@ -5625,7 +5650,7 @@ def _build_recursive_ifc_mesh(product, settings, logger=None):
             faces_offset = faces_np + total_verts
             
             # Handle materials
-            item_mat_ids = shape.geometry.material_ids
+            item_mat_ids = geom.material_ids
             if not item_mat_ids:
                 item_mat_ids = [-1] * faces_np.shape[0]
             
@@ -5636,8 +5661,8 @@ def _build_recursive_ifc_mesh(product, settings, logger=None):
                     mapped_mat_ids.append(-1)
                     continue
                     
-                if m_id < len(shape.geometry.materials):
-                    mat = shape.geometry.materials[m_id]
+                if m_id < len(geom.materials):
+                    mat = geom.materials[m_id]
                     # Use name as key (or id if available, but these are wrappers)
                     # mat.name is usually reliable
                     mat_key = mat.name
@@ -5839,6 +5864,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             bool(style_material),
             default_material_key,
             type_product=type_ref,
+            face_style_groups=face_style_groups,
         )
         settings_fp_current = settings_fp_base
         skip_occ_detail = False
@@ -5991,6 +6017,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     product,
                     material_resolver=detail_material_resolver,
                     reference_shape=shape,
+                    face_style_groups=face_style_groups,
                 )
                 if detail_mesh_data is None:
                     log.warning(
@@ -6565,6 +6592,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                             material_resolver=detail_material_resolver,
                             reference_shape=shape,
                             canonical_map=canonical_map,
+                            face_style_groups=face_style_groups,
                         )
                         if detail_mesh_data is None:
                             log.debug(
