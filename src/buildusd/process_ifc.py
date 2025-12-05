@@ -6067,15 +6067,38 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                         item_material_id_map[iid_int] = top[0][0]
         # Build canonical map whenever material_ids align to faces (item_ids optional/truncated)
         if material_ids and len(material_ids) == face_count:
-            trimmed_items = []
-            if face_item_ids:
-                trimmed_items = list(face_item_ids[: min(len(face_item_ids), face_count)])
-            canonical_map_base = {
-                "vertices": mesh_dict_base.get("vertices"),
-                "faces": mesh_dict_base.get("faces"),
-                "material_ids": list(material_ids),
-                "item_ids": trimmed_items,
-            }
+            # Optionally skip canonical map when oversized or trivial (single material, no item ids)
+            skip_canonical = False
+            try:
+                face_cap_env = os.getenv("OCC_CANONICAL_MAP_FACE_CAP")
+                face_cap = int(face_cap_env) if face_cap_env else None
+                if face_cap and face_count > face_cap:
+                    skip_canonical = True
+                    log.info(
+                        "Skipping canonical map (faces=%d > cap=%d) for %s guid=%s",
+                        face_count,
+                        face_cap,
+                        product.is_a() if hasattr(product, "is_a") else "<IfcProduct>",
+                        getattr(product, "GlobalId", None),
+                    )
+            except Exception:
+                face_cap = None
+            try:
+                unique_mats = len(set(int(m) for m in material_ids if m is not None))
+            except Exception:
+                unique_mats = None
+            if unique_mats is not None and unique_mats <= 1 and not face_item_ids:
+                skip_canonical = True
+            if not skip_canonical:
+                trimmed_items = []
+                if face_item_ids:
+                    trimmed_items = list(face_item_ids[: min(len(face_item_ids), face_count)])
+                canonical_map_base = {
+                    "vertices": mesh_dict_base.get("vertices"),
+                    "faces": mesh_dict_base.get("faces"),
+                    "material_ids": list(material_ids),
+                    "item_ids": trimmed_items,
+                }
         detail_material_resolver = _build_detail_material_resolver(
             ifc_file,
             product,
