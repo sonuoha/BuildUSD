@@ -561,7 +561,13 @@ def _resolve_threads(env_var="IFC_GEOM_THREADS", minimum=1):
     if val and val.strip():
         try: return max(minimum, int(val))
         except ValueError: pass
-    try: return max(minimum, multiprocessing.cpu_count())
+    # Allow an upper cap to avoid oversubscription on large hosts.
+    try:
+        max_cap = os.getenv(f"{env_var}_MAX")
+        cap = int(max_cap) if max_cap and max_cap.strip() else 8
+    except Exception:
+        cap = 8
+    try: return min(cap, max(minimum, multiprocessing.cpu_count()))
     except NotImplementedError: return minimum
 
 threads = _resolve_threads()
@@ -5962,7 +5968,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                 mesh_dict_base.pop("uv_indices", None)
         if face_count and material_ids and len(material_ids) != face_count:
             geom_attrs = [name for name in dir(geom) if name.startswith("material") or name.endswith("counts")]
-            log.debug(
+            log.warning(
                 "Material mismatch for %s (%s): faces=%d material_ids=%d geom_attrs=%s style=%s styledFaces=%d",
                 getattr(product, "GlobalId", None),
                 product.is_a() if hasattr(product, "is_a") else "IfcProduct",
@@ -5983,8 +5989,8 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             except Exception:
                 face_item_ids = []
             if face_item_ids and len(face_item_ids) != face_count:
-                log.debug(
-                    "Iterator face_item_ids length mismatch for %s (%s): faces=%d item_ids=%d",
+                log.warning(
+                    "Iterator face_item_ids length mismatch for %s (%s): faces=%d item_ids=%d; falling back to default material mapping.",
                     getattr(product, "GlobalId", None),
                     product.is_a() if hasattr(product, "is_a") else "IfcProduct",
                     face_count,

@@ -1830,12 +1830,29 @@ def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index:
     subshapes = getattr(detail_mesh, "subshapes", None) or []
     if not subshapes:
         return
-    product_label = getattr(product, "GlobalId", None) or getattr(product, "Name", None) or product.is_a()
-    item_name = getattr(item, "Name", None) or (item.is_a() if hasattr(item, "is_a") else f"Item{item_index}")
-    prefix = f"{product_label}_rep{rep_index}_item{item_index}_{item_name}"
+    product_label = getattr(product, "Name", None) or getattr(product, "GlobalId", None) or product.is_a()
+    item_name = (
+        getattr(item, "Name", None)
+        or getattr(item, "Description", None)
+        or (item.is_a() if hasattr(item, "is_a") else f"Item{item_index}")
+    )
+    def _clean(text: str) -> str:
+        try:
+            import re as _re
+            token = _re.sub(r"[^A-Za-z0-9_]+", "_", str(text)).strip("_") or "Part"
+            if len(token) > 64:
+                token = f"{token[:48]}_{hash(token) & 0xFFFF:04x}"
+            return token
+        except Exception:
+            return str(text) if text else "Part"
+
+    prefix_core = f"{_clean(product_label)}_rep{rep_index}_item{item_index}_{_clean(item_name)}"
     for local_index, subshape in enumerate(subshapes):
         current = getattr(subshape, "label", f"Subshape_{local_index}")
-        subshape.label = f"{prefix}_{current}"
+        shape_type = getattr(subshape, "shape_type", None)
+        if shape_type:
+            current = f"{_clean(shape_type)}_{current}"
+        subshape.label = f"{prefix_core}_{current}"
         if material_key is not None and getattr(subshape, "material_key", None) is None:
             subshape.material_key = material_key
         for face in getattr(subshape, "faces", None) or []:

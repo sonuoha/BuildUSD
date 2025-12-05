@@ -1042,6 +1042,7 @@ def _texture_path_from_style(surface_style: ifcopenshell.entity_instance) -> Opt
                 textures.extend(getattr(elem, "Textures", []) or [])
     except Exception:
         pass
+    allowed_schemes = {"http", "https", "file"}
     for tex in textures:
         if tex is None:
             continue
@@ -1049,6 +1050,13 @@ def _texture_path_from_style(surface_style: ifcopenshell.entity_instance) -> Opt
         for attr in ("UrlReference", "URLReference", "Location", "RelativePath"):
             val = getattr(tex, attr, None)
             if val:
+                try:
+                    import urllib.parse as _up
+                    parsed = _up.urlparse(str(val))
+                    if parsed.scheme and parsed.scheme.lower() not in allowed_schemes:
+                        continue
+                except Exception:
+                    pass
                 return str(val)
     return None
 
