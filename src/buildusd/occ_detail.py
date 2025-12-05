@@ -1846,7 +1846,8 @@ def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index:
         except Exception:
             return str(text) if text else "Part"
 
-    prefix_core = f"{_clean(product_label)}_rep{rep_index}_item{item_index}_{_clean(item_name)}"
+    # Shorter, more readable prefix that still keeps traceability.
+    prefix_core = f"{_clean(product_label)}_{_clean(item_name)}"
     for local_index, subshape in enumerate(subshapes):
         current = getattr(subshape, "label", f"Subshape_{local_index}")
         shape_type = getattr(subshape, "shape_type", None)

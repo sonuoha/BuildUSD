@@ -196,10 +196,17 @@ def _normalize_geom_materials(materials, face_style_groups, ifc_file):
     return converted
 
 
+_PBR_SIGNATURE_CACHE: Dict[int, Optional[Tuple]] = {}
+_FACE_STYLE_CACHE: Dict[int, Dict[int, List[Any]]] = {}
+
 def _pbr_signature(mat: Any) -> Optional[Tuple]:
-    """Stable signature for PBRMaterial comparison (rounded floats)."""
+    """Stable signature for PBRMaterial comparison (rounded floats), cached."""
     if not isinstance(mat, PBRMaterial):
         return None
+    key = id(mat)
+    if key in _PBR_SIGNATURE_CACHE:
+        return _PBR_SIGNATURE_CACHE[key]
+
     def _round3(val):
         try:
             return round(float(val), 6)
@@ -207,7 +214,7 @@ def _pbr_signature(mat: Any) -> Optional[Tuple]:
             return None
     base = tuple(_round3(c) for c in getattr(mat, "base_color", ()))
     emissive = tuple(_round3(c) for c in getattr(mat, "emissive", ()))
-    return (
+    sig = (
         sanitize_name(getattr(mat, "name", None), fallback="Material"),
         base,
         _round3(getattr(mat, "opacity", None)),
@@ -218,6 +225,8 @@ def _pbr_signature(mat: Any) -> Optional[Tuple]:
         getattr(mat, "normal_tex", None),
         getattr(mat, "orm_tex", None),
     )
+    _PBR_SIGNATURE_CACHE[key] = sig
+    return sig
 
 
 def _log_semantic_attempt(product, mesh_dict, face_style_groups, materials, *, label: str) -> None:
@@ -437,6 +446,17 @@ def _build_detail_material_resolver(
     """
     face_styles_cache: Optional[Dict[int, List[Any]]] = None
     type_styles_cache: Optional[Dict[int, List[Any]]] = None
+    cache_key_product = None
+    try:
+        cache_key_product = int(product.id())
+    except Exception:
+        cache_key_product = id(product)
+    cache_key_type = None
+    if type_product is not None:
+        try:
+            cache_key_type = int(type_product.id())
+        except Exception:
+            cache_key_type = id(type_product)
 
     # Build face index to material token mapping from face_style_groups
     face_to_material_token: Dict[int, str] = {}
@@ -467,21 +487,42 @@ def _build_detail_material_resolver(
 
         # 0a. Primary override: per-item material_id from iterator (dominant)
         if item_material_id_map and item_id_int is not None:
-            mat_id_override = item_material_id_map.get(item_id_int)
-            if mat_id_override is not None:
-                return mat_id_override
+            override_val = item_material_id_map.get(item_id_int)
+            if override_val is not None:
+                return override_val
 
         # 0b. Secondary override: per-item material token from iterator
         if item_material_token_map:
             if item_id_int is not None and item_id_int in item_material_token_map:
                 return item_material_token_map[item_id_int]
 
-        # 1. Check product styles
+        # 0c. If we have a per-face token map (from style groups), try mapping by face index if present on the item
+        if face_to_material_token and item_id_int is not None:
+            face_idx = getattr(item, "face_index", None)
+            if face_idx is not None:
+                try:
+                    face_idx_int = int(face_idx)
+                    mat_tok = face_to_material_token.get(face_idx_int)
+                    if mat_tok:
+                        return mat_tok
+                except Exception:
+                    pass
+
+        # 1. Check product styles (with cache)
         if face_styles_cache is None:
+            global _FACE_STYLE_CACHE
             try:
-                face_styles_cache = get_face_styles(ifc_file, product) or {}
-            except Exception:
-                face_styles_cache = {}
+                _FACE_STYLE_CACHE
+            except NameError:
+                _FACE_STYLE_CACHE = {}
+            if cache_key_product in _FACE_STYLE_CACHE:
+                face_styles_cache = _FACE_STYLE_CACHE.get(cache_key_product) or {}
+            else:
+                try:
+                    face_styles_cache = get_face_styles(ifc_file, product) or {}
+                except Exception:
+                    face_styles_cache = {}
+                _FACE_STYLE_CACHE[cache_key_product] = face_styles_cache
         
         try:
             item_id = item.id()
@@ -494,9 +535,16 @@ def _build_detail_material_resolver(
         if not styles and type_product:
             if type_styles_cache is None:
                 try:
-                    type_styles_cache = get_face_styles(ifc_file, type_product) or {}
+                    type_styles_cache = _FACE_STYLE_CACHE.get(cache_key_type) if cache_key_type in _FACE_STYLE_CACHE else None
                 except Exception:
-                    type_styles_cache = {}
+                    type_styles_cache = None
+                if type_styles_cache is None:
+                    try:
+                        type_styles_cache = get_face_styles(ifc_file, type_product) or {}
+                    except Exception:
+                        type_styles_cache = {}
+                    if cache_key_type is not None:
+                        _FACE_STYLE_CACHE[cache_key_type] = type_styles_cache
             styles = type_styles_cache.get(item_id) if type_styles_cache else None
 
         if styles:
@@ -5988,19 +6036,21 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                 face_item_ids = ish.get_faces_representation_item_ids(geom) or []
             except Exception:
                 face_item_ids = []
-            if face_item_ids and len(face_item_ids) != face_count:
+        # Build per-item material ids list; allow partial item_ids by truncating to matched length
+        if face_item_ids and material_ids:
+            pair_len = min(len(face_item_ids), len(material_ids), face_count)
+            if pair_len and pair_len != face_count:
                 log.warning(
-                    "Iterator face_item_ids length mismatch for %s (%s): faces=%d item_ids=%d; falling back to default material mapping.",
+                    "Iterator face_item_ids length mismatch for %s (%s): faces=%d item_ids=%d; using first %d entries.",
                     getattr(product, "GlobalId", None),
                     product.is_a() if hasattr(product, "is_a") else "IfcProduct",
                     face_count,
                     len(face_item_ids),
+                    pair_len,
                 )
-                face_item_ids = []
-            # Build dominant material id per item (helps when canonical_map is unavailable downstream)
-            if face_item_ids and material_ids and len(material_ids) == face_count:
+            if pair_len:
                 by_item: Dict[int, Counter] = {}
-                for iid, mid in zip(face_item_ids, material_ids):
+                for iid, mid in zip(face_item_ids[:pair_len], material_ids[:pair_len]):
                     try:
                         iid_int = int(iid)
                         mid_int = int(mid)
@@ -6013,14 +6063,17 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     top = counter.most_common(1)
                     if top:
                         item_material_id_map[iid_int] = top[0][0]
-            # Build canonical map when material_ids align to faces
-            if material_ids and len(material_ids) == face_count:
-                canonical_map_base = {
-                    "vertices": mesh_dict_base.get("vertices"),
-                    "faces": mesh_dict_base.get("faces"),
-                    "material_ids": list(material_ids),
-                    "item_ids": list(face_item_ids) if face_item_ids else [],
-                }
+        # Build canonical map whenever material_ids align to faces (item_ids optional/truncated)
+        if material_ids and len(material_ids) == face_count:
+            trimmed_items = []
+            if face_item_ids:
+                trimmed_items = list(face_item_ids[: min(len(face_item_ids), face_count)])
+            canonical_map_base = {
+                "vertices": mesh_dict_base.get("vertices"),
+                "faces": mesh_dict_base.get("faces"),
+                "material_ids": list(material_ids),
+                "item_ids": trimmed_items,
+            }
         detail_material_resolver = _build_detail_material_resolver(
             ifc_file,
             product,
