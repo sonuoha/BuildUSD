@@ -154,6 +154,175 @@ def _build_canonical_maps(canonical_map: Dict[str, Any]) -> Tuple[Dict[tuple, in
     return coord_to_vid, tri_map
 
 
+# -----------------------------------------------------------------------------
+# Matrix / Transform Helpers (duplicated from process_ifc to avoid circular dep)
+# -----------------------------------------------------------------------------
+
+def _as_float(v, default=0.0):
+    try:
+        if hasattr(v, "wrappedValue"): return float(v.wrappedValue)
+        return float(v)
+    except Exception:
+        try: return float(default)
+        except Exception: return 0.0
+
+def _axis_placement_to_np(placement) -> np.ndarray:
+    """Convert IfcAxis2Placement3D to 4x4 numpy matrix."""
+    if placement is None:
+        return np.eye(4, dtype=float)
+    
+    loc = getattr(placement, "Location", None)
+    axis = getattr(placement, "Axis", None)
+    ref_dir = getattr(placement, "RefDirection", None)
+    
+    ox = _as_float(getattr(loc, "Coordinates", [0,0,0])[0])
+    oy = _as_float(getattr(loc, "Coordinates", [0,0,0])[1])
+    oz = _as_float(getattr(loc, "Coordinates", [0,0,0])[2])
+    
+    # Z axis
+    if axis and getattr(axis, "DirectionRatios", None):
+        z = np.array(axis.DirectionRatios, dtype=float)
+        zn = np.linalg.norm(z)
+        if zn > 1e-9: z /= zn
+        else: z = np.array([0,0,1], dtype=float)
+    else:
+        z = np.array([0,0,1], dtype=float)
+        
+    # X axis
+    if ref_dir and getattr(ref_dir, "DirectionRatios", None):
+        x = np.array(ref_dir.DirectionRatios, dtype=float)
+        xn = np.linalg.norm(x)
+        if xn > 1e-9: x /= xn
+        else: x = np.array([1,0,0], dtype=float)
+    else:
+        # Arbitrary X if not specified
+        if abs(z[2]) < 0.9: x = np.array([0,0,1], dtype=float) # if Z not vertical, use Z as X-ish? No.
+        # Standard fallback logic:
+        # If Z is vertical (0,0,1), X is (1,0,0).
+        # If Z is not vertical, we need an X.
+        # Actually, if RefDirection is missing, X is derived from Z.
+        # But let's keep it simple: if missing, use (1,0,0) and orthogonalize.
+        x = np.array([1,0,0], dtype=float)
+
+    # Orthogonalize X against Z
+    # x = x - dot(x,z)*z
+    x = x - np.dot(x, z) * z
+    xn = np.linalg.norm(x)
+    if xn > 1e-9:
+        x /= xn
+    else:
+        # X is parallel to Z? Pick arbitrary
+        if abs(z[0]) < 0.9: x = np.array([1,0,0], dtype=float)
+        else: x = np.array([0,1,0], dtype=float)
+        x = x - np.dot(x, z) * z
+        x /= np.linalg.norm(x)
+        
+    y = np.cross(z, x)
+    
+    mat = np.eye(4, dtype=float)
+    mat[:3, 0] = x
+    mat[:3, 1] = y
+    mat[:3, 2] = z
+    mat[0, 3] = ox
+    mat[1, 3] = oy
+    mat[2, 3] = oz
+    return mat
+
+def _cartesian_transform_to_np(operator) -> np.ndarray:
+    """Convert IfcCartesianTransformationOperator3D to 4x4 numpy matrix."""
+    if operator is None:
+        return np.eye(4, dtype=float)
+    
+    # Origin
+    origin = getattr(operator, "LocalOrigin", None)
+    ox = _as_float(getattr(origin, "Coordinates", [0,0,0])[0])
+    oy = _as_float(getattr(origin, "Coordinates", [0,0,0])[1])
+    oz = _as_float(getattr(origin, "Coordinates", [0,0,0])[2])
+    
+    # Axis 1 (X)
+    axis1 = getattr(operator, "Axis1", None)
+    if axis1 and getattr(axis1, "DirectionRatios", None):
+        x = np.array(axis1.DirectionRatios, dtype=float)
+        xn = np.linalg.norm(x)
+        if xn > 1e-9: x /= xn
+        else: x = np.array([1,0,0], dtype=float)
+    else:
+        x = np.array([1,0,0], dtype=float)
+        
+    # Axis 2 (Y)
+    axis2 = getattr(operator, "Axis2", None)
+    if axis2 and getattr(axis2, "DirectionRatios", None):
+        y = np.array(axis2.DirectionRatios, dtype=float)
+        yn = np.linalg.norm(y)
+        if yn > 1e-9: y /= yn
+        else: y = np.array([0,1,0], dtype=float)
+    else:
+        y = np.array([0,1,0], dtype=float)
+        
+    # Axis 3 (Z)
+    axis3 = getattr(operator, "Axis3", None)
+    if axis3 and getattr(axis3, "DirectionRatios", None):
+        z = np.array(axis3.DirectionRatios, dtype=float)
+        zn = np.linalg.norm(z)
+        if zn > 1e-9: z /= zn
+        else: z = np.array([0,0,1], dtype=float)
+    else:
+        z = np.array([0,0,1], dtype=float)
+        
+    # Scale
+    scale = _as_float(getattr(operator, "Scale", 1.0), 1.0)
+    
+    mat = np.eye(4, dtype=float)
+    mat[:3, 0] = x * scale
+    mat[:3, 1] = y * scale
+    mat[:3, 2] = z * scale
+    mat[0, 3] = ox
+    mat[1, 3] = oy
+    mat[2, 3] = oz
+    return mat
+
+def _repmap_rt_matrix(mapped_item) -> np.ndarray:
+    """Return MappingTarget @ MappingOrigin (RepresentationMap frame to product frame)."""
+    source = getattr(mapped_item, "MappingSource", None)
+    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
+    return target_np @ origin_np
+
+def _apply_transform_to_occ_shape(shape: Any, matrix: np.ndarray) -> Any:
+    """Apply a 4x4 numpy matrix transform to a TopoDS_Shape."""
+    if not is_available() or shape is None:
+        return shape
+    try:
+        gp_Trsf = sym("gp_Trsf")
+        gp_Vec = sym("gp_Vec")
+        gp_Mat = sym("gp_Mat")
+        BRepBuilderAPI_Transform = sym("BRepBuilderAPI_Transform")
+        
+        trsf = gp_Trsf()
+        
+        # Extract rotation/scale part
+        m = matrix
+        # gp_Mat expects (Row1, Row2, Row3)
+        mat = gp_Mat(
+            float(m[0,0]), float(m[0,1]), float(m[0,2]),
+            float(m[1,0]), float(m[1,1]), float(m[1,2]),
+            float(m[2,0]), float(m[2,1]), float(m[2,2])
+        )
+        vec = gp_Vec(float(m[0,3]), float(m[1,3]), float(m[2,3]))
+        
+        trsf.SetValues(
+            float(m[0,0]), float(m[0,1]), float(m[0,2]), float(m[0,3]),
+            float(m[1,0]), float(m[1,1]), float(m[1,2]), float(m[1,3]),
+            float(m[2,0]), float(m[2,1]), float(m[2,2]), float(m[2,3])
+        )
+        
+        transformer = BRepBuilderAPI_Transform(shape, trsf, True) # True = copy
+        return transformer.Shape()
+    except Exception as exc:
+        log.warning("Failed to apply transform to OCC shape: %s", exc)
+        return shape
+
+
 def build_detail_mesh(
     shape_obj: Any,
     *,
@@ -1142,12 +1311,29 @@ def build_detail_mesh_payload(
 
     detail_mesh = None
 
+    # If we need materials but lack a canonical map, prefer the representation-item approach.
+    # This ensures we process each item individually (resolving its material) rather than
+    # merging them into a monolithic shape where material assignments are lost.
+    # This is critical for 'force-occ' workflows where the iterator mesh (and thus canonical map)
+    # might be unavailable or unreliable.
+    if detail_mesh is None and material_resolver is not None and not canonical_map and product is not None:
+        detail_mesh = _build_representation_detail_mesh(
+            product,
+            settings,
+            float(linear_def),
+            angular_rad,
+            logger=logref,
+            detail_level=detail_level,
+            material_resolver=material_resolver,
+            unit_scale=unit_scale,
+        )
+
     # Prefer product-local OCC so we stay in the product's native local frame.
-    if product is not None:
+    if detail_mesh is None and product is not None:
         product_occ_shape = _create_occ_product_shape(settings, product, logger=logref)
         detail_mesh = _run_occ_detail(product_occ_shape, "product")
-    if detail_mesh is not None and product is not None:
-        _attach_pre_xform(detail_mesh, product_occ_shape)
+        if detail_mesh is not None and product is not None:
+             _attach_pre_xform(detail_mesh, product_occ_shape)
 
     # If that failed, fall back to iterator OCC and attach a normalization matrix if possible.
     if detail_mesh is None and shape_obj is not None:
@@ -1241,6 +1427,48 @@ def precompute_detail_meshes(
     return cache
 
 
+def _iter_representation_items(product) -> Iterator[Tuple[int, int, Any, Optional[np.ndarray]]]:
+    """Iterate representation items, expanding IfcMappedItem recursively.
+    
+    Yields:
+        (rep_index, item_index, item, transform_matrix)
+    """
+    representation = getattr(product, "Representation", None)
+    if representation is None:
+        return
+    reps = getattr(representation, "Representations", None) or []
+    
+    def _recurse(item, current_xform=None):
+        # If item is IfcMappedItem, expand it
+        if item.is_a("IfcMappedItem"):
+            source = getattr(item, "MappingSource", None)
+            mapped_rep = getattr(source, "MappedRepresentation", None) if source else None
+            if mapped_rep:
+                # Calculate transform
+                local_xform = _repmap_rt_matrix(item)
+                new_xform = local_xform @ current_xform if current_xform is not None else local_xform
+                
+                mapped_items = getattr(mapped_rep, "Items", None) or []
+                for sub_item in mapped_items:
+                    yield from _recurse(sub_item, new_xform)
+            return
+
+        # Otherwise yield the item itself
+        yield item, current_xform
+
+    for rep_index, rep in enumerate(reps):
+        if rep is None:
+            continue
+        items = getattr(rep, "Items", None) or []
+        for item_index, item in enumerate(items):
+            if item is None:
+                continue
+            
+            # Expand mapped items
+            for expanded_item, xform in _recurse(item):
+                yield rep_index, item_index, expanded_item, xform
+
+
 def _build_representation_detail_mesh(
     product,
     settings,
@@ -1257,7 +1485,7 @@ def _build_representation_detail_mesh(
     if representation is None:
         return None
     item_meshes: List[OCCDetailMesh] = []
-    for rep_index, item_index, item in _iter_representation_items(product):
+    for rep_index, item_index, item, xform in _iter_representation_items(product):
         detail_mesh = _detail_mesh_for_item(
             item,
             settings,
@@ -1270,6 +1498,7 @@ def _build_representation_detail_mesh(
             detail_level=detail_level,
             material_resolver=material_resolver,
             unit_scale=unit_scale,
+            transform=xform,
         )
         if detail_mesh is None:
             continue
@@ -1282,19 +1511,44 @@ def _build_representation_detail_mesh(
     return _merge_detail_meshes(item_meshes)
 
 
-def _iter_representation_items(product):
-    representation = getattr(product, "Representation", None)
-    if representation is None:
-        return
-    reps = getattr(representation, "Representations", None) or []
-    for rep_index, rep in enumerate(reps):
-        if rep is None:
-            continue
-        items = getattr(rep, "Items", None) or []
-        for item_index, item in enumerate(items):
-            if item is None:
-                continue
-            yield rep_index, item_index, item
+def _detail_mesh_for_item(
+    item,
+    settings,
+    linear_def: float,
+    angular_rad: float,
+    *,
+    product=None,
+    rep_index: Optional[int] = None,
+    item_index: Optional[int] = None,
+    logger: Optional[logging.Logger] = None,
+    detail_level: Literal["subshape", "face"] = "subshape",
+    material_resolver: Optional[Callable[[Any], Any]] = None,
+    unit_scale: float = 1.0,
+    transform: Optional[np.ndarray] = None,
+):
+    if item is None:
+        return None
+    occ_source = _create_occ_shape(
+        settings,
+        item,
+        product=product,
+        rep_index=rep_index,
+        item_index=item_index,
+        logger=logger,
+    )
+    if occ_source is None:
+        return None
+        
+    # Apply transform if present (from IfcMappedItem expansion)
+    if transform is not None:
+        occ_source = _apply_transform_to_occ_shape(occ_source, transform)
+        
+    detail_mesh = build_detail_mesh(
+        occ_source,
+        linear_deflection=float(linear_def),
+        angular_deflection_rad=float(angular_rad),
+        logger=logger or log,
+    )
 
 
 def _describe_rep_item(item) -> str:
@@ -1335,6 +1589,7 @@ def _detail_mesh_for_item(
     detail_level: Literal["subshape", "face"] = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     unit_scale: float = 1.0,
+    transform: Optional[np.ndarray] = None,
 ):
     if item is None:
         return None
@@ -1348,6 +1603,11 @@ def _detail_mesh_for_item(
     )
     if occ_source is None:
         return None
+        
+    # Apply transform if present (from IfcMappedItem expansion)
+    if transform is not None:
+        occ_source = _apply_transform_to_occ_shape(occ_source, transform)
+        
     detail_mesh = build_detail_mesh(
         occ_source,
         linear_deflection=float(linear_def),

@@ -27,6 +27,10 @@ _REQUIRED = [
     ("OCC.Core.BRep", "BRep_Tool"),
     ("OCC.Core.Bnd", "Bnd_Box"),
     ("OCC.Core", "BRepBndLib"),
+    ("OCC.Core.gp", "gp_Trsf"),
+    ("OCC.Core.gp", "gp_Vec"),
+    ("OCC.Core.gp", "gp_Mat"),
+    ("OCC.Core.BRepBuilderAPI", "BRepBuilderAPI_Transform"),
 ]
 
 _OPTIONAL: list[tuple[str, str]] = []
