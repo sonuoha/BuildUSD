@@ -6591,9 +6591,10 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
         semantic_parts: Dict[str, Dict[str, Any]] = {}
         
         # Determine if we should attempt semantic splitting
-        should_attempt_semantic = getattr(options, "enable_semantic_subcomponents", False)
+        detail_requested = getattr(options, "detail_mode", False) or (ctx.detail_scope in ("all", "object"))
+        should_attempt_semantic = detail_requested or getattr(options, "enable_semantic_subcomponents", False)
         if getattr(options, "force_occ", False):
-            # If force_occ is on, we skip semantic ONLY if this object is targeted for OCC detail
+            # If force_occ is on, we skip semantic ONLY when detail was requested for this object
             if ctx.detail_scope == "all":
                 should_attempt_semantic = False
             elif ctx.detail_scope == "object" and detail_object_match:
