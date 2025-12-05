@@ -415,17 +415,42 @@ def _build_detail_material_resolver(
     style_token_by_style_id: Dict[int, str],
     has_instance_style: bool,
     default_material_key: Optional[Any],
+    type_product=None,
 ):
     face_styles_cache: Optional[Dict[int, List[Any]]] = None
+    type_styles_cache: Optional[Dict[int, List[Any]]] = None
 
     def _resolver(item) -> Optional[Any]:
-        nonlocal face_styles_cache
+        nonlocal face_styles_cache, type_styles_cache
+        
+        # 1. Check product styles
         if face_styles_cache is None:
             try:
                 face_styles_cache = get_face_styles(ifc_file, product) or {}
             except Exception:
                 face_styles_cache = {}
-        styles = face_styles_cache.get(id(item)) if face_styles_cache else None
+        
+        try:
+            item_id = item.id()
+        except Exception:
+            item_id = 0
+            
+        styles = face_styles_cache.get(item_id) if face_styles_cache else None
+        
+        # DEBUG: Trace resolution
+        # item_desc = str(item)
+        print(f"DEBUG: Resolving item {item_id} ({item.is_a()}). Instance styles: {styles}")
+
+        # 2. Fallback: Check type product styles (for mapped items defined in Type)
+        if not styles and type_product:
+            if type_styles_cache is None:
+                try:
+                    type_styles_cache = get_face_styles(ifc_file, type_product) or {}
+                except Exception:
+                    type_styles_cache = {}
+            styles = type_styles_cache.get(item_id) if type_styles_cache else None
+            print(f"DEBUG: Type styles for item {item_id}: {styles}")
+
         if styles:
             for style in styles:
                 try:
@@ -435,9 +460,11 @@ def _build_detail_material_resolver(
                 if style_id is not None:
                     token = style_token_by_style_id.get(style_id)
                     if token:
+                        print(f"DEBUG: Resolved to {token}")
                         return token
         if has_instance_style:
             return "__style__instance"
+        print(f"DEBUG: Fallback to default {default_material_key}")
         return default_material_key
 
     return _resolver
@@ -5788,25 +5815,6 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             except Exception:
                 continue
         default_material_key = material_ids[0] if material_ids else None
-        detail_material_resolver = _build_detail_material_resolver(
-            ifc_file,
-            product,
-            style_token_by_style_id,
-            bool(style_material),
-            default_material_key,
-        )
-        settings_fp_current = settings_fp_base
-        skip_occ_detail = False
-
-        product_class = product.is_a() if hasattr(product, "is_a") else None
-        product_class_upper = product_class.upper() if isinstance(product_class, str) else None
-        product_name = getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<unnamed>"
-        guid_for_log = getattr(product, "GlobalId", None)
-
-        try:
-            product_id_int = int(product.id())
-        except Exception:
-            product_id_int = None
 
         type_ref = None
         type_guid = None
@@ -5824,6 +5832,28 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
             except Exception:
                 type_id = None
             break
+        detail_material_resolver = _build_detail_material_resolver(
+            ifc_file,
+            product,
+            style_token_by_style_id,
+            bool(style_material),
+            default_material_key,
+            type_product=type_ref,
+        )
+        settings_fp_current = settings_fp_base
+        skip_occ_detail = False
+
+        product_class = product.is_a() if hasattr(product, "is_a") else None
+        product_class_upper = product_class.upper() if isinstance(product_class, str) else None
+        product_name = getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<unnamed>"
+        guid_for_log = getattr(product, "GlobalId", None)
+
+        try:
+            product_id_int = int(product.id())
+        except Exception:
+            product_id_int = None
+
+
 
         type_info: Optional[MeshProto] = None
         type_detail_mesh: Optional["OCCDetailMesh"] = None
