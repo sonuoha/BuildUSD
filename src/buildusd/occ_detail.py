@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Literal, Set, Callable
@@ -1251,6 +1252,34 @@ def build_detail_mesh_payload(
     # Prepare canonical mapping data if available
     coord_to_vid: Optional[Dict[tuple, int]] = None
     tri_map: Optional[Dict[tuple, Dict[str, int]]] = None
+
+    # Resource guard: skip OCC detail if face count exceeds cap (when data available)
+    def _faces_in_map(cmap: Optional[Dict[str, Any]]) -> int:
+        try:
+            faces = cmap.get("faces")
+            return len(faces) if faces is not None else 0
+        except Exception:
+            return 0
+
+    face_cap_env = os.getenv("OCC_DETAIL_FACE_CAP")
+    face_cap = None
+    try:
+        if face_cap_env:
+            face_cap = int(face_cap_env)
+    except Exception:
+        face_cap = None
+
+    if canonical_map and face_cap:
+        if _faces_in_map(canonical_map) > face_cap:
+            if logref:
+                logref.warning(
+                    "OCC detail skipped for %s (guid=%s): face count %d exceeds cap %d",
+                    getattr(product, "is_a", lambda: type(product).__name__)(),
+                    getattr(product, "GlobalId", None),
+                    _faces_in_map(canonical_map),
+                    face_cap,
+                )
+            return None
     
     if canonical_map and "vertices" in canonical_map and "faces" in canonical_map:
         try:
@@ -1365,7 +1394,7 @@ def build_detail_mesh_payload(
     if detail_mesh is None:
         target_name = type(shape_obj).__name__ if shape_obj is not None else "IfcProduct"
         if logref:
-            logref.debug("OCC detail: no mesh generated for %s", target_name)
+            logref.warning("OCC detail: no mesh generated for %s", target_name)
         return None
 
     if detail_level == "face":

@@ -106,6 +106,10 @@ def _derive_lonlat_from_base_point(bp: BasePointConfig, projected_crs: Optional[
 def sanitize_name(raw_name, fallback=None):
     """Make a USD-legal prim name (deterministic; no time-based suffix)."""
     base = str(raw_name or fallback or "Unnamed")
+    try:
+        base = base.encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        base = str(fallback or "Unnamed")
     name = re.sub(r"[^A-Za-z0-9_]", "_", base)
     name = re.sub(r"_+", "_", name).strip("_")
     if not name:

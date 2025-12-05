@@ -1108,6 +1108,10 @@ def stable_mesh_hash(verts: Any, faces: Any) -> str:
 def sanitize_name(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
     """Return a USD-friendly identifier derived from IFC names."""
     base = str(raw_name or fallback or "Unnamed")
+    try:
+        base = base.encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        base = str(fallback or "Unnamed")
     if base.strip().lower() == "undefined" or not base.strip():
         base = str(fallback or "Material")
     name = re.sub(r"[^A-Za-z0-9_]", "_", base)
@@ -6297,7 +6301,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     canonical_map=canonical_map,
                 )
                 if detail_mesh_data is None:
-                    log.debug(
+                    log.warning(
                         "Detail mode: OCC mesh unavailable for %s guid=%s step=%s name=%s",
                         product_class_upper or product_class or "<unknown>",
                         getattr(product, "GlobalId", None),
@@ -6318,7 +6322,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                 subshape_count,
                 face_total if face_total is not None else "n/a",
             )
-            if subshape_entries:
+            if subshape_entries and log.isEnabledFor(logging.DEBUG):
                 for entry in subshape_entries:
                     label = getattr(entry, "label", "<subshape>")
                     shape_type = getattr(entry, "shape_type", "<unknown>")
