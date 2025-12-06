@@ -41,9 +41,41 @@ if TYPE_CHECKING:
     from .occ_detail import OCCDetailMesh
 
 
+class MaterialDict(dict):
+    """Hybrid mapping that behaves like a list for indexed access but also exposes name lookups."""
+    def __init__(self, ordered: List[PBRMaterial], extra: Optional[Dict[Any, PBRMaterial]] = None):
+        super().__init__()
+        self._ordered: List[PBRMaterial] = list(ordered)
+        for idx, mat in enumerate(self._ordered):
+            super().__setitem__(idx, mat)
+            name = getattr(mat, "name", None)
+            if name:
+                super().__setitem__(name, mat)
+        if extra:
+            for key, value in extra.items():
+                if key not in self and value is not None:
+                    super().__setitem__(key, value)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._ordered[key]
+        return super().__getitem__(key)
+
+    def __len__(self) -> int:  # type: ignore[override]
+        return len(self._ordered)
+
+    def __iter__(self):
+        return iter(self._ordered)
+
+    def copy(self):
+        return MaterialDict(self._ordered, {k: v for k, v in self.items() if not isinstance(k, int)})
+
+
 def _clone_materials(source):
     if source is None:
         return None
+    if isinstance(source, MaterialDict):
+        return source.copy()
     if isinstance(source, dict):
         cloned: Dict[Any, Any] = {}
         for key, value in source.items():
@@ -150,18 +182,39 @@ def _normalize_geom_materials(materials, face_style_groups, ifc_file):
     """Map iterator-provided style wrappers to friendly PBR materials."""
     if not isinstance(materials, (list, tuple)):
         return materials
+    def _is_pbr_material(obj: Any) -> bool:
+        return isinstance(obj, PBRMaterial) or (
+            hasattr(obj, "base_color")
+            and hasattr(obj, "opacity")
+            and hasattr(obj, "roughness")
+            and not hasattr(obj, "is_a")
+        )
     style_lookup: Dict[int, PBRMaterial] = {}
     for entry in (face_style_groups or {}).values():
         style_id = entry.get("style_id")
         mat = entry.get("material")
-        if style_id is None or mat is None or not isinstance(mat, PBRMaterial):
+        if style_id is None or mat is None or not _is_pbr_material(mat):
             continue
         try:
             style_lookup[int(style_id)] = mat
         except Exception:
             continue
+    # Fast-path: already-normalized PBR materials
+    all_pbr = all(_is_pbr_material(m) for m in materials)
+    name_overrides: Dict[str, PBRMaterial] = {}
+    for group in (face_style_groups or {}).values():
+        mat_obj = group.get("material")
+        if _is_pbr_material(mat_obj):
+            mat_name = getattr(mat_obj, "name", None)
+            if mat_name:
+                name_overrides[mat_name] = mat_obj
+    if all_pbr:
+        if face_style_groups:
+            return MaterialDict(list(materials), extra=name_overrides)
+        return list(materials)
     render_map = _render_style_map(ifc_file)
     converted: List[PBRMaterial] = []
+
     for idx, entry in enumerate(materials):
         if isinstance(entry, PBRMaterial):
             converted.append(entry)
@@ -193,6 +246,9 @@ def _normalize_geom_materials(materials, face_style_groups, ifc_file):
         converted.append(pbr)
         if style_id is not None:
             style_lookup.setdefault(style_id, pbr)
+    # When face style groups are present, expose both index and name lookup for downstream consumers.
+    if face_style_groups:
+        return MaterialDict(converted, extra=name_overrides)
     return converted
 
 
@@ -304,6 +360,15 @@ def _variantize_material(mat: Any, suffix: str) -> Any:
 
 
 def _variantize_materials(materials: Any, suffix: str):
+    if isinstance(materials, MaterialDict):
+        indexed = [_variantize_material(mat, suffix) for mat in materials._ordered]
+        extras = {}
+        for key, val in materials.items():
+            if isinstance(key, int):
+                continue
+            new_val = _variantize_material(val, suffix)
+            extras[getattr(new_val, "name", key)] = new_val
+        return MaterialDict(indexed, extra=extras)
     if not isinstance(materials, (list, tuple)):
         return materials
     return [ _variantize_material(mat, suffix) for mat in materials ]
@@ -675,8 +740,6 @@ class GeometrySettingsManager:
         remesh_overrides: Optional[Mapping[str, Any]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        import ifcopenshell.geom  # local import
-
         self._log = logger or log
 
         # High-level state
@@ -690,22 +753,47 @@ class GeometrySettingsManager:
             float(v) for v in base_settings.get("model-rotation", (0.0, 0.0, 0.0, 1.0))
         )
 
+        using_stub = False
+        try:
+            import ifcopenshell.geom  # local import
+            settings_factory = ifcopenshell.geom.settings
+        except Exception as exc:
+            # Provide a stub so unit tests can run without the native bindings.
+            class _StubSettings:
+                def __init__(self):
+                    self._data = {}
+                def set(self, key, value):
+                    self._data[key] = value
+                def get(self, key, default=None):
+                    return self._data.get(key, default)
+            settings_factory = _StubSettings
+            using_stub = True
+            self._log.debug("ifcopenshell.geom unavailable; using stub settings (%s)", exc)
+
         # Underlying ifcopenshell settings
-        self._default = ifcopenshell.geom.settings()
-        self._occ = ifcopenshell.geom.settings()
-        self._remesh = ifcopenshell.geom.settings()
+        self._default = settings_factory()
+        self._occ = settings_factory()
+        self._remesh = settings_factory()
 
         # Apply base config to all three
         for s in (self._default, self._occ, self._remesh):
             _apply_geom_settings(s, dict(base_settings))
 
         # OCC toggles (never on default, always on occ/remesh)
-        self._occ_available = _enable_occ(self._occ)
-        if remesh_overrides:
-            remesh_base = dict(base_settings)
-            remesh_base.update(remesh_overrides)
-            _apply_geom_settings(self._remesh, remesh_base)
-        self._remesh_occ_available = _enable_occ(self._remesh)
+        if using_stub:
+            self._occ_available = False
+            if remesh_overrides:
+                remesh_base = dict(base_settings)
+                remesh_base.update(remesh_overrides)
+                _apply_geom_settings(self._remesh, remesh_base)
+            self._remesh_occ_available = False
+        else:
+            self._occ_available = _enable_occ(self._occ)
+            if remesh_overrides:
+                remesh_base = dict(base_settings)
+                remesh_base.update(remesh_overrides)
+                _apply_geom_settings(self._remesh, remesh_base)
+            self._remesh_occ_available = _enable_occ(self._remesh)
 
         # Re-apply the initial model offset using the current offset-type
         # so the underlying settings carry the signed value.

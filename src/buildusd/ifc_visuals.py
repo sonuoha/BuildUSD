@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
 import re
 import logging
@@ -112,7 +113,18 @@ def _build_material_for_product_internal(product, model) -> Dict[str, Any]:
 # === IFC 8.9.3.10 PRECEDENCE: A → B → C → D → E ===
 
 def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_instance) -> List[ifcopenshell.entity_instance]:
-    styles = []
+    styles: List[Any] = []
+    generated: List[Any] = []
+
+    def _split_generated(candidates: List[Any]) -> tuple[list[Any], list[Any]]:
+        real = []
+        gen = []
+        for entry in candidates or []:
+            if getattr(entry, "_buildusd_generated_style", False):
+                gen.append(entry)
+            else:
+                real.append(entry)
+        return real, gen
 
     # A: IfcStyledItem on geometry
     for rep in (product.Representation.Representations if product.Representation else []):
@@ -127,7 +139,9 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
     for rel in getattr(product, "HasAssociations", []):
         if rel.is_a("IfcRelAssociatesMaterial"):
             mat = rel.RelatingMaterial
-            styles.extend(_styles_from_material_definition(mat))
+            resolved, gen = _split_generated(_styles_from_material_definition(mat))
+            styles.extend(resolved)
+            generated.extend(gen)
             if not styles:
                 # Fallback: try material style lookup via representation util when no MDR is present
                 try:
@@ -163,16 +177,23 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
         for rel in getattr(typ, "HasAssociations", []):
             if rel.is_a("IfcRelAssociatesMaterial"):
                 mat = rel.RelatingMaterial
-                styles.extend(_styles_from_material_definition(mat))
+                resolved, gen = _split_generated(_styles_from_material_definition(mat))
+                styles.extend(resolved)
+                generated.extend(gen)
                 if styles:
                     return styles
 
+    if styles:
+        return styles
+    if generated:
+        return generated
     return []
 
 
 def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[ifcopenshell.entity_instance]:
-    styles = []
-    visited = set()
+    styles: List[Any] = []
+    generated: List[Any] = []
+    visited: Set[int] = set()
 
     def collect(entity):
         if not entity or entity.id() in visited:
@@ -190,13 +211,24 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
                             styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
 
         # Recurse into sets
-        children = []
+        children: List[Any] = []
         if entity.is_a("IfcMaterialLayerSetUsage"):
             children.append(entity.ForLayerSet)
         elif entity.is_a("IfcMaterialLayerSet"):
             children.extend(entity.MaterialLayers or [])
         elif entity.is_a("IfcMaterialLayer"):
             children.append(entity.Material)
+            # Record layer name against its material so shape aspects can match.
+            layer_name = getattr(entity, "Name", None)
+            if layer_name:
+                material_source = getattr(entity, "Material", None) or entity
+                styles_for_layer = _styles_from_material_definition(material_source)
+                if styles_for_layer:
+                    generated_flag = getattr(material_source, "_buildusd_generated_style", False)
+                    for s in styles_for_layer:
+                        styles.append(s)
+                        if generated_flag:
+                            setattr(s, "_buildusd_generated_style", True)
         elif entity.is_a("IfcMaterialProfileSetUsage"):
             children.append(entity.ForProfileSet)
         elif entity.is_a("IfcMaterialProfileSet"):
@@ -211,12 +243,48 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
             children.extend(entity.Materials or [])
         elif entity.is_a("IfcMaterial"):
             children.extend(entity.HasRepresentation or [])
+        elif hasattr(entity, "HasRepresentation"):
+            # Allow other IfcMaterialDefinition subtypes (e.g. LayerSetUsage) to carry representations.
+            children.extend(getattr(entity, "HasRepresentation", []) or [])
 
         for child in children:
             collect(child)
 
     collect(mat)
-    return styles
+    if styles:
+        return styles
+
+    # Loose binding: match orphaned surface styles with the same name as the material.
+    def _match_styles_by_name(entity: Any) -> List[Any]:
+        model = getattr(entity, "file", None)
+        if model is None or not hasattr(model, "by_type"):
+            return []
+        target_name = getattr(entity, "Name", None)
+        if not target_name:
+            return []
+        try:
+            style_entities = model.by_type("IfcSurfaceStyle") or []
+        except Exception:
+            return []
+        target = _sanitize_style_token(str(target_name))
+        matched = []
+        for style in style_entities:
+            name = getattr(style, "Name", None)
+            if name and _sanitize_style_token(str(name)) == target:
+                matched.append(style)
+        return matched
+
+    loose = _match_styles_by_name(mat)
+    if loose:
+        return loose
+
+    # Generated fallback: provide a PBRMaterial so callers can still render with a stable token.
+    if mat is not None and hasattr(mat, "is_a") and mat.is_a("IfcMaterial"):
+        mat_name = getattr(mat, "Name", None) or "Material"
+        placeholder = PBRMaterial(name=_sanitize_style_token(str(mat_name)))
+        setattr(placeholder, "_buildusd_generated_style", True)
+        generated.append(placeholder)
+    return generated
 
 
 # Map material constituent names to styles (used to correlate with shape aspect names).
@@ -251,6 +319,26 @@ def _constituent_styles_by_name(product: ifcopenshell.entity_instance) -> Dict[s
         elif entity.is_a("IfcMaterialConstituent"):
             cname = getattr(entity, "Name", None) or getattr(getattr(entity, "Material", None), "Name", None)
             record(cname, getattr(entity, "Material", None) or entity)
+        elif entity.is_a("IfcMaterialLayerSet"):
+            set_name = getattr(entity, "LayerSetName", None) or getattr(entity, "Name", None)
+            record(set_name, entity)
+            for layer in getattr(entity, "MaterialLayers", []) or []:
+                collect(layer)
+        elif entity.is_a("IfcMaterialLayer"):
+            layer_name = getattr(entity, "Name", None)
+            record(layer_name, getattr(entity, "Material", None) or entity)
+            if getattr(entity, "Material", None):
+                collect(entity.Material)
+        elif entity.is_a("IfcMaterialProfileSet"):
+            set_name = getattr(entity, "Name", None)
+            record(set_name, entity)
+            for profile in getattr(entity, "MaterialProfiles", []) or []:
+                collect(profile)
+        elif entity.is_a("IfcMaterialProfile"):
+            prof_name = getattr(entity, "Name", None)
+            record(prof_name, getattr(entity, "Material", None) or entity)
+            if getattr(entity, "Material", None):
+                collect(entity.Material)
         elif entity.is_a("IfcMaterial"):
             record(getattr(entity, "Name", None), entity)
         elif entity.is_a("IfcMaterialLayerSetUsage"):
@@ -259,7 +347,14 @@ def _constituent_styles_by_name(product: ifcopenshell.entity_instance) -> Dict[s
             collect(entity.ForProfileSet)
 
         # Follow associated material definitions.
-        for child_attr in ("HasAssociations", "ForLayerSet", "ForProfileSet", "MaterialConstituents"):
+        for child_attr in (
+            "HasAssociations",
+            "ForLayerSet",
+            "ForProfileSet",
+            "MaterialConstituents",
+            "MaterialLayers",
+            "MaterialProfiles",
+        ):
             child = getattr(entity, child_attr, None)
             if isinstance(child, (list, tuple)):
                 for sub in child:
@@ -622,6 +717,10 @@ def _resolve_uv_ifc4_polygonal_texture_map(tess) -> Optional[MeshUV]:
 # === PBR CONVERSION ===
 def _get_material_for_style(model, style) -> Optional[ifcopenshell.entity_instance]:
     """Resolve the IfcMaterial that owns ``style`` via MDR chains."""
+    if model is None or not hasattr(model, "by_type"):
+        return None
+    if isinstance(style, PBRMaterial):
+        return None
     try:
         mdrs = model.by_type("IfcMaterialDefinitionRepresentation")
     except Exception:
@@ -674,6 +773,14 @@ def _resolve_surface_style_entity(style: Optional[ifcopenshell.entity_instance])
 
 def _friendly_style_name(style: ifcopenshell.entity_instance, shape_name: Optional[str] = None) -> str:
     """Readable token combining shape aspect name + material/style name."""
+    if isinstance(style, PBRMaterial):
+        base = style.name or "Material"
+        named = _name_with_color_hint(base, getattr(style, "base_color", (0.8, 0.8, 0.8)))
+        token = _sanitize_style_token(named)
+        if shape_name:
+            token = _sanitize_style_token(f"{shape_name}_{token}")
+        return token
+
     model = getattr(style, "file", None)
     material = _get_material_for_style(model, style)
     def _clean_name(name: Optional[str]) -> Optional[str]:
@@ -720,6 +827,9 @@ def _to_pbr(
     *,
     preferred_name: Optional[str] = None,
 ) -> PBRMaterial:
+    if isinstance(style, PBRMaterial):
+        return replace(style, name=preferred_name or style.name)
+
     surface_style = _resolve_surface_style_entity(style) or style
     material = _get_material_for_style(model or getattr(surface_style, "file", None), surface_style)
     mat_name = getattr(material, "Name", None)
@@ -781,6 +891,22 @@ def pbr_from_surface_style(
 
 
 def _log_style_resolution(style, rendering, shading, pbr) -> None:
+    if isinstance(style, PBRMaterial):
+        target_logger = LOG if LOG.isEnabledFor(logging.INFO) else logging.getLogger()
+        try:
+            target_logger.info(
+                "PBR material '%s' -> base=%s opacity=%.4f roughness=%.4f metallic=%.4f emissive=%s",
+                getattr(style, "name", None),
+                tuple(round(c, 4) for c in getattr(style, "base_color", (0.8, 0.8, 0.8))),
+                getattr(style, "opacity", 1.0),
+                getattr(style, "roughness", 0.5),
+                getattr(style, "metallic", 0.0),
+                tuple(round(c, 4) for c in getattr(style, "emissive", (0.0, 0.0, 0.0))),
+            )
+        except Exception:
+            pass
+        return
+
     root_logger = logging.getLogger()
     logger: logging.Logger
     if LOG.isEnabledFor(logging.DEBUG):
