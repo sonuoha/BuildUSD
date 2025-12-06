@@ -45,6 +45,8 @@ tests/*
 .idea/
 
 # Debugging files
+*debug*.py
+*debug*
 _debug_bbox.py
 _debug_components.py
 _debug_container.py
@@ -65,3 +67,24 @@ container_material_debug.log
 patch/
 run_*.txt
 *.zip
+
+# Log Files
+*.log
+logs/
+logs/*
+logs/**/*
+*logs*.txt
+
+# Temp and local run artifacts
+*.tmp
+*_log.txt
+run_local.txt
+run_log.txt
+code-review.csv
+_tmp_update_ifc.py
+tmp_patch.diff
+build_log.txt
+
+# Empty or misnamed files
+python
+conda
