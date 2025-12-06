@@ -15,9 +15,29 @@ Requirements
 - **Kit mode (default)** – no standalone `usd-core` wheel required. Install Omniverse Kit (``pip install --extra-index-url https://pypi.nvidia.com omniverse-kit``) so `omni.client` and Kit's pxr are available.
 - **Offline mode (`--offline`)** – install a standalone USD build (e.g. ``pip install usd-core``). All paths must be local; `omniverse://` URIs are rejected and checkpointing is skipped.
 
+Support matrix (tested)
+- OS: Windows 10/11, Ubuntu 22.04 (headless OK).
+- Python: 3.11, 3.12.
+- IfcOpenShell: 0.8.3.post2.
+- USD bindings: Omniverse Kit pxr (Kit 105/106), usd-core 24.08.
+- pythonocc: optional; OCC detail requires an OCC-enabled ifcopenshell build.
+
 Environment
 - Windows requires the Microsoft Visual C++ 2015–2022 Redistributable x64.
 - Ensure your virtual environment is active before running.
+
+Quick start (offline)
+- Download a small public IFC (e.g., Duplex_A_20110907.ifc from common samples) into `data/input/`.
+- Convert locally (no Kit):  
+  `python -m buildusd --offline --input data/input/Duplex_A_20110907.ifc`
+- Expected: stages and layers under `data/output/Duplex_A_20110907/`; no Nucleus access.
+- Additional IFC samples are available at https://github.com/youshengCode/IfcSampleFiles (see that repository’s license; attribute and comply with its terms when using those files).
+
+Quick start (Nucleus / Kit)
+- Accept Kit EULA, install Kit, and ensure an `omniverse://` endpoint is reachable.
+- Convert and checkpoint:  
+  `python -m buildusd --input omniverse://server/Projects/IFC/Duplex_A.ifc --checkpoint`
+- Expected: authored layers on Nucleus; headless Kit session auto-starts.
 
 Install
 - Create/activate venv and install dependencies per your workflow (e.g., ``pip install -e .`` or ``uv sync``).
@@ -76,6 +96,11 @@ Usage (CLI)
   - python -m buildusd --detail-mode --detail-engine semantic  # IFC subcomponents only (no OCC fallback) for all products
   - python -m buildusd --detail-mode --detail-scope object --detail-objects 1265 ubd7n32hksiop  # detail only specific STEP ids / GUIDs
   - python -m buildusd --detail-mode --detail-engine occ --detail-scope object --detail-objects 1265  # OCC-only detail for targeted objects
+- CLI detail flags (defaults/behavior):
+  - `--detail-mode`: off by default; enables the detail pipeline.
+  - `--detail-scope`: required when detail-mode is on; `all` (default when omitted) or `object` (requires `--detail-objects`).
+  - `--detail-objects`: space-separated STEP ids and/or GUIDs; used only when scope=object.
+  - `--detail-engine`: `default` (semantic first, OCC fallback), `occ|opencascade` (OCC only), `semantic|ifc-subcomponents|ifc-parts` (semantic only).
 - Update meters-per-unit metadata on an existing USD stage/layer (no IFC conversion):
   - python -m buildusd --set-stage-unit "omniverse://server/Projects/file.usdc" --stage-unit-value 0.001
 - Update up-axis metadata on an existing USD stage/layer (no IFC conversion):
@@ -117,6 +142,9 @@ ConversionOptions examples (programmatic)
 - Geometry overrides (safe subset only):
   - `options = ConversionOptions(detail_mode=True, detail_scope="all", geom_overrides={"mesher-linear-deflection": 0.5, "mesher-angular-deflection": 5})`
 
+Manifest schema
+- Sample manifests live in `src/buildusd/config/sample_manifest.{json,yaml}`. Keep the same structure (masters, base points, CRS). Add a jsonschema alongside your manifests if you want automated validation (e.g., `manifest.schema.json`) and validate with `buildusd validate-manifest` when available.
+
 Outputs
 - Per-IFC stages and layers are written to data/output:
   - <name>.usda (stage)
@@ -137,6 +165,9 @@ Materials
 - Names drop literal “Undefined” and add a closest CSS color hint when available (`webcolors` preferred; small fallback palette otherwise).
 - Multiple materials → face subsets; iterator materials are not force-overridden beyond IFC precedence. Single-material meshes bind the resolved style when only one material id exists and no face-level subsets are defined.
 - Texture safety: only http/https and relative file:// paths are used; absolute file:// paths are ignored for safety.
+
+License
+- GPL-3.0. This is a copyleft license; consuming projects must comply with GPL terms. If you need a different license for your use case, discuss with the maintainers.
 
 
 Geometry overrides (advanced)
