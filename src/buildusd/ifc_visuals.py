@@ -530,16 +530,23 @@ def _collect_styled_items(item, mapping):
 # === FACE GROUPING ===
 
 def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, Any]]:
-    face_styles = get_face_styles(model, product)
-    if not face_styles:
-        return {}
+    face_styles = get_face_styles(model, product) or {}
+    # If object-level styles exist, prefer them over indexed colour maps.
+    has_object_styles = bool(get_surface_styles(model, product))
 
     shape_name_by_item = _shape_aspect_name_map(product)
     item_to_aspects = _map_items_to_aspects(product)
     combined = {}
     face_offset = 0
     for item in _iter_representation_items(product):
-        item_groups, face_count = _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, item_to_aspects)
+        item_groups, face_count = _face_style_groups_from_item(
+            item,
+            face_styles,
+            model,
+            shape_name_by_item,
+            item_to_aspects,
+            allow_color_fallback=not has_object_styles,
+        )
         for key, entry in item_groups.items():
             faces = [face_offset + idx for idx in entry.get("faces", [])]
             if not faces:
@@ -582,7 +589,7 @@ def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, A
     return result
 
 
-def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, item_to_aspects=None) -> Tuple[Dict, int]:
+def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, item_to_aspects=None, *, allow_color_fallback: bool = True) -> Tuple[Dict, int]:
     face_count = _face_count_from_item(item)
     if face_count == 0:
         return {}, 0
@@ -646,6 +653,8 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, i
         return {("styled", mat.name): payload}, face_count
 
     # Fallback: IfcIndexedColourMap
+    if not allow_color_fallback:
+        return {}, face_count
     groups = {}
     maps = getattr(item, "HasColours", []) or []
     assigned = [False] * face_count
