@@ -571,8 +571,20 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, i
     if face_count == 0:
         return {}, 0
 
-    item_id = id(item)
-    step_id = item.id()
+    try:
+        raw_id = item.id()
+    except Exception:
+        raw_id = None
+    step_id: Optional[int]
+    item_id: Any
+    try:
+        step_id = int(raw_id) if raw_id is not None else None
+    except Exception:
+        step_id = None
+    if raw_id is None:
+        item_id = id(item)
+    else:
+        item_id = step_id if step_id is not None else raw_id
     item_type = item.is_a()
     
     aspect_ids = set()
