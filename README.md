@@ -71,10 +71,11 @@ Usage (CLI)
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m buildusd --input omniverse://server/Projects/IFC --all
 - Detail routing examples:
-  - python -m buildusd --detail-mode --detail-engine default   # subcomponents then OCC fallback
-  - python -m buildusd --detail-mode --detail-engine occ       # OCC only, skip subcomponents
-  - python -m buildusd --detail-mode --detail-engine semantic  # IFC subcomponents only
-  - python -m buildusd --detail-mode --detail-scope object --detail-objects 1265 ubd7n32hksiop
+  - python -m buildusd --detail-mode --detail-engine default   # IFC subcomponents first, OCC fallback for all products
+  - python -m buildusd --detail-mode --detail-engine occ       # OCC only for all products (skip subcomponents)
+  - python -m buildusd --detail-mode --detail-engine semantic  # IFC subcomponents only (no OCC fallback) for all products
+  - python -m buildusd --detail-mode --detail-scope object --detail-objects 1265 ubd7n32hksiop  # detail only specific STEP ids / GUIDs
+  - python -m buildusd --detail-mode --detail-engine occ --detail-scope object --detail-objects 1265  # OCC-only detail for targeted objects
 - Update meters-per-unit metadata on an existing USD stage/layer (no IFC conversion):
   - python -m buildusd --set-stage-unit "omniverse://server/Projects/file.usdc" --stage-unit-value 0.001
 - Update up-axis metadata on an existing USD stage/layer (no IFC conversion):
@@ -106,6 +107,16 @@ Usage (Python)
 - from buildusd.api import set_stage_up_axis
 - set_stage_up_axis("omniverse://server/Projects/file.usdc", axis="Z")
 
+ConversionOptions examples (programmatic)
+- Detail all with OCC fallback after subcomponents:
+  - `options = ConversionOptions(detail_mode=True, detail_scope="all", detail_engine="default")`
+- Detail specific objects (mixed ids/guids) via OCC only:
+  - `options = ConversionOptions(detail_mode=True, detail_scope="object", detail_objects=(1265, "UBD7N32HKSiop"), detail_engine="occ")`
+- Semantic-only detail (no OCC fallback):
+  - `options = ConversionOptions(detail_mode=True, detail_scope="all", detail_engine="semantic")`
+- Geometry overrides (safe subset only):
+  - `options = ConversionOptions(detail_mode=True, detail_scope="all", geom_overrides={"mesher-linear-deflection": 0.5, "mesher-angular-deflection": 5})`
+
 Outputs
 - Per-IFC stages and layers are written to data/output:
   - <name>.usda (stage)
@@ -134,7 +145,8 @@ Geometry overrides (advanced)
 - Core pipeline settings are fixed internally and ignored if provided here: `use-world-coords`, `model-offset`, `offset-type`, `use-python-opencascade`.
 - Anchoring/model offsets remain controlled by the converter; overrides are merged on top of the defaults where safe.
 Detail / remesh
-- `enable_high_detail_remesh` defaults to False; the iterator mesh is the base geometry. `--detail-mode`/`detail_scope` runs the OCC detail pipeline without remeshing unless remesh is explicitly enabled.
+- `enable_high_detail_remesh` defaults to False; the iterator mesh is the base geometry. `--detail-mode` runs the detail pipeline without remeshing unless explicitly enabled.
+- Detail scope is required when detail-mode is on: `all` (default when omitted) or `object` (paired with `--detail-objects`).
 - OCC detail meshes author under `/World/__PrototypesDetail` (and instance overrides when scoped); the base iterator tessellation remains the primary geometry path.
 - Detail engine routing:
   - `--detail-engine default` (default) tries IFC subcomponents first, then falls back to OCC.
