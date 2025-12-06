@@ -6106,6 +6106,24 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
         mesh_dict = mesh_dict_base
         mesh_stats = _mesh_stats(mesh_dict_base) if mesh_dict_base is not None else None
         face_count = int(mesh_dict["faces"].shape[0]) if mesh_dict is not None and "faces" in mesh_dict else 0
+
+        def _is_placeholder_material(mat: Any) -> bool:
+            name = getattr(mat, "name", None) or getattr(mat, "Name", None)
+            if not name:
+                return False
+            token = str(name).strip().lower()
+            return token.startswith("materialconstituentset") or token.startswith("materiallayerset") or token.startswith("materialprofileset")
+
+        if face_count:
+            if not materials or (
+                isinstance(materials, (list, tuple))
+                and len(materials) == 1
+                and _is_placeholder_material(materials[0])
+            ):
+                if style_material is not None:
+                    materials = [style_material]
+                    material_ids = [0 for _ in range(face_count)]
+
         if mesh_dict_base is not None:
             try:
                 expected_corners = int(mesh_dict_base["faces"].size)

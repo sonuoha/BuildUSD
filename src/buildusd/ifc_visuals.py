@@ -194,6 +194,26 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
     styles: List[Any] = []
     generated: List[Any] = []
     visited: Set[int] = set()
+    _mdr_cache: Dict[int, List[Any]] = {}
+
+    def _match_styles_by_name(entity: Any) -> List[Any]:
+        model = getattr(entity, "file", None)
+        if model is None or not hasattr(model, "by_type"):
+            return []
+        target_name = getattr(entity, "Name", None)
+        if not target_name:
+            return []
+        try:
+            style_entities = model.by_type("IfcSurfaceStyle") or []
+        except Exception:
+            return []
+        target = _sanitize_style_token(str(target_name))
+        matched = []
+        for style in style_entities:
+            name = getattr(style, "Name", None)
+            if name and _sanitize_style_token(str(name)) == target:
+                matched.append(style)
+        return matched
 
     def collect(entity):
         if not entity or entity.id() in visited:
@@ -242,7 +262,23 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
         elif entity.is_a("IfcMaterialList"):
             children.extend(entity.Materials or [])
         elif entity.is_a("IfcMaterial"):
+            # If inverse HasRepresentation is missing, walk MDRs that target this material.
+            mat_file = getattr(entity, "file", None)
+            if mat_file is not None:
+                try:
+                    cache_key = id(mat_file)
+                    if cache_key not in _mdr_cache:
+                        _mdr_cache[cache_key] = list(mat_file.by_type("IfcMaterialDefinitionRepresentation") or [])
+                    for mdr in _mdr_cache[cache_key]:
+                        if getattr(mdr, "RepresentedMaterial", None) == entity:
+                            children.append(mdr)
+                except Exception:
+                    pass
             children.extend(entity.HasRepresentation or [])
+            # Loose binding on the material itself (by name).
+            matched = _match_styles_by_name(entity)
+            if matched:
+                styles.extend(matched)
         elif hasattr(entity, "HasRepresentation"):
             # Allow other IfcMaterialDefinition subtypes (e.g. LayerSetUsage) to carry representations.
             children.extend(getattr(entity, "HasRepresentation", []) or [])
@@ -253,26 +289,6 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
     collect(mat)
     if styles:
         return styles
-
-    # Loose binding: match orphaned surface styles with the same name as the material.
-    def _match_styles_by_name(entity: Any) -> List[Any]:
-        model = getattr(entity, "file", None)
-        if model is None or not hasattr(model, "by_type"):
-            return []
-        target_name = getattr(entity, "Name", None)
-        if not target_name:
-            return []
-        try:
-            style_entities = model.by_type("IfcSurfaceStyle") or []
-        except Exception:
-            return []
-        target = _sanitize_style_token(str(target_name))
-        matched = []
-        for style in style_entities:
-            name = getattr(style, "Name", None)
-            if name and _sanitize_style_token(str(name)) == target:
-                matched.append(style)
-        return matched
 
     loose = _match_styles_by_name(mat)
     if loose:
