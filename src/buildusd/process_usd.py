@@ -2257,9 +2257,9 @@ def author_prototype_layer(
     proto_root_detail = Sdf.Path("/World/__PrototypesDetail")
     proto_paths: Dict[PrototypeKey, Sdf.Path] = {}
     used_names: Dict[str, int] = {}
-    detail_scope = getattr(options, "detail_scope", "none") or "none"
+    detail_scope = getattr(options, "detail_scope", "all") or "all"
     detail_mode_enabled = bool(
-        getattr(options, "enable_high_detail_remesh", False) or detail_scope in ("all", "object")
+        getattr(options, "detail_mode", False) or getattr(options, "enable_high_detail_remesh", False)
     )
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
@@ -3843,9 +3843,9 @@ def author_instance_layer(
     hierarchy_nodes_by_step: Dict[int, Sdf.Path] = {}
     hierarchy_nodes_by_label: Dict[Tuple[Sdf.Path, str], Sdf.Path] = {}
 
-    detail_scope = getattr(options, "detail_scope", "none") or "none"
+    detail_scope = getattr(options, "detail_scope", "all") or "all"
     detail_mode_enabled = bool(
-        getattr(options, "enable_high_detail_remesh", False) or detail_scope in ("all", "object")
+        getattr(options, "detail_mode", False) or getattr(options, "enable_high_detail_remesh", False)
     )
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 

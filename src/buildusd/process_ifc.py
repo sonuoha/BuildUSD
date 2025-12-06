@@ -412,7 +412,6 @@ def _build_object_scope_detail_mesh(
         default_linear_def=_DEFAULT_LINEAR_DEF,
         default_angular_def=_DEFAULT_ANGULAR_DEF,
         logger=log,
-        detail_level=ctx.detail_level,
         material_resolver=material_resolver,
         reference_shape=reference_shape,
         canonical_map=canonical_map,
@@ -1186,16 +1185,15 @@ class ConversionOptions:
     manifest: Optional['ConversionManifest'] = None
     curve_width_rules: Tuple[CurveWidthRule, ...] = tuple()
     anchor_mode: Optional[Literal["local", "site"]] = None
-    split_topology_by_material: bool = False
-    detail_scope: Literal["none", "all", "object"] = "none"
-    detail_level: Literal["subshape", "face"] = "subshape"
-    detail_object_ids: Tuple[int, ...] = tuple()
-    detail_object_guids: Tuple[str, ...] = tuple()
+    detail_mode: bool = False
+    detail_scope: Literal["all", "object"] = "all"
+    detail_objects: Tuple[Union[int, str], ...] = tuple()
     enable_instance_material_variants: bool = True
     enable_semantic_subcomponents: bool = False
     semantic_tokens: Dict[str, List[str]] = field(default_factory=dict)
-    force_occ: bool = False
-    force_engine: Literal["default", "occ", "semantic"] = "default"
+    detail_engine: Literal["default", "occ", "semantic"] = "default"
+    # Optional geometry overrides (safe subset). Keys match ifcopenshell/occ settings.
+    geom_overrides: Dict[str, Any] = field(default_factory=dict)
     # Optional overrides for geometry settings (fed from anchoring logic)
     model_offset: Optional[Tuple[float, float, float]] = None
     model_offset_type: Optional[str] = None
@@ -1284,8 +1282,8 @@ class PrototypeBuildContext:
     instances: Dict[int, InstanceRecord] = field(default_factory=dict)
     hierarchy_cache: Dict[int, Tuple[Tuple[str, Optional[int]], ...]] = field(default_factory=dict)
     annotation_hooks: Optional[AnnotationHooks] = field(default=None)
-    detail_scope: Literal["none", "all", "object"] = "none"
-    detail_level: Literal["subshape", "face"] = "subshape"
+    detail_mode: bool = False
+    detail_scope: Literal["all", "object"] = "all"
     detail_object_ids: Set[int] = field(default_factory=set)
     detail_object_guids: Set[str] = field(default_factory=set)
     user_high_detail: bool = False
@@ -1299,53 +1297,61 @@ class PrototypeBuildContext:
             options = ConversionOptions()
 
         # Normalise detail scope / level
-        detail_scope = getattr(options, "detail_scope", "none") or "none"
-        if detail_scope not in ("none", "all", "object"):
-            detail_scope = "none"
+        detail_mode = bool(getattr(options, "detail_mode", False))
+        detail_scope = getattr(options, "detail_scope", "all") or "all"
+        if detail_scope not in ("all", "object"):
+            log.info("Detail scope '%s' invalid; defaulting to 'all'.", detail_scope)
+            detail_scope = "all"
 
-        detail_level = getattr(options, "detail_level", "subshape") or "subshape"
         explicit_semantic = bool(getattr(options, "enable_semantic_subcomponents", False))
 
-        # "subcomponents" is a semantic request but uses same OCC detail level
-        if detail_level.lower() in ("subcomponent", "subcomponents"):
-            detail_level = "subshape"
-            explicit_semantic = True
-
-        if detail_level not in ("subshape", "face"):
-            detail_level = "subshape"
-
-        # Any non-"none" detail_scope implies semantics + detail
-        if detail_scope != "none":
+        # Any detail_mode implies semantics + detail
+        if detail_mode:
             explicit_semantic = True
 
         options.enable_semantic_subcomponents = explicit_semantic
+        options.detail_scope = detail_scope
+        options.detail_mode = detail_mode
 
         # Decode explicit object ids / guids
+        # Resolve mixed detail object tokens (STEP ids or GUIDs)
         detail_object_ids: Set[int] = set()
+        detail_object_guids: Set[str] = set()
+
+        # Preferred mixed input
+        for value in getattr(options, "detail_objects", tuple()) or tuple():
+            try:
+                detail_object_ids.add(int(value))
+                continue
+            except Exception:
+                pass
+            text = str(value).strip().upper()
+            if text:
+                detail_object_guids.add(text)
+
+        # Legacy explicit id / guid fields (kept for compatibility)
         for value in getattr(options, "detail_object_ids", tuple()) or tuple():
             try:
                 detail_object_ids.add(int(value))
             except Exception:
                 continue
+        for value in getattr(options, "detail_object_guids", tuple()) or tuple():
+            text = str(value).strip().upper()
+            if text:
+                detail_object_guids.add(text)
 
-        detail_object_guids: Set[str] = {
-            str(value).strip().upper()
-            for value in (getattr(options, "detail_object_guids", tuple()) or tuple())
-            if str(value).strip()
-        }
-
-        detail_mode_requested = detail_scope == "all"
+        detail_mode_requested = detail_mode
         user_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
-        force_engine = getattr(options, "force_engine", "default") or "default"
+        force_engine = getattr(options, "detail_engine", getattr(options, "force_engine", "default")) or "default"
         force_occ = force_engine == "occ"
         force_semantic_only = force_engine == "semantic"
 
         if force_occ:
-            if detail_scope in ("none", "all"):
+            if detail_scope == "object":
+                log.info("Detail engine OCC: bypassing semantic splitting for detailed objects.")
+            else:
                 log.info("Detail engine OCC: applying OCC pipeline to ALL products.")
                 detail_scope = "all"
-            elif detail_scope == "object":
-                log.info("Detail engine OCC: bypassing semantic splitting for detailed objects.")
 
         # Instantiate our unified settings manager
         base_geom_settings = dict(_BASE_GEOM_SETTINGS)
@@ -1353,6 +1359,14 @@ class PrototypeBuildContext:
             base_geom_settings["model-offset"] = tuple(getattr(options, "model_offset"))
         if getattr(options, "model_offset_type", None):
             base_geom_settings["offset-type"] = str(getattr(options, "model_offset_type"))
+        # Apply user-provided safe geometry overrides
+        user_geom = getattr(options, "geom_overrides", {}) or {}
+        if user_geom:
+            for key, value in user_geom.items():
+                # Protect core pipeline settings
+                if key in ("use-world-coords", "model-offset", "offset-type", "use-python-opencascade"):
+                    continue
+                base_geom_settings[key] = value
 
         settings_manager = GeometrySettingsManager(
             base_settings=base_geom_settings,
@@ -1372,16 +1386,17 @@ class PrototypeBuildContext:
         else:
             log.info("High-detail remeshing is ENABLED: remesh settings will be used as a per-product fallback.")
 
-        if detail_scope == "object":
-            log.info(
-                "Detail scope 'object': iterator + semantic subcomponents run first; "
-                "OCC detail will be attempted only for selected objects where needed."
-            )
-        elif detail_scope == "all":
-            log.info(
-                "Detail scope 'all': iterator + semantic subcomponents run for all products; "
-                "OCC detail will only be used as a fallback when semantic splitting fails."
-            )
+        if detail_mode:
+            if detail_scope == "object":
+                log.info(
+                    "Detail scope 'object': iterator + semantic subcomponents run first; "
+                    "OCC detail will be attempted only for selected objects where needed."
+                )
+            elif detail_scope == "all":
+                log.info(
+                    "Detail scope 'all': iterator + semantic subcomponents run for all products; "
+                    "OCC detail will only be used as a fallback when semantic splitting fails."
+                )
 
         fine_remesh_settings = settings_manager.remesh_settings if enable_high_detail else None
 
@@ -1439,8 +1454,8 @@ class PrototypeBuildContext:
             instances={},
             hierarchy_cache={},
             annotation_hooks=annotation_hooks,
+            detail_mode=detail_mode,
             detail_scope=detail_scope,
-            detail_level=detail_level,
             detail_object_ids=detail_object_ids,
             detail_object_guids=detail_object_guids,
             user_high_detail=user_high_detail,
@@ -5809,9 +5824,8 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
         )
     ctx = PrototypeBuildContext.build(ifc_file, options)
     log.info(
-        "Detail configuration: scope=%s level=%s object_ids=%d object_guids=%d",
+        "Detail configuration: scope=%s object_ids=%d object_guids=%d",
         ctx.detail_scope,
-        ctx.detail_level,
         len(ctx.detail_object_ids),
         len(ctx.detail_object_guids),
     )
@@ -6138,7 +6152,8 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                 if not info.style_face_groups and face_style_groups:
                     info.style_face_groups = _clone_style_groups(face_style_groups)
             if (
-                ctx.enable_high_detail
+                ctx.detail_mode
+                and ctx.enable_high_detail
                 and ctx.detail_scope in ("all", "object")
                 and occ_detail.is_available()
                 and getattr(info, "detail_mesh", None) is None
@@ -6150,7 +6165,6 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                         default_linear_def=_DEFAULT_LINEAR_DEF,
                         default_angular_def=_DEFAULT_ANGULAR_DEF,
                         logger=log,
-                        detail_level=ctx.detail_level,
                         material_resolver=detail_material_resolver,
                     )
                     if info.detail_mesh:
@@ -6172,17 +6186,17 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
 
         need_fine_remesh = False
         allow_brep_fallback = False
-        force_engine = getattr(options, "force_engine", "default") or "default"
+        force_engine = getattr(options, "detail_engine", getattr(options, "force_engine", "default")) or "default"
         force_occ = force_engine == "occ"
         force_semantic_only = force_engine == "semantic"
         need_occ_detail = False
         defer_occ_detail = bool(getattr(options, "enable_semantic_subcomponents", False)) and not force_occ and not force_semantic_only
 
-        if force_occ and ctx.detail_scope != "object":
+        if ctx.detail_mode and force_occ and ctx.detail_scope != "object":
             need_occ_detail = True
             detail_reasons.append("force_occ")
 
-        if detail_object_match and not force_semantic_only:
+        if ctx.detail_mode and detail_object_match and not force_semantic_only:
             log.info(
                 "Detail scope object hit: %s name=%s guid=%s step=%s",
                 product_class_upper or product_class or "<unknown>",
@@ -6221,7 +6235,7 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     primary_key = PrototypeKey(kind="repmap_detail", identifier=type_id)
                     detail_mesh_data = type_detail_mesh
         else:
-            if ctx.detail_scope == "all" and not force_semantic_only:
+            if ctx.detail_mode and ctx.detail_scope == "all" and not force_semantic_only:
                 need_occ_detail = True
                 detail_reasons.append("scope_all")
 
@@ -6318,7 +6332,6 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                     default_linear_def=_DEFAULT_LINEAR_DEF,
                     default_angular_def=_DEFAULT_ANGULAR_DEF,
                     logger=log,
-                    detail_level=ctx.detail_level,
                     material_resolver=detail_material_resolver,
                     reference_shape=shape,
                     canonical_map=canonical_map,
@@ -6614,9 +6627,9 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
         semantic_parts: Dict[str, Dict[str, Any]] = {}
         
         # Determine if we should attempt semantic splitting
-        detail_requested = getattr(options, "detail_mode", False) or (ctx.detail_scope in ("all", "object"))
-        force_engine = getattr(options, "force_engine", "default") or "default"
-        force_occ = force_engine == "occ" or getattr(options, "force_occ", False)
+        detail_requested = bool(ctx.detail_mode or ctx.enable_high_detail)
+        force_engine = getattr(options, "detail_engine", getattr(options, "force_engine", "default")) or "default"
+        force_occ = force_engine == "occ"
         force_semantic_only = force_engine == "semantic"
         should_attempt_semantic = force_semantic_only or detail_requested or getattr(options, "enable_semantic_subcomponents", False)
         if force_occ and detail_requested:
@@ -6779,7 +6792,6 @@ def build_prototypes(ifc_file, options: ConversionOptions, ifc_path: Optional[st
                         default_linear_def=_DEFAULT_LINEAR_DEF,
                         default_angular_def=_DEFAULT_ANGULAR_DEF,
                         logger=log,
-                        detail_level=ctx.detail_level,
                         material_resolver=detail_material_resolver,
                         reference_shape=shape,
                         canonical_map=canonical_map,

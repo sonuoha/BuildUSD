@@ -70,6 +70,11 @@ Usage (CLI)
   - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.yaml --masters-root data/federated
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m buildusd --input omniverse://server/Projects/IFC --all
+- Detail routing examples:
+  - python -m buildusd --detail-mode --detail-engine default   # subcomponents then OCC fallback
+  - python -m buildusd --detail-mode --detail-engine occ       # OCC only, skip subcomponents
+  - python -m buildusd --detail-mode --detail-engine semantic  # IFC subcomponents only
+  - python -m buildusd --detail-mode --detail-scope object --detail-objects 1265 ubd7n32hksiop
 - Update meters-per-unit metadata on an existing USD stage/layer (no IFC conversion):
   - python -m buildusd --set-stage-unit "omniverse://server/Projects/file.usdc" --stage-unit-value 0.001
 - Update up-axis metadata on an existing USD stage/layer (no IFC conversion):
@@ -120,10 +125,23 @@ Materials
 - `IfcSurfaceStyleRendering` maps to PreviewSurface: baseColor from SurfaceColour (else DiffuseColour), opacity from Transparency, roughness from SpecularRoughness/specular level, metallic from ReflectanceMethod, emissive from EmissiveColour/SelfLuminous. SurfaceStyleWithTextures/ImageTexture set the baseColor texture when present; UVs from IfcIndexedPolygonalTextureMap are authored as `primvars:st`.
 - Names drop literal “Undefined” and add a closest CSS color hint when available (`webcolors` preferred; small fallback palette otherwise).
 - Multiple materials → face subsets; iterator materials are not force-overridden beyond IFC precedence. Single-material meshes bind the resolved style when only one material id exists and no face-level subsets are defined.
+- Texture safety: only http/https and relative file:// paths are used; absolute file:// paths are ignored for safety.
 
+
+Geometry overrides (advanced)
+- You can supply a limited set of geometry overrides via `ConversionOptions.geom_overrides` or `ConversionSettings.geom_overrides`.
+- Supported keys align with ifcopenshell/occ settings (e.g., `mesher-linear-deflection`, `mesher-angular-deflection`, `compute-normals`).
+- Core pipeline settings are fixed internally and ignored if provided here: `use-world-coords`, `model-offset`, `offset-type`, `use-python-opencascade`.
+- Anchoring/model offsets remain controlled by the converter; overrides are merged on top of the defaults where safe.
 Detail / remesh
 - `enable_high_detail_remesh` defaults to False; the iterator mesh is the base geometry. `--detail-mode`/`detail_scope` runs the OCC detail pipeline without remeshing unless remesh is explicitly enabled.
 - OCC detail meshes author under `/World/__PrototypesDetail` (and instance overrides when scoped); the base iterator tessellation remains the primary geometry path.
+- Detail engine routing:
+  - `--detail-engine default` (default) tries IFC subcomponents first, then falls back to OCC.
+  - `--detail-engine occ|opencascade` skips subcomponents and goes straight to OCC.
+  - `--detail-engine semantic|ifc-subcomponents|ifc-parts` runs IFC subcomponent splitting only (no OCC fallback).
+  - `--detail-objects` accepts mixed STEP ids and GUIDs when `--detail-scope object` is used (e.g. `--detail-objects 1265 ubd7n32hksiop`).
+  - Env caps: `OCC_DETAIL_FACE_CAP` skips OCC detail when face count exceeds the cap; `OCC_CANONICAL_MAP_FACE_CAP` skips canonical map building when faces exceed the cap or the mesh is single-material with no item ids.
 
 Annotation Curve Width Overrides
 - Control the `UsdGeom.BasisCurves` widths authored in geometry2d layers via `--annotation-width-default`, repeated `--annotation-width-rule`, or config files supplied with `--annotation-width-config`.
@@ -181,10 +199,10 @@ Units and Geospatial
 - Federated masters created via `buildusd.federate` are authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
 
 Geo Anchoring
-- Conversion and federation now expose `--anchor-mode` controlling how /World is aligned. `local` anchors to the per-file base point, `site` aligns to the shared site base point, and `none` leaves /World unchanged (the default).
+- Conversion and federation expose `--anchor-mode` controlling how /World is aligned. `local` anchors to the per-file base point, `site` aligns to the shared site base point, and `none` leaves /World unchanged (default).
 - The manifest can define `defaults.shared_site_base_point` and per-master/per-file overrides via `shared_site_base_point`. When `--anchor-mode site` is used, resolution falls back through file → master → defaults → repo fallback → (0,0,0).
-- When `local` anchoring is requested but a file lacks its own base point, the pipeline automatically falls back to `site` so stages always receive a valid anchor.
-- Geodetic metadata is derived from the anchor point (using `pyproj` when available) and written to `/World` alongside the traditional `ifc:` attributes.
+- If `local` anchoring is requested but a file lacks its own base point, the pipeline automatically falls back to `site` (never leaves /World unanchored unless `none` is specified).
+- Geodetic metadata (lon/lat/height) is derived from the chosen anchor (using `pyproj` when available) and written on the instance layer prim (not `/World`) alongside the traditional `ifc:` attributes; metersPerUnit remains 1.0.
 - Example invocations: `python -m buildusd --anchor-mode site ...` for conversion, `python -m buildusd --anchor-mode none ...` to leave stages unanchored, and `python -m buildusd.federate --anchor-mode site ...` to keep federated masters aligned in the same frame.
 
 IFC Metadata as USD Attributes

@@ -1229,7 +1229,7 @@ def build_detail_mesh_payload(
     default_linear_def: float = _DEFAULT_LINEAR_DEF,
     default_angular_def: float = _DEFAULT_ANGULAR_DEF,
     logger: Optional[logging.Logger] = None,
-    detail_level: Literal["subshape", "face"] = "subshape",
+    detail_level: Literal["subshape"] | str = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     reference_shape: Optional[Any] = None,
     unit_scale: float = 1.0,
@@ -1242,6 +1242,11 @@ def build_detail_mesh_payload(
         return None
     if shape_obj is None and product is None:
         return None
+
+    if detail_level != "subshape":
+        if logref:
+            logref.debug("Detail level '%s' is deprecated; using 'subshape'.", detail_level)
+        detail_level = "subshape"
 
     linear_def = _setting_float(settings, "mesher-linear-deflection", default_linear_def)
     angular_def = _setting_float(settings, "mesher-angular-deflection", default_angular_def)
@@ -1398,9 +1403,6 @@ def build_detail_mesh_payload(
             logref.warning("OCC detail: no mesh generated for %s", target_name)
         return None
 
-    if detail_level == "face":
-        detail_mesh = _explode_to_faces(detail_mesh)
-
     subshape_count = len(getattr(detail_mesh, "subshapes", []) or [])
     face_total = detail_mesh.face_count if hasattr(detail_mesh, "face_count") else 0
     _scale_detail_mesh(detail_mesh, unit_scale)
@@ -1421,7 +1423,7 @@ def precompute_detail_meshes(
     default_linear_def: float = _DEFAULT_LINEAR_DEF,
     default_angular_def: float = _DEFAULT_ANGULAR_DEF,
     logger: Optional[logging.Logger] = None,
-    detail_level: Literal["subshape", "face"] = "subshape",
+    detail_level: Literal["subshape"] | str = "subshape",
     unit_scale: float = 1.0,
 ) -> Dict[int, OCCDetailMesh]:
     """Precompute OCC detail meshes for every product (detail-mode prepass)."""
@@ -1509,7 +1511,7 @@ def _build_representation_detail_mesh(
     angular_rad: float,
     *,
     logger: Optional[logging.Logger] = None,
-    detail_level: Literal["subshape", "face"] = "subshape",
+    detail_level: Literal["subshape"] | str = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     unit_scale: float = 1.0,
     face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -1551,46 +1553,6 @@ def _build_representation_detail_mesh(
     return _merge_detail_meshes(item_meshes)
 
 
-def _detail_mesh_for_item(
-    item,
-    settings,
-    linear_def: float,
-    angular_rad: float,
-    *,
-    product=None,
-    rep_index: Optional[int] = None,
-    item_index: Optional[int] = None,
-    logger: Optional[logging.Logger] = None,
-    detail_level: Literal["subshape", "face"] = "subshape",
-    material_resolver: Optional[Callable[[Any], Any]] = None,
-    unit_scale: float = 1.0,
-    transform: Optional[np.ndarray] = None,
-):
-    if item is None:
-        return None
-    occ_source = _create_occ_shape(
-        settings,
-        item,
-        product=product,
-        rep_index=rep_index,
-        item_index=item_index,
-        logger=logger,
-    )
-    if occ_source is None:
-        return None
-        
-    # Apply transform if present (from IfcMappedItem expansion)
-    if transform is not None:
-        occ_source = _apply_transform_to_occ_shape(occ_source, transform)
-        
-    detail_mesh = build_detail_mesh(
-        occ_source,
-        linear_deflection=float(linear_def),
-        angular_deflection_rad=float(angular_rad),
-        logger=logger or log,
-    )
-
-
 def _describe_rep_item(item) -> str:
     if item is None:
         return "<None>"
@@ -1626,13 +1588,18 @@ def _detail_mesh_for_item(
     rep_index: Optional[int] = None,
     item_index: Optional[int] = None,
     logger: Optional[logging.Logger] = None,
-    detail_level: Literal["subshape", "face"] = "subshape",
+    detail_level: Literal["subshape"] | str = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     unit_scale: float = 1.0,
     transform: Optional[np.ndarray] = None,
     face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
     face_offset: int = 0,
 ):
+    logref = logger or log
+    if detail_level != "subshape":
+        if logref:
+            logref.debug("Detail level '%s' is deprecated; using 'subshape'.", detail_level)
+        detail_level = "subshape"
     if item is None:
         return None
     occ_source = _create_occ_shape(
@@ -1654,7 +1621,7 @@ def _detail_mesh_for_item(
         occ_source,
         linear_deflection=float(linear_def),
         angular_deflection_rad=float(angular_rad),
-        logger=logger or log,
+        logger=logref,
     )
     material_key = material_resolver(item) if material_resolver else None
     
@@ -1685,8 +1652,8 @@ def _detail_mesh_for_item(
                 sorted(face_material_map.keys())[:10],
             )
     
-    if detail_mesh is None and logger:
-        logger.debug(
+    if detail_mesh is None and logref:
+        logref.debug(
             "Detail mode: OCC tessellation yielded no faces for product=%s step=%s item=%s rep=%s/%s",
             getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
             getattr(product, "id", lambda: None)(),
@@ -1696,13 +1663,11 @@ def _detail_mesh_for_item(
         )
     elif detail_mesh is not None:
         _apply_material_key(detail_mesh, material_key, face_material_map=face_material_map)
-        if detail_level == "face":
-            detail_mesh = _explode_to_faces(detail_mesh)
         if product is not None and rep_index is not None and item_index is not None:
             _annotate_detail_subshapes(detail_mesh, product, rep_index, item_index, item, material_key=material_key)
-        if logger:
+        if logref:
             subshape_count = len(getattr(detail_mesh, "subshapes", None) or [])
-            logger.debug(
+            logref.debug(
                 "Detail mode: OCC tessellation succeeded for product=%s step=%s item=%s rep=%s/%s subshapes=%d",
                 getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
                 getattr(product, "id", lambda: None)(),
@@ -1722,7 +1687,7 @@ def detail_from_repmap_items(
     linear_def: float,
     angular_def_rad: float,
     logger: Optional[logging.Logger] = None,
-    detail_level: Literal["subshape", "face"] = "subshape",
+    detail_level: Literal["subshape"] | str = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     unit_scale: float = 1.0,
 ) -> Optional[OCCDetailMesh]:
@@ -1766,7 +1731,7 @@ def build_canonical_detail_for_type(
     default_linear_def: float = _DEFAULT_LINEAR_DEF,
     default_angular_def: float = _DEFAULT_ANGULAR_DEF,
     logger: Optional[logging.Logger] = None,
-    detail_level: Literal["subshape", "face"] = "subshape",
+    detail_level: Literal["subshape"] | str = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     unit_scale: float = 1.0,
 ) -> Optional[OCCDetailMesh]:
@@ -1944,33 +1909,6 @@ def _merge_detail_meshes(meshes: List[OCCDetailMesh]) -> Optional[OCCDetailMesh]
     if not combined:
         return None
     return OCCDetailMesh(shape=None, subshapes=combined)
-
-
-def _explode_to_faces(detail_mesh: OCCDetailMesh) -> OCCDetailMesh:
-    """Return a copy of detail mesh where each face is exposed as its own subshape."""
-    subshapes = getattr(detail_mesh, "subshapes", None) or []
-    exploded: List[OCCSubshapeMesh] = []
-    for parent in subshapes:
-        faces = getattr(parent, "faces", None) or []
-        for face in faces:
-            label = getattr(parent, "label", "Subshape")
-            face_material = getattr(face, "material_key", None)
-            subshape_material = getattr(parent, "material_key", None)
-            if face_material is None and subshape_material is not None:
-                face.material_key = subshape_material
-                face_material = subshape_material
-            exploded.append(
-                OCCSubshapeMesh(
-                    index=len(exploded),
-                    label=f"{label}_face{face.face_index}",
-                    shape_type="Face",
-                    faces=[face],
-                    material_key=face_material or subshape_material,
-                )
-            )
-    if not exploded:
-        return detail_mesh
-    return OCCDetailMesh(shape=detail_mesh.shape, subshapes=exploded)
 
 
 def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict[str, Any]]:

@@ -64,7 +64,7 @@ OPTIONS = ConversionOptions(
     convert_metadata=True,
     enable_high_detail_remesh=False,
     anchor_mode=None,
-    split_topology_by_material=False,
+    detail_mode=False,
     enable_semantic_subcomponents=False,
 )
 USD_FORMAT_CHOICES = ("usdc", "usda", "usd", "auto")
@@ -130,15 +130,10 @@ def _detail_features_requested(args: argparse.Namespace) -> bool:
 
     if args is None:
         return False
-    scope = getattr(args, "detail_scope", None)
-    scope_requested = scope is not None and scope.lower() != "none"
     return any(
         (
             getattr(args, "detail_mode", False),
-            scope_requested,
-            bool(getattr(args, "detail_level", None)),
-            bool(getattr(args, "detail_object_ids", None)),
-            bool(getattr(args, "detail_object_guids", None)),
+            bool(getattr(args, "detail_objects", None)),
         )
     )
 
@@ -1563,35 +1558,19 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         LOG.info("Detail mode enabled: forwarding to OCC detail pipeline (iterator mesh for base geometry).")
         if not detail_scope_arg:
             detail_scope_arg = "all"
+        if not getattr(options_override, "detail_mode", False):
+            options_override = replace(options_override, detail_mode=True)
     if detail_scope_arg:
-        if detail_scope_arg != "none" and not getattr(args, "detail_mode", False):
+        if not getattr(args, "detail_mode", False):
             print("Error: --detail-scope requires --detail-mode to be enabled.", file=sys.stderr)
             shutdown_usd_context()
             raise SystemExit(2)
         LOG.info("Detail scope override: %s", detail_scope_arg)
         options_override = replace(options_override, detail_scope=detail_scope_arg)
-    detail_level_arg = getattr(args, "detail_level", None)
-    if detail_level_arg:
-        LOG.info("Detail level override: %s", detail_level_arg)
-        options_override = replace(options_override, detail_level=detail_level_arg)
     detail_objects_arg = getattr(args, "detail_objects", None)
     if detail_objects_arg:
-        ids: list[int] = []
-        guids: list[str] = []
-        for token in detail_objects_arg:
-            try:
-                ids.append(int(token))
-                continue
-            except Exception:
-                pass
-            if token and isinstance(token, str):
-                guids.append(str(token).strip())
-        if ids:
-            LOG.info("Detail object ids override: %s", ids)
-            options_override = replace(options_override, detail_object_ids=tuple(ids))
-        if guids:
-            LOG.info("Detail object GUIDs override: %s", guids)
-            options_override = replace(options_override, detail_object_guids=tuple(guids))
+        LOG.info("Detail objects override (mixed ids/guids): %s", detail_objects_arg)
+        options_override = replace(options_override, detail_objects=tuple(detail_objects_arg))
 
     if getattr(args, "enable_semantic_subcomponents", False):
         LOG.info("Semantic subcomponent splitting enabled.")
@@ -1603,13 +1582,10 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         norm_engine = "occ"
     elif norm_engine in ("ifc-subcomponents", "ifc-parts"):
         norm_engine = "semantic"
-    force_engine_arg = norm_engine
-    # Normalize deprecated force-occ (removed) into detail-engine if present in options_override
-    if getattr(options_override, "force_occ", False):
-        force_engine_arg = "occ"
-        options_override = replace(options_override, force_occ=False)
-    if getattr(options_override, "force_engine", "default") != force_engine_arg:
-        options_override = replace(options_override, force_engine=force_engine_arg)
+    detail_engine_arg = norm_engine
+    # Normalize deprecated force_engine into detail_engine for compatibility
+    if getattr(options_override, "detail_engine", getattr(options_override, "force_engine", "default")) != detail_engine_arg:
+        options_override = replace(options_override, detail_engine=detail_engine_arg)
 
     semantic_tokens_path = getattr(args, "semantic_tokens_path", None)
     if semantic_tokens_path:

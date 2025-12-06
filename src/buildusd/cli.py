@@ -181,16 +181,9 @@ def parse_args(
     parser.add_argument(
         "--detail-scope",
         dest="detail_scope",
-        choices=("none", "all", "object"),
+        choices=("all", "object"),
         default=None,
-        help="Select which objects receive OCC detail meshes ('none', 'all', or 'object' IDs only).",
-    )
-    parser.add_argument(
-        "--detail-level",
-        dest="detail_level",
-        choices=("subshape", "face"),
-        default=None,
-        help="Granularity of OCC detail meshes when enabled ('subshape' groups or per 'face').",
+        help="Select which objects receive OCC detail meshes ('all' or specific objects via --detail-objects).",
     )
     parser.add_argument(
         "--detail-objects",
