@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-#Import standard libraries
+# Import standard libraries
 import logging
 import numpy as np
 
@@ -12,20 +12,19 @@ log = logging.getLogger(__name__)
 
 # Optional: EPSG transforms (WGS84 <-> GDA2020 / MGA Zone 55 : EPSG:7855)
 try:
-    from pyproj import CRS, Transformer
     _HAVE_PYPROJ = True
 except Exception:
     _HAVE_PYPROJ = False
 
 # Optional: ifcopenshell util for robust matrices (mapped/type geometry)
 try:
-    from ifcopenshell.util import shape as ifc_shape_util
     _HAVE_IFC_UTIL_SHAPE = True
 except Exception:
     _HAVE_IFC_UTIL_SHAPE = False
 
 
 # ---------------- Matrix helpers ----------------
+
 
 def np_to_gf_matrix(mat_data):
     """Convert a 16-element tuple or 4x4 numpy array to Gf.Matrix4d (row-major)."""
@@ -67,7 +66,7 @@ def scale_matrix_translation_only(gfmat, scale):
         return Gf.Matrix4d(gfmat)
     out = Gf.Matrix4d(gfmat)
     t = _extract_translation_safe(out)
-    out.SetTranslateOnly(Gf.Vec3d(t[0]*scale, t[1]*scale, t[2]*scale))
+    out.SetTranslateOnly(Gf.Vec3d(t[0] * scale, t[1] * scale, t[2] * scale))
     return out
 
 
@@ -79,7 +78,7 @@ def gf_to_tuple16(gf: Gf.Matrix4d):
 def _is_identity16(mat16, atol=1e-10):
     """
     Check if a 4x4 matrix (16-element tuple or list) is an identity matrix.
-    
+
     Parameters
     ----------
     mat16 : tuple or list of 16 floats
@@ -87,7 +86,7 @@ def _is_identity16(mat16, atol=1e-10):
     atol : float, optional
         The absolute tolerance to use when checking for equality.
         Defaults to 1e-10.
-    
+
     Returns
     -------
     bool
@@ -98,4 +97,3 @@ def _is_identity16(mat16, atol=1e-10):
         return np.allclose(arr, np.eye(4), atol=atol)
     except Exception:
         return False
-

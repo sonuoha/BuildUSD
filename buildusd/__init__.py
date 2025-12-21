@@ -1,4 +1,5 @@
 """Expose the actual `buildusd` package when running from the repository root."""
+
 from __future__ import annotations
 
 from importlib import import_module

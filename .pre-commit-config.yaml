@@ -1,0 +1,47 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+        exclude: ^\.vscode/launch\.json$
+      - id: check-added-large-files
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.2
+    hooks:
+      - id: ruff
+        args: [--select, E9]
+        language_version: python3
+      - id: ruff-format
+        language_version: python3
+
+  - repo: local
+    hooks:
+      - id: block-temp-artifacts
+        name: Block temp/debug artifacts
+        entry: python
+        language: python
+        pass_filenames: true
+        args:
+          - -c
+          - |
+            import sys
+            blocked = {
+                "_tmp_update_ifc.py",
+                "code-review.csv",
+                "run_local.txt",
+                "run_log.txt",
+                "temp_psu.tmp",
+                "tmp_patch.diff",
+                "python",
+                "conda",
+            }
+            fail = [f for f in sys.argv[1:] if f in blocked or f.endswith(".tmp") or f.endswith(".log")]
+            if fail:
+                print("Commit blocked: temp/debug file staged ->", ", ".join(fail), file=sys.stderr)
+                sys.exit(1)
+        types: [file]

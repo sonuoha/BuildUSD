@@ -88,3 +88,7 @@ build_log.txt
 # Empty or misnamed files
 python
 conda
+
+# Ignore
+scripts/
+scripts/*

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set
 import re
 import logging
 
@@ -50,6 +50,7 @@ class MeshUV:
 
 # === PUBLIC API: BACKWARD COMPATIBLE ===
 
+
 def build_material_for_product(
     product: ifcopenshell.entity_instance,
     prefer_surface_style: bool = True,  # ← kept for compatibility (ignored)
@@ -71,7 +72,7 @@ def build_material_for_product(
 
 
 def extract_face_style_groups(
-    product: ifcopenshell.entity_instance
+    product: ifcopenshell.entity_instance,
 ) -> Dict[str, Dict[str, Any]]:
     """Backward-compatible wrapper."""
     model = product.file
@@ -90,13 +91,17 @@ def extract_uvs_for_product(product: ifcopenshell.entity_instance) -> Optional[M
 
 # === INTERNAL: HARDENED LOGIC ===
 
+
 def _build_material_for_product_internal(product, model) -> Dict[str, Any]:
     result = {}
 
     # 1. Per-face (highest priority)
     face_styles = get_face_styles(model, product)
     if face_styles:
-        result["per_face"] = {item_id: _to_pbr(styles[0], model) for item_id, styles in face_styles.items()}
+        result["per_face"] = {
+            item_id: _to_pbr(styles[0], model)
+            for item_id, styles in face_styles.items()
+        }
 
     # 2. Object-level (A→E precedence)
     obj_styles = get_surface_styles(model, product)
@@ -104,7 +109,9 @@ def _build_material_for_product_internal(product, model) -> Dict[str, Any]:
         result["object"] = _to_pbr(obj_styles[0], model)
 
     # 3. Fallback: material name
-    name = _material_name_from_associations(product) or _default_name_for_product(product)
+    name = _material_name_from_associations(product) or _default_name_for_product(
+        product
+    )
     result["fallback"] = PBRMaterial(name=name)
 
     return result
@@ -112,7 +119,10 @@ def _build_material_for_product_internal(product, model) -> Dict[str, Any]:
 
 # === IFC 8.9.3.10 PRECEDENCE: A → B → C → D → E ===
 
-def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_instance) -> List[ifcopenshell.entity_instance]:
+
+def get_surface_styles(
+    model: ifcopenshell.file, product: ifcopenshell.entity_instance
+) -> List[ifcopenshell.entity_instance]:
     styles: List[Any] = []
     generated: List[Any] = []
 
@@ -127,11 +137,17 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
         return real, gen
 
     # A: IfcStyledItem on geometry
-    for rep in (product.Representation.Representations if product.Representation else []):
+    for rep in product.Representation.Representations if product.Representation else []:
         for item in rep.Items:
             for styled in getattr(item, "StyledByItem", []):
-                for psa in styled.Styles:
-                    styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+                for psa in getattr(styled, "Styles", []) or []:
+                    styles.extend(
+                        [
+                            s
+                            for s in (getattr(psa, "Styles", []) or [])
+                            if s.is_a("IfcSurfaceStyle")
+                        ]
+                    )
     if styles:
         return styles
 
@@ -145,12 +161,16 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
             if not styles:
                 # Fallback: try material style lookup via representation util when no MDR is present
                 try:
-                    contexts = ifcopenshell.util.representation.get_prioritised_contexts(model)
+                    contexts = (
+                        ifcopenshell.util.representation.get_prioritised_contexts(model)
+                    )
                 except Exception:
                     contexts = []
                 if contexts:
                     try:
-                        style_obj = ifcopenshell.util.representation.get_material_style(mat, contexts[0])
+                        style_obj = ifcopenshell.util.representation.get_material_style(
+                            mat, contexts[0]
+                        )
                     except Exception:
                         style_obj = None
                     if style_obj:
@@ -168,7 +188,13 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
             for item in getattr(rep, "Items", []):
                 for styled in getattr(item, "StyledByItem", []):
                     for psa in getattr(styled, "Styles", []) or []:
-                        styles.extend([s for s in getattr(psa, "Styles", []) or [] if s.is_a("IfcSurfaceStyle")])
+                        styles.extend(
+                            [
+                                s
+                                for s in getattr(psa, "Styles", []) or []
+                                if s.is_a("IfcSurfaceStyle")
+                            ]
+                        )
         if styles:
             return styles
 
@@ -190,7 +216,9 @@ def get_surface_styles(model: ifcopenshell.file, product: ifcopenshell.entity_in
     return []
 
 
-def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[ifcopenshell.entity_instance]:
+def _styles_from_material_definition(
+    mat: ifcopenshell.entity_instance,
+) -> List[ifcopenshell.entity_instance]:
     styles: List[Any] = []
     generated: List[Any] = []
     visited: Set[int] = set()
@@ -224,11 +252,23 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
             for rep in getattr(entity, "Representations", []):
                 for item in getattr(rep, "Items", []):
                     if item.is_a("IfcStyledItem"):
-                        for psa in item.Styles:
-                            styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+                        for psa in getattr(item, "Styles", []) or []:
+                            styles.extend(
+                                [
+                                    s
+                                    for s in (getattr(psa, "Styles", []) or [])
+                                    if s.is_a("IfcSurfaceStyle")
+                                ]
+                            )
                     else:
-                        for psa in getattr(item, "Styles", []):
-                            styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+                        for psa in getattr(item, "Styles", []) or []:
+                            styles.extend(
+                                [
+                                    s
+                                    for s in (getattr(psa, "Styles", []) or [])
+                                    if s.is_a("IfcSurfaceStyle")
+                                ]
+                            )
 
         # Recurse into sets
         children: List[Any] = []
@@ -244,7 +284,9 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
                 material_source = getattr(entity, "Material", None) or entity
                 styles_for_layer = _styles_from_material_definition(material_source)
                 if styles_for_layer:
-                    generated_flag = getattr(material_source, "_buildusd_generated_style", False)
+                    generated_flag = getattr(
+                        material_source, "_buildusd_generated_style", False
+                    )
                     for s in styles_for_layer:
                         styles.append(s)
                         if generated_flag:
@@ -268,7 +310,10 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
                 try:
                     cache_key = id(mat_file)
                     if cache_key not in _mdr_cache:
-                        _mdr_cache[cache_key] = list(mat_file.by_type("IfcMaterialDefinitionRepresentation") or [])
+                        _mdr_cache[cache_key] = list(
+                            mat_file.by_type("IfcMaterialDefinitionRepresentation")
+                            or []
+                        )
                     for mdr in _mdr_cache[cache_key]:
                         if getattr(mdr, "RepresentedMaterial", None) == entity:
                             children.append(mdr)
@@ -304,7 +349,9 @@ def _styles_from_material_definition(mat: ifcopenshell.entity_instance) -> List[
 
 
 # Map material constituent names to styles (used to correlate with shape aspect names).
-def _constituent_styles_by_name(product: ifcopenshell.entity_instance) -> Dict[str, List[ifcopenshell.entity_instance]]:
+def _constituent_styles_by_name(
+    product: ifcopenshell.entity_instance,
+) -> Dict[str, List[ifcopenshell.entity_instance]]:
     mapping: Dict[str, List[ifcopenshell.entity_instance]] = {}
     visited: Set[int] = set()
 
@@ -329,14 +376,20 @@ def _constituent_styles_by_name(product: ifcopenshell.entity_instance) -> Dict[s
 
         if entity.is_a("IfcMaterialConstituentSet"):
             for c in getattr(entity, "MaterialConstituents", []) or []:
-                cname = getattr(c, "Name", None) or getattr(getattr(c, "Material", None), "Name", None)
+                cname = getattr(c, "Name", None) or getattr(
+                    getattr(c, "Material", None), "Name", None
+                )
                 record(cname, getattr(c, "Material", None) or c)
                 collect(c)
         elif entity.is_a("IfcMaterialConstituent"):
-            cname = getattr(entity, "Name", None) or getattr(getattr(entity, "Material", None), "Name", None)
+            cname = getattr(entity, "Name", None) or getattr(
+                getattr(entity, "Material", None), "Name", None
+            )
             record(cname, getattr(entity, "Material", None) or entity)
         elif entity.is_a("IfcMaterialLayerSet"):
-            set_name = getattr(entity, "LayerSetName", None) or getattr(entity, "Name", None)
+            set_name = getattr(entity, "LayerSetName", None) or getattr(
+                entity, "Name", None
+            )
             record(set_name, entity)
             for layer in getattr(entity, "MaterialLayers", []) or []:
                 collect(layer)
@@ -394,7 +447,10 @@ def _constituent_styles_by_name(product: ifcopenshell.entity_instance) -> Dict[s
 
 # === PER-FACE MAPPING ===
 
-def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_instance) -> Dict[int, List[ifcopenshell.entity_instance]]:
+
+def get_face_styles(
+    model: ifcopenshell.file, product: ifcopenshell.entity_instance
+) -> Dict[int, List[ifcopenshell.entity_instance]]:
     if not product:
         return {}
 
@@ -419,15 +475,17 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
                 item_id = item.id()
             except Exception:
                 item_id = 0
-            
+
             if item_id and item_id not in shape_styles and constituent_styles:
                 # 1. Try Aspect Name
-                aspect_name = aspect_name_by_item.get(item_id) if aspect_name_by_item else None
+                aspect_name = (
+                    aspect_name_by_item.get(item_id) if aspect_name_by_item else None
+                )
                 if aspect_name:
                     styles = constituent_styles.get(aspect_name)
                     if styles:
                         shape_styles[item_id] = styles
-                
+
                 # 2. Fallback: Try Item Name
                 if item_id not in shape_styles:
                     item_name = getattr(item, "Name", None)
@@ -442,7 +500,13 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
         styles = []
         for psa in getattr(styled, "Styles", []) or []:
             if hasattr(psa, "Styles"):
-                styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+                styles.extend(
+                    [
+                        s
+                        for s in (getattr(psa, "Styles", []) or [])
+                        if s.is_a("IfcSurfaceStyle")
+                    ]
+                )
             elif psa.is_a("IfcSurfaceStyle"):
                 styles.append(psa)
         if not styles:
@@ -467,7 +531,9 @@ def get_face_styles(model: ifcopenshell.file, product: ifcopenshell.entity_insta
     return shape_styles
 
 
-def _map_items_to_aspects(product: ifcopenshell.entity_instance) -> Dict[int, List[ifcopenshell.entity_instance]]:
+def _map_items_to_aspects(
+    product: ifcopenshell.entity_instance,
+) -> Dict[int, List[ifcopenshell.entity_instance]]:
     """Return mapping from representation item id() to list of IfcShapeAspects."""
     mapping: Dict[int, List[ifcopenshell.entity_instance]] = {}
     aspects = getattr(product, "HasShapeAspects", None) or []
@@ -490,7 +556,9 @@ def _shape_aspect_name_map(product: ifcopenshell.entity_instance) -> Dict[int, s
     for item_id, aspects in item_to_aspects.items():
         # Use the first aspect that has a valid name
         for aspect in aspects:
-            raw_name = getattr(aspect, "Name", None) or getattr(aspect, "Description", None)
+            raw_name = getattr(aspect, "Name", None) or getattr(
+                aspect, "Description", None
+            )
             if raw_name:
                 mapping[item_id] = _sanitize_style_token(raw_name)
                 break
@@ -500,9 +568,15 @@ def _shape_aspect_name_map(product: ifcopenshell.entity_instance) -> Dict[int, s
 def _collect_styled_items(item, mapping):
     for styled in getattr(item, "StyledByItem", []):
         styles = []
-        for psa in styled.Styles:
+        for psa in getattr(styled, "Styles", []) or []:
             if hasattr(psa, "Styles"):
-                styles.extend([s for s in psa.Styles if s.is_a("IfcSurfaceStyle")])
+                styles.extend(
+                    [
+                        s
+                        for s in (getattr(psa, "Styles", []) or [])
+                        if s.is_a("IfcSurfaceStyle")
+                    ]
+                )
             elif psa.is_a("IfcSurfaceStyle"):
                 styles.append(psa)
             else:
@@ -518,7 +592,11 @@ def _collect_styled_items(item, mapping):
         _collect_styled_items(item.SecondOperand, mapping)
     elif item.is_a("IfcMappedItem"):
         source = getattr(item, "MappingSource", None)
-        mapped = getattr(source, "MappedRepresentation", None) if source is not None else None
+        mapped = (
+            getattr(source, "MappedRepresentation", None)
+            if source is not None
+            else None
+        )
         if mapped is not None:
             for sub in getattr(mapped, "Items", []) or []:
                 _collect_styled_items(sub, mapping)
@@ -528,6 +606,7 @@ def _collect_styled_items(item, mapping):
 
 
 # === FACE GROUPING ===
+
 
 def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, Any]]:
     face_styles = get_face_styles(model, product) or {}
@@ -551,7 +630,7 @@ def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, A
             faces = [face_offset + idx for idx in entry.get("faces", [])]
             if not faces:
                 continue
-            
+
             # Use step_id in key to prevent merging distinct items
             step_id = entry.get("step_id")
             unique_key = key + (step_id,) if step_id is not None else key
@@ -589,7 +668,15 @@ def _extract_face_style_groups_internal(product, model) -> Dict[str, Dict[str, A
     return result
 
 
-def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, item_to_aspects=None, *, allow_color_fallback: bool = True) -> Tuple[Dict, int]:
+def _face_style_groups_from_item(
+    item,
+    face_styles,
+    model,
+    shape_name_by_item,
+    item_to_aspects=None,
+    *,
+    allow_color_fallback: bool = True,
+) -> Tuple[Dict, int]:
     face_count = _face_count_from_item(item)
     if face_count == 0:
         return {}, 0
@@ -609,7 +696,7 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, i
     else:
         item_id = step_id if step_id is not None else raw_id
     item_type = item.is_a()
-    
+
     aspect_ids = set()
     if item_to_aspects:
         for aspect in item_to_aspects.get(item_id, []):
@@ -620,18 +707,22 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, i
     common_payload = {
         "step_id": step_id,
         "item_type": item_type,
-        "aspect_ids": aspect_ids
+        "aspect_ids": aspect_ids,
     }
 
     if item_id in face_styles:
         style = face_styles[item_id][0]
         resolved_style = _resolve_surface_style_entity(style) or style
-        friendly_name = _friendly_style_name(resolved_style, shape_name_by_item.get(item_id))
+        friendly_name = _friendly_style_name(
+            resolved_style, shape_name_by_item.get(item_id)
+        )
         mat = _to_pbr(resolved_style, model=model, preferred_name=friendly_name)
         if LOG.isEnabledFor(logging.DEBUG):
             LOG.debug(
                 "Face style item=%s style=%s friendly=%s base=%s opacity=%.4f metallic=%.4f roughness=%.4f",
-                getattr(item, "GlobalId", None) or getattr(item, "id", None) or hex(item_id),
+                getattr(item, "GlobalId", None)
+                or getattr(item, "id", None)
+                or hex(item_id),
                 getattr(resolved_style, "id", lambda: None)(),
                 friendly_name,
                 tuple(round(c, 4) for c in mat.base_color),
@@ -643,13 +734,11 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, i
             style_id = int(resolved_style.id())
         except Exception:
             style_id = None
-        
+
         payload = common_payload.copy()
-        payload.update({
-            "material": mat,
-            "faces": list(range(face_count)),
-            "style_id": style_id
-        })
+        payload.update(
+            {"material": mat, "faces": list(range(face_count)), "style_id": style_id}
+        )
         return {("styled", mat.name): payload}, face_count
 
     # Fallback: IfcIndexedColourMap
@@ -666,7 +755,9 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, i
         for face_idx, idx_list in enumerate(indices):
             if not idx_list or face_idx >= face_count:
                 continue
-            idx = idx_list[0] - 1 if isinstance(idx_list, (list, tuple)) else idx_list - 1
+            idx = (
+                idx_list[0] - 1 if isinstance(idx_list, (list, tuple)) else idx_list - 1
+            )
             if idx < 0 or idx >= len(colors):
                 continue
             r, g, b = colors[idx]
@@ -679,22 +770,14 @@ def _face_style_groups_from_item(item, face_styles, model, shape_name_by_item, i
         for key, entry in color_entries.items():
             mat = PBRMaterial(name="Color", base_color=(key[0], key[1], key[2]))
             payload = common_payload.copy()
-            payload.update({
-                "material": mat,
-                "faces": entry["faces"],
-                "style_id": None
-            })
+            payload.update({"material": mat, "faces": entry["faces"], "style_id": None})
             groups[("color", key)] = payload
 
     unassigned = [i for i, f in enumerate(assigned) if not f]
     if unassigned:
         mat = PBRMaterial(name="Default")
         payload = common_payload.copy()
-        payload.update({
-            "material": mat,
-            "faces": unassigned,
-            "style_id": None
-        })
+        payload.update({"material": mat, "faces": unassigned, "style_id": None})
         groups[("default",)] = payload
 
     return groups, face_count
@@ -714,6 +797,7 @@ def _iter_representation_items(product):
     if not rep or not getattr(rep, "Representations", None):
         return
     seen = set()
+
     def visit(item):
         if not item or id(item) in seen:
             return
@@ -725,6 +809,7 @@ def _iter_representation_items(product):
         else:
             for sub in getattr(item, "Items", []):
                 yield from visit(sub)
+
     for shape_rep in rep.Representations:
         for entry in getattr(shape_rep, "Items", []):
             yield from visit(entry)
@@ -773,12 +858,15 @@ def _get_material_for_style(model, style) -> Optional[ifcopenshell.entity_instan
                     if any(s == style for s in styles):
                         return represented
                 elif hasattr(item, "Styles"):
-                    for psa in item.Styles or []:
-                        if style in (psa.Styles or []):
+                    for psa in getattr(item, "Styles", []) or []:
+                        if style in (getattr(psa, "Styles", []) or []):
                             return represented
     return None
 
-def _resolve_surface_style_entity(style: Optional[ifcopenshell.entity_instance]) -> Optional[ifcopenshell.entity_instance]:
+
+def _resolve_surface_style_entity(
+    style: Optional[ifcopenshell.entity_instance],
+) -> Optional[ifcopenshell.entity_instance]:
     """Chase through presentation assignments/styled items to find an IfcSurfaceStyle."""
     if style is None:
         return None
@@ -808,11 +896,15 @@ def _resolve_surface_style_entity(style: Optional[ifcopenshell.entity_instance])
     return None
 
 
-def _friendly_style_name(style: ifcopenshell.entity_instance, shape_name: Optional[str] = None) -> str:
+def _friendly_style_name(
+    style: ifcopenshell.entity_instance, shape_name: Optional[str] = None
+) -> str:
     """Readable token combining shape aspect name + material/style name."""
     if isinstance(style, PBRMaterial):
         base = style.name or "Material"
-        named = _name_with_color_hint(base, getattr(style, "base_color", (0.8, 0.8, 0.8)))
+        named = _name_with_color_hint(
+            base, getattr(style, "base_color", (0.8, 0.8, 0.8))
+        )
         token = _sanitize_style_token(named)
         if shape_name:
             token = _sanitize_style_token(f"{shape_name}_{token}")
@@ -820,6 +912,7 @@ def _friendly_style_name(style: ifcopenshell.entity_instance, shape_name: Option
 
     model = getattr(style, "file", None)
     material = _get_material_for_style(model, style)
+
     def _clean_name(name: Optional[str]) -> Optional[str]:
         if not name:
             return None
@@ -827,6 +920,7 @@ def _friendly_style_name(style: ifcopenshell.entity_instance, shape_name: Option
         if not text or text.lower() == "undefined":
             return None
         return text
+
     mat_name = _clean_name(getattr(material, "Name", None))
     style_name = _clean_name(getattr(style, "Name", None))
 
@@ -839,7 +933,9 @@ def _friendly_style_name(style: ifcopenshell.entity_instance, shape_name: Option
     base_color = None
     try:
         elements = list(getattr(style, "Styles", []) or [])
-        rendering = next((e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None)
+        rendering = next(
+            (e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None
+        )
         shading = next((e for e in elements if e.is_a("IfcSurfaceStyleShading")), None)
         if rendering:
             base_color = _rendering_base_color(rendering)
@@ -868,9 +964,12 @@ def _to_pbr(
         return replace(style, name=preferred_name or style.name)
 
     surface_style = _resolve_surface_style_entity(style) or style
-    material = _get_material_for_style(model or getattr(surface_style, "file", None), surface_style)
+    material = _get_material_for_style(
+        model or getattr(surface_style, "file", None), surface_style
+    )
     mat_name = getattr(material, "Name", None)
     style_name = getattr(surface_style, "Name", None)
+
     def _clean_name(name: Optional[str]) -> Optional[str]:
         if not name:
             return None
@@ -880,12 +979,17 @@ def _to_pbr(
         if text.lower() == "undefined":
             return None
         return text
-    material_name = preferred_name or _clean_name(mat_name) or _clean_name(style_name) or "Material"
+
+    material_name = (
+        preferred_name or _clean_name(mat_name) or _clean_name(style_name) or "Material"
+    )
     pbr = PBRMaterial(name=material_name)
 
     if surface_style is not None and surface_style.is_a("IfcSurfaceStyle"):
         elements = list(getattr(surface_style, "Styles", []) or [])
-        rendering = next((e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None)
+        rendering = next(
+            (e for e in elements if e.is_a("IfcSurfaceStyleRendering")), None
+        )
         shading = next((e for e in elements if e.is_a("IfcSurfaceStyleShading")), None)
         texture_path = _texture_path_from_style(surface_style)
         if texture_path:
@@ -934,7 +1038,9 @@ def _log_style_resolution(style, rendering, shading, pbr) -> None:
             target_logger.info(
                 "PBR material '%s' -> base=%s opacity=%.4f roughness=%.4f metallic=%.4f emissive=%s",
                 getattr(style, "name", None),
-                tuple(round(c, 4) for c in getattr(style, "base_color", (0.8, 0.8, 0.8))),
+                tuple(
+                    round(c, 4) for c in getattr(style, "base_color", (0.8, 0.8, 0.8))
+                ),
                 getattr(style, "opacity", 1.0),
                 getattr(style, "roughness", 0.5),
                 getattr(style, "metallic", 0.0),
@@ -986,7 +1092,9 @@ def _log_style_resolution(style, rendering, shading, pbr) -> None:
     )
 
 
-def _rendering_debug_snapshot(rendering: Optional[ifcopenshell.entity_instance]) -> Optional[Dict[str, Any]]:
+def _rendering_debug_snapshot(
+    rendering: Optional[ifcopenshell.entity_instance],
+) -> Optional[Dict[str, Any]]:
     if rendering is None:
         return None
 
@@ -1000,17 +1108,23 @@ def _rendering_debug_snapshot(rendering: Optional[ifcopenshell.entity_instance])
         "SurfaceColour": _rounded_color(getattr(rendering, "SurfaceColour", None)),
         "DiffuseColour": _rounded_color(getattr(rendering, "DiffuseColour", None)),
         "SpecularColour": _rounded_color(getattr(rendering, "SpecularColour", None)),
-        "SpecularHighlight": _rounded_color(getattr(rendering, "SpecularHighlight", None)),
+        "SpecularHighlight": _rounded_color(
+            getattr(rendering, "SpecularHighlight", None)
+        ),
         "EmissiveColour": _rounded_color(getattr(rendering, "EmissiveColour", None)),
         "Transparency": _float_value(getattr(rendering, "Transparency", None)),
-        "SpecularRoughness": _float_value(getattr(rendering, "SpecularRoughness", None)),
+        "SpecularRoughness": _float_value(
+            getattr(rendering, "SpecularRoughness", None)
+        ),
         "SelfLuminous": _float_value(getattr(rendering, "SelfLuminous", None)),
         "ReflectanceMethod": getattr(rendering, "ReflectanceMethod", None),
     }
     return snapshot
 
 
-def _shading_debug_snapshot(shading: Optional[ifcopenshell.entity_instance]) -> Optional[Dict[str, Any]]:
+def _shading_debug_snapshot(
+    shading: Optional[ifcopenshell.entity_instance],
+) -> Optional[Dict[str, Any]]:
     if shading is None:
         return None
     surface = getattr(shading, "SurfaceColour", None)
@@ -1061,7 +1175,9 @@ def _rendering_metallic(rendering) -> float:
     return 0.0
 
 
-def _rendering_emissive(rendering, base_color: Tuple[float, float, float]) -> Optional[Tuple[float, float, float]]:
+def _rendering_emissive(
+    rendering, base_color: Tuple[float, float, float]
+) -> Optional[Tuple[float, float, float]]:
     emissive = _color_or_factor(getattr(rendering, "EmissiveColour", None))
     if emissive:
         return tuple(_clamp01(c) for c in emissive)
@@ -1195,7 +1311,9 @@ def _name_with_color_hint(name: str, base_color: Tuple[float, float, float]) -> 
     return f"{name} - Colour {color_name}"
 
 
-def _texture_path_from_style(surface_style: ifcopenshell.entity_instance) -> Optional[str]:
+def _texture_path_from_style(
+    surface_style: ifcopenshell.entity_instance,
+) -> Optional[str]:
     """Return a texture file path/URL when the style carries IfcSurfaceStyleWithTextures / IfcImageTexture."""
     textures = []
     try:
@@ -1215,6 +1333,7 @@ def _texture_path_from_style(surface_style: ifcopenshell.entity_instance) -> Opt
             if val:
                 try:
                     import urllib.parse as _up
+
                     parsed = _up.urlparse(str(val))
                     scheme = parsed.scheme.lower() if parsed.scheme else ""
                     if scheme and scheme not in allowed_schemes:
@@ -1235,13 +1354,20 @@ def _material_name_from_associations(product) -> Optional[str]:
     if not mat:
         return None
     names = []
+
     def collect(e):
         if hasattr(e, "Name") and e.Name:
             names.append(str(e.Name))
-        for attr in ("MaterialLayers", "MaterialProfiles", "MaterialConstituents", "Materials"):
+        for attr in (
+            "MaterialLayers",
+            "MaterialProfiles",
+            "MaterialConstituents",
+            "Materials",
+        ):
             if children := getattr(e, attr, None):
                 for c in children:
                     collect(c.Material if hasattr(c, "Material") else c)
+
     collect(mat)
     if not names:
         return None
@@ -1250,7 +1376,11 @@ def _material_name_from_associations(product) -> Optional[str]:
 
 
 def _default_name_for_product(product) -> str:
-    label = getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "IfcProduct"
+    label = (
+        getattr(product, "Name", None)
+        or getattr(product, "GlobalId", None)
+        or "IfcProduct"
+    )
     return f"{product.is_a()}_{label}"
 
 

@@ -28,14 +28,14 @@ Environment
 
 Quick start (offline)
 - Download a small public IFC (e.g., Duplex_A_20110907.ifc from common samples) into `data/input/`.
-- Convert locally (no Kit):  
+- Convert locally (no Kit):
   `python -m buildusd --offline --input data/input/Duplex_A_20110907.ifc`
 - Expected: stages and layers under `data/output/Duplex_A_20110907/`; no Nucleus access.
 - Additional IFC samples are available at https://github.com/youshengCode/IfcSampleFiles (see that repository’s license; attribute and comply with its terms when using those files).
 
 Quick start (Nucleus / Kit)
 - Accept Kit EULA, install Kit, and ensure an `omniverse://` endpoint is reachable.
-- Convert and checkpoint:  
+- Convert and checkpoint:
   `python -m buildusd --input omniverse://server/Projects/IFC/Duplex_A.ifc --checkpoint`
 - Expected: authored layers on Nucleus; headless Kit session auto-starts.
 
@@ -290,4 +290,3 @@ Examples
 - Our IFC pipeline preserves full segment detail and materials while authoring clean instance hierarchies.
 
 ![Pipeline output preserving object integrity](data/input/img/Pipeline.png)
-

@@ -60,7 +60,9 @@ def ensure_kit(extensions: Iterable[str] | None = None):
         _KIT_APP = KitApp()
         _KIT_APP_OWNED = True
         args: list[str] = list(_BASE_ARGS)
-        all_exts = _normalize_extensions(tuple(dict.fromkeys(list(required) + list(_DEFAULT_EXTENSIONS))))
+        all_exts = _normalize_extensions(
+            tuple(dict.fromkeys(list(required) + list(_DEFAULT_EXTENSIONS)))
+        )
         for ext in all_exts:
             if ext and ext not in _ENABLED_EXTENSIONS:
                 args.extend(["--enable", ext])

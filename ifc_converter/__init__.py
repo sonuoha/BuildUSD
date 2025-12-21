@@ -1,4 +1,5 @@
 """Compatibility shim so legacy `ifc_converter` imports still resolve."""
+
 from __future__ import annotations
 
 from importlib import import_module
@@ -21,4 +22,3 @@ __path__ = getattr(_replacement, "__path__", [])
 __spec__ = getattr(_replacement, "__spec__", None)
 __file__ = getattr(_replacement, "__file__", __file__)
 __package__ = __name__
-

@@ -7,7 +7,7 @@ import os
 import re
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Literal, Set, Callable
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Literal, Callable
 
 import numpy as np
 import ifcopenshell
@@ -17,7 +17,6 @@ from .occ_detail_bootstrap import (
     is_available as _occ_bootstrap_available,
     last_failure_reason as _occ_last_failure,
     sym,
-    sym_optional,
 )
 
 log = logging.getLogger(__name__)
@@ -44,7 +43,7 @@ __all__ = [
 ]
 
 _DEFAULT_LINEAR_DEF = 0.01  # metres (cap)
-_DEFAULT_ANGULAR_DEF = 0.5   # degrees
+_DEFAULT_ANGULAR_DEF = 0.5  # degrees
 
 _PROXY_SHORT_DIM_THRESHOLD = 0.06  # metres
 _PROXY_SLENDER_RATIO = 40.0
@@ -109,12 +108,13 @@ def why_unavailable() -> str:
     return "OCC bootstrap failed: unknown reason (check logs)"
 
 
-
-def _build_canonical_maps(canonical_map: Dict[str, Any]) -> Tuple[Dict[tuple, int], Dict[tuple, Dict[str, int]]]:
+def _build_canonical_maps(
+    canonical_map: Dict[str, Any],
+) -> Tuple[Dict[tuple, int], Dict[tuple, Dict[str, int]]]:
     """Build lookup maps from canonical mesh data."""
     coord_to_vid: Dict[tuple, int] = {}
     tri_map: Dict[tuple, Dict[str, int]] = {}
-    
+
     verts = canonical_map.get("vertices")
     faces = canonical_map.get("faces")
     mat_ids = canonical_map.get("material_ids")
@@ -123,19 +123,20 @@ def _build_canonical_maps(canonical_map: Dict[str, Any]) -> Tuple[Dict[tuple, in
     item_ids = canonical_map.get("item_ids")
     if item_ids is None:
         item_ids = []
-    
+
     if verts is None or faces is None:
         return coord_to_vid, tri_map
-        
+
     # Tolerance for coordinate matching (should match what's used in _triangulate_face_mapped)
     TOL = 1e-6
+
     def coord_key(p):
         return tuple((np.round(p / TOL) * TOL).tolist())
 
     # Build vertex map
     for i, v in enumerate(verts):
         coord_to_vid[coord_key(v)] = i
-        
+
     # Build triangle map
     for i, face in enumerate(faces):
         if len(face) != 3:
@@ -144,15 +145,15 @@ def _build_canonical_maps(canonical_map: Dict[str, Any]) -> Tuple[Dict[tuple, in
         # Actually, winding order matters for normals, but for identification, sorted indices are safer if we assume same vertices.
         # However, we are mapping *canonical* VIDs.
         tri_key = tuple(sorted((int(face[0]), int(face[1]), int(face[2]))))
-        
+
         info = {}
         if i < len(mat_ids):
             info["material_id"] = int(mat_ids[i])
         if i < len(item_ids):
             info["item_id"] = int(item_ids[i])
-            
+
         tri_map[tri_key] = info
-        
+
     return coord_to_vid, tri_map
 
 
@@ -160,51 +161,63 @@ def _build_canonical_maps(canonical_map: Dict[str, Any]) -> Tuple[Dict[tuple, in
 # Matrix / Transform Helpers (duplicated from process_ifc to avoid circular dep)
 # -----------------------------------------------------------------------------
 
+
 def _as_float(v, default=0.0):
     try:
-        if hasattr(v, "wrappedValue"): return float(v.wrappedValue)
+        if hasattr(v, "wrappedValue"):
+            return float(v.wrappedValue)
         return float(v)
     except Exception:
-        try: return float(default)
-        except Exception: return 0.0
+        try:
+            return float(default)
+        except Exception:
+            return 0.0
+
 
 def _axis_placement_to_np(placement) -> np.ndarray:
     """Convert IfcAxis2Placement3D to 4x4 numpy matrix."""
     if placement is None:
         return np.eye(4, dtype=float)
-    
+
     loc = getattr(placement, "Location", None)
     axis = getattr(placement, "Axis", None)
     ref_dir = getattr(placement, "RefDirection", None)
-    
-    ox = _as_float(getattr(loc, "Coordinates", [0,0,0])[0])
-    oy = _as_float(getattr(loc, "Coordinates", [0,0,0])[1])
-    oz = _as_float(getattr(loc, "Coordinates", [0,0,0])[2])
-    
+
+    ox = _as_float(getattr(loc, "Coordinates", [0, 0, 0])[0])
+    oy = _as_float(getattr(loc, "Coordinates", [0, 0, 0])[1])
+    oz = _as_float(getattr(loc, "Coordinates", [0, 0, 0])[2])
+
     # Z axis
     if axis and getattr(axis, "DirectionRatios", None):
         z = np.array(axis.DirectionRatios, dtype=float)
         zn = np.linalg.norm(z)
-        if zn > 1e-9: z /= zn
-        else: z = np.array([0,0,1], dtype=float)
+        if zn > 1e-9:
+            z /= zn
+        else:
+            z = np.array([0, 0, 1], dtype=float)
     else:
-        z = np.array([0,0,1], dtype=float)
-        
+        z = np.array([0, 0, 1], dtype=float)
+
     # X axis
     if ref_dir and getattr(ref_dir, "DirectionRatios", None):
         x = np.array(ref_dir.DirectionRatios, dtype=float)
         xn = np.linalg.norm(x)
-        if xn > 1e-9: x /= xn
-        else: x = np.array([1,0,0], dtype=float)
+        if xn > 1e-9:
+            x /= xn
+        else:
+            x = np.array([1, 0, 0], dtype=float)
     else:
         # Arbitrary X if not specified
-        if abs(z[2]) < 0.9: x = np.array([0,0,1], dtype=float) # if Z not vertical, use Z as X-ish? No.
+        if abs(z[2]) < 0.9:
+            x = np.array(
+                [0, 0, 1], dtype=float
+            )  # if Z not vertical, use Z as X-ish? No.
         # Standard fallback logic:
         # If Z is vertical (0,0,1), X is (1,0,0).
         # If Z is not vertical, we need an X.
         # Actually, if RefDirection is missing, X is derived from Z.
         # But let's keep it simple: if missing, use (1,0,0) and orthogonalize.
-        x = np.array([1,0,0], dtype=float)
+        x = np.array([1, 0, 0], dtype=float)
 
     # Orthogonalize X against Z
     # x = x - dot(x,z)*z
@@ -214,13 +227,15 @@ def _axis_placement_to_np(placement) -> np.ndarray:
         x /= xn
     else:
         # X is parallel to Z? Pick arbitrary
-        if abs(z[0]) < 0.9: x = np.array([1,0,0], dtype=float)
-        else: x = np.array([0,1,0], dtype=float)
+        if abs(z[0]) < 0.9:
+            x = np.array([1, 0, 0], dtype=float)
+        else:
+            x = np.array([0, 1, 0], dtype=float)
         x = x - np.dot(x, z) * z
         x /= np.linalg.norm(x)
-        
+
     y = np.cross(z, x)
-    
+
     mat = np.eye(4, dtype=float)
     mat[:3, 0] = x
     mat[:3, 1] = y
@@ -230,50 +245,57 @@ def _axis_placement_to_np(placement) -> np.ndarray:
     mat[2, 3] = oz
     return mat
 
+
 def _cartesian_transform_to_np(operator) -> np.ndarray:
     """Convert IfcCartesianTransformationOperator3D to 4x4 numpy matrix."""
     if operator is None:
         return np.eye(4, dtype=float)
-    
+
     # Origin
     origin = getattr(operator, "LocalOrigin", None)
-    ox = _as_float(getattr(origin, "Coordinates", [0,0,0])[0])
-    oy = _as_float(getattr(origin, "Coordinates", [0,0,0])[1])
-    oz = _as_float(getattr(origin, "Coordinates", [0,0,0])[2])
-    
+    ox = _as_float(getattr(origin, "Coordinates", [0, 0, 0])[0])
+    oy = _as_float(getattr(origin, "Coordinates", [0, 0, 0])[1])
+    oz = _as_float(getattr(origin, "Coordinates", [0, 0, 0])[2])
+
     # Axis 1 (X)
     axis1 = getattr(operator, "Axis1", None)
     if axis1 and getattr(axis1, "DirectionRatios", None):
         x = np.array(axis1.DirectionRatios, dtype=float)
         xn = np.linalg.norm(x)
-        if xn > 1e-9: x /= xn
-        else: x = np.array([1,0,0], dtype=float)
+        if xn > 1e-9:
+            x /= xn
+        else:
+            x = np.array([1, 0, 0], dtype=float)
     else:
-        x = np.array([1,0,0], dtype=float)
-        
+        x = np.array([1, 0, 0], dtype=float)
+
     # Axis 2 (Y)
     axis2 = getattr(operator, "Axis2", None)
     if axis2 and getattr(axis2, "DirectionRatios", None):
         y = np.array(axis2.DirectionRatios, dtype=float)
         yn = np.linalg.norm(y)
-        if yn > 1e-9: y /= yn
-        else: y = np.array([0,1,0], dtype=float)
+        if yn > 1e-9:
+            y /= yn
+        else:
+            y = np.array([0, 1, 0], dtype=float)
     else:
-        y = np.array([0,1,0], dtype=float)
-        
+        y = np.array([0, 1, 0], dtype=float)
+
     # Axis 3 (Z)
     axis3 = getattr(operator, "Axis3", None)
     if axis3 and getattr(axis3, "DirectionRatios", None):
         z = np.array(axis3.DirectionRatios, dtype=float)
         zn = np.linalg.norm(z)
-        if zn > 1e-9: z /= zn
-        else: z = np.array([0,0,1], dtype=float)
+        if zn > 1e-9:
+            z /= zn
+        else:
+            z = np.array([0, 0, 1], dtype=float)
     else:
-        z = np.array([0,0,1], dtype=float)
-        
+        z = np.array([0, 0, 1], dtype=float)
+
     # Scale
     scale = _as_float(getattr(operator, "Scale", 1.0), 1.0)
-    
+
     mat = np.eye(4, dtype=float)
     mat[:3, 0] = x * scale
     mat[:3, 1] = y * scale
@@ -283,12 +305,18 @@ def _cartesian_transform_to_np(operator) -> np.ndarray:
     mat[2, 3] = oz
     return mat
 
+
 def _repmap_rt_matrix(mapped_item) -> np.ndarray:
     """Return MappingTarget @ MappingOrigin (RepresentationMap frame to product frame)."""
     source = getattr(mapped_item, "MappingSource", None)
-    origin_np = _axis_placement_to_np(getattr(source, "MappingOrigin", None)) if source is not None else np.eye(4, dtype=float)
+    origin_np = (
+        _axis_placement_to_np(getattr(source, "MappingOrigin", None))
+        if source is not None
+        else np.eye(4, dtype=float)
+    )
     target_np = _cartesian_transform_to_np(getattr(mapped_item, "MappingTarget", None))
     return target_np @ origin_np
+
 
 def _apply_transform_to_occ_shape(shape: Any, matrix: np.ndarray) -> Any:
     """Apply a 4x4 numpy matrix transform to a TopoDS_Shape."""
@@ -299,26 +327,41 @@ def _apply_transform_to_occ_shape(shape: Any, matrix: np.ndarray) -> Any:
         gp_Vec = sym("gp_Vec")
         gp_Mat = sym("gp_Mat")
         BRepBuilderAPI_Transform = sym("BRepBuilderAPI_Transform")
-        
+
         trsf = gp_Trsf()
-        
+
         # Extract rotation/scale part
         m = matrix
         # gp_Mat expects (Row1, Row2, Row3)
         mat = gp_Mat(
-            float(m[0,0]), float(m[0,1]), float(m[0,2]),
-            float(m[1,0]), float(m[1,1]), float(m[1,2]),
-            float(m[2,0]), float(m[2,1]), float(m[2,2])
+            float(m[0, 0]),
+            float(m[0, 1]),
+            float(m[0, 2]),
+            float(m[1, 0]),
+            float(m[1, 1]),
+            float(m[1, 2]),
+            float(m[2, 0]),
+            float(m[2, 1]),
+            float(m[2, 2]),
         )
-        vec = gp_Vec(float(m[0,3]), float(m[1,3]), float(m[2,3]))
-        
+        vec = gp_Vec(float(m[0, 3]), float(m[1, 3]), float(m[2, 3]))
+
         trsf.SetValues(
-            float(m[0,0]), float(m[0,1]), float(m[0,2]), float(m[0,3]),
-            float(m[1,0]), float(m[1,1]), float(m[1,2]), float(m[1,3]),
-            float(m[2,0]), float(m[2,1]), float(m[2,2]), float(m[2,3])
+            float(m[0, 0]),
+            float(m[0, 1]),
+            float(m[0, 2]),
+            float(m[0, 3]),
+            float(m[1, 0]),
+            float(m[1, 1]),
+            float(m[1, 2]),
+            float(m[1, 3]),
+            float(m[2, 0]),
+            float(m[2, 1]),
+            float(m[2, 2]),
+            float(m[2, 3]),
         )
-        
-        transformer = BRepBuilderAPI_Transform(shape, trsf, True) # True = copy
+
+        transformer = BRepBuilderAPI_Transform(shape, trsf, True)  # True = copy
         return transformer.Shape()
     except Exception as exc:
         log.warning("Failed to apply transform to OCC shape: %s", exc)
@@ -337,7 +380,11 @@ def build_detail_mesh(
     """Return OCC meshes grouped by logical sub-shapes, when OCC is available."""
     if not is_available() or shape_obj is None:
         if logger:
-            logger.log(1, "Either OCC Module not installed or no valid TopoDS Shape found", exc_info=True)
+            logger.log(
+                1,
+                "Either OCC Module not installed or no valid TopoDS Shape found",
+                exc_info=True,
+            )
         return None
     topo_shape = _extract_topods_shape(shape_obj, logger=logger)
     if topo_shape is None:
@@ -345,11 +392,11 @@ def build_detail_mesh(
     linear_tol = max(float(linear_deflection), 1e-6)
     angular_tol = max(float(angular_deflection_rad), math.radians(0.1))
     if not _perform_meshing(
-        topo_shape, 
-        linear_tol, 
-        angular_tol, 
-        logger=logger, 
-        ifc_entity=getattr(shape_obj, "id", lambda: None)()
+        topo_shape,
+        linear_tol,
+        angular_tol,
+        logger=logger,
+        ifc_entity=getattr(shape_obj, "id", lambda: None)(),
     ):
         return None
     subshape_shapes = _primary_subshape_list(topo_shape)
@@ -357,10 +404,7 @@ def build_detail_mesh(
     face_counter = 0
     for idx, (label, subshape) in enumerate(subshape_shapes):
         faces, face_counter = _collect_face_meshes(
-            subshape, 
-            face_counter,
-            coord_to_vid=coord_to_vid,
-            tri_map=tri_map
+            subshape, face_counter, coord_to_vid=coord_to_vid, tri_map=tri_map
         )
         if faces:
             subshape_meshes.append(
@@ -373,15 +417,17 @@ def build_detail_mesh(
             )
     if not subshape_meshes:
         faces, _ = _collect_face_meshes(
-            topo_shape, 
-            0,
-            coord_to_vid=coord_to_vid,
-            tri_map=tri_map
+            topo_shape, 0, coord_to_vid=coord_to_vid, tri_map=tri_map
         )
         if not faces:
             return None
         subshape_meshes.append(
-            OCCSubshapeMesh(index=0, label="Shape", shape_type=_shape_type_name(topo_shape), faces=faces)
+            OCCSubshapeMesh(
+                index=0,
+                label="Shape",
+                shape_type=_shape_type_name(topo_shape),
+                faces=faces,
+            )
         )
     log.debug(
         "OCC detail: prepared %d subshape entries for %s",
@@ -390,7 +436,10 @@ def build_detail_mesh(
     )
     return OCCDetailMesh(shape=topo_shape, subshapes=subshape_meshes)
 
-def _extract_topods_shape(shape_obj: Any, logger: Optional[logging.Logger] = None) -> Optional[Any]:
+
+def _extract_topods_shape(
+    shape_obj: Any, logger: Optional[logging.Logger] = None
+) -> Optional[Any]:
     """Best-effort conversion of ifcopenshell shapes to TopoDS_Shape."""
     if not is_available():
         return None
@@ -398,7 +447,9 @@ def _extract_topods_shape(shape_obj: Any, logger: Optional[logging.Logger] = Non
         occ_utils = sym("occ_utils")
     except Exception as exc:
         if logger:
-            logger.debug("OCC detail: occ_utils import failed during extraction (%s)", exc)
+            logger.debug(
+                "OCC detail: occ_utils import failed during extraction (%s)", exc
+            )
         return None
     if _is_topods(shape_obj):
         return shape_obj
@@ -407,14 +458,18 @@ def _extract_topods_shape(shape_obj: Any, logger: Optional[logging.Logger] = Non
             result = occ_utils.create_shape_from_serialization(candidate)  # type: ignore[arg-type]
         except Exception as exc:  # pragma: no cover - defensive
             if logger:
-                logger.debug("OCC serialization failed for %s: %s", type(candidate).__name__, exc)
+                logger.debug(
+                    "OCC serialization failed for %s: %s", type(candidate).__name__, exc
+                )
             continue
         if _is_topods(result):
             return result
         if hasattr(result, "geometry") and _is_topods(result.geometry):  # type: ignore[attr-defined]
             return result.geometry  # type: ignore[attr-defined]
     if logger:
-        logger.debug("No TopoDS_Shape could be extracted for %s", type(shape_obj).__name__)
+        logger.debug(
+            "No TopoDS_Shape could be extracted for %s", type(shape_obj).__name__
+        )
     return None
 
 
@@ -446,7 +501,11 @@ def _is_topods(candidate: Any) -> bool:
         topo_cls = None
     if topo_cls is not None and isinstance(candidate, topo_cls):
         return True
-    return hasattr(candidate, "ShapeType") and hasattr(candidate, "IsNull") and callable(candidate.ShapeType)
+    return (
+        hasattr(candidate, "ShapeType")
+        and hasattr(candidate, "IsNull")
+        and callable(candidate.ShapeType)
+    )
 
 
 def try_inv_4x4(matrix: Any) -> Optional[List[List[float]]]:
@@ -504,7 +563,9 @@ def _compose_pre_xform(detail_mesh: OCCDetailMesh, matrix: np.ndarray) -> bool:
     return True
 
 
-def align_detail_mesh_to_base(detail_mesh: OCCDetailMesh, base_mesh: Dict[str, Any]) -> bool:
+def align_detail_mesh_to_base(
+    detail_mesh: OCCDetailMesh, base_mesh: Dict[str, Any]
+) -> bool:
     """Attach a translation pre_xform so OCC detail shares the base mesh's center."""
     base_center = _mesh_center(base_mesh)
     if base_center is None:
@@ -594,7 +655,12 @@ def _set_linear_deflection(params, value: float) -> None:
 
 
 def _set_angular_deflection(params, value: float) -> None:
-    for name in ("SetAngularDeflection", "SetAngularDeviation", "SetAngularError", "SetMaximalAngle"):
+    for name in (
+        "SetAngularDeflection",
+        "SetAngularDeviation",
+        "SetAngularError",
+        "SetMaximalAngle",
+    ):
         method = getattr(params, name, None)
         if callable(method):
             method(float(value))
@@ -612,9 +678,6 @@ def _set_bool_flag(params, candidates: Tuple[str, ...], value: bool) -> None:
         if hasattr(params, name):
             setattr(params, name, bool(value))
             return
-
-
-
 
 
 def _get_bounding_box_diag(shape: Any) -> float:
@@ -670,7 +733,9 @@ def safe_mesh_shape(
     try:
         analyzer = BRepCheck_Analyzer(occ_shape)
         if analyzer is not None and not analyzer.IsValid():
-            active_log.info("Detail mesher: invalid B-Rep for %s, running ShapeFix.", ifc_entity)
+            active_log.info(
+                "Detail mesher: invalid B-Rep for %s, running ShapeFix.", ifc_entity
+            )
             fixer = ShapeFix_Shape(occ_shape)
             fixer.Perform()
             fixed_shape = fixer.Shape()
@@ -679,7 +744,9 @@ def safe_mesh_shape(
                 return False, None
             occ_shape = fixed_shape
     except Exception:
-        active_log.debug("Detail mesher: BRepCheck analyzer failed for %s", ifc_entity, exc_info=True)
+        active_log.debug(
+            "Detail mesher: BRepCheck analyzer failed for %s", ifc_entity, exc_info=True
+        )
 
     try:
         TopAbs_SOLID = sym("TopAbs_SOLID")
@@ -700,7 +767,7 @@ def safe_mesh_shape(
                     should_sew = False
             except Exception:
                 pass
-        
+
         if should_sew:
             try:
                 sewing = BRepBuilderAPI_Sewing(1e-6)
@@ -711,7 +778,9 @@ def safe_mesh_shape(
                     occ_shape = sewn
                 sewed_performed = True
             except Exception:
-                active_log.debug("Detail mesher: sewing failed for %s", ifc_entity, exc_info=True)
+                active_log.debug(
+                    "Detail mesher: sewing failed for %s", ifc_entity, exc_info=True
+                )
 
     # Use absolute deflection from settings to ensure consistency with IfcOpenShell/process_ifc
     linear_deflection = base_linear_deflection
@@ -720,7 +789,7 @@ def safe_mesh_shape(
     # Dynamic deflection logic:
     # Calculate diagonal to determine appropriate scale
     diag = _get_bounding_box_diag(occ_shape)
-    
+
     # Target 0.1% of diagonal as relative deflection
     # But clamp to the absolute setting (don't exceed what user asked for)
     # And clamp to a safe minimum (1e-5)
@@ -731,7 +800,7 @@ def safe_mesh_shape(
     params = IMeshTools_Parameters()
     _set_linear_deflection(params, effective_linear)
     _set_angular_deflection(params, angular_deflection)
-    
+
     # Enforce absolute deflection (SetRelative=False) to match process_ifc.py intent
     _set_bool_flag(
         params,
@@ -751,7 +820,7 @@ def safe_mesh_shape(
 
     mesher = None
     success = False
-    
+
     # First meshing attempt
     try:
         mesher = BRepMesh_IncrementalMesh(occ_shape, params)
@@ -773,8 +842,12 @@ def safe_mesh_shape(
                 mesher = BRepMesh_IncrementalMesh(occ_shape, params)
                 success = True
         except Exception as exc:
-             active_log.warning("Detail mesher: fallback sewing/meshing failed for %s: %s", ifc_entity, exc)
-             return False, None
+            active_log.warning(
+                "Detail mesher: fallback sewing/meshing failed for %s: %s",
+                ifc_entity,
+                exc,
+            )
+            return False, None
 
     if success and mesher:
         active_log.debug(
@@ -816,12 +889,12 @@ def _perform_meshing(
 
 
 def _collect_face_meshes(
-    target_shape: Any, 
-    start_index: int, 
-    *, 
+    target_shape: Any,
+    start_index: int,
+    *,
     material_key: Optional[Any] = None,
     coord_to_vid: Optional[Dict[tuple, int]] = None,
-    tri_map: Optional[Dict[tuple, Dict[str, int]]] = None
+    tri_map: Optional[Dict[tuple, Dict[str, int]]] = None,
 ) -> tuple[List[OCCFaceMesh], int]:
     """Collect OCCFaceMesh entries for every face in ``target_shape``."""
     _require_occ_components()
@@ -837,14 +910,17 @@ def _collect_face_meshes(
             explorer.Next()
             face_index += 1
             continue
-        
+
         # If we have a canonical map, we might split this face into multiple meshes
         if coord_to_vid and tri_map:
             split_meshes = _triangulate_face_mapped(face, coord_to_vid, tri_map)
             if split_meshes:
                 for mesh in split_meshes:
                     mesh.face_index = face_index
-                    if material_key is not None and getattr(mesh, "material_key", None) is None:
+                    if (
+                        material_key is not None
+                        and getattr(mesh, "material_key", None) is None
+                    ):
                         mesh.material_key = material_key
                     faces.append(mesh)
             else:
@@ -852,26 +928,30 @@ def _collect_face_meshes(
                 mesh = _triangulate_face(face)
                 if mesh is not None:
                     mesh.face_index = face_index
-                    if material_key is not None and getattr(mesh, "material_key", None) is None:
+                    if (
+                        material_key is not None
+                        and getattr(mesh, "material_key", None) is None
+                    ):
                         mesh.material_key = material_key
                     faces.append(mesh)
         else:
             mesh = _triangulate_face(face)
             if mesh is not None:
                 mesh.face_index = face_index
-                if material_key is not None and getattr(mesh, "material_key", None) is None:
+                if (
+                    material_key is not None
+                    and getattr(mesh, "material_key", None) is None
+                ):
                     mesh.material_key = material_key
                 faces.append(mesh)
-                
+
         explorer.Next()
         face_index += 1
     return faces, face_index
 
 
 def _triangulate_face_mapped(
-    face: Any, 
-    coord_to_vid: Dict[tuple, int], 
-    tri_map: Dict[tuple, Dict[str, int]]
+    face: Any, coord_to_vid: Dict[tuple, int], tri_map: Dict[tuple, Dict[str, int]]
 ) -> List[OCCFaceMesh]:
     """Triangulate a face and split it by canonical material/item IDs."""
     TopLoc_Location = sym("TopLoc_Location")
@@ -918,7 +998,7 @@ def _triangulate_face_mapped(
 
     use_transform = hasattr(loc, "IsIdentity") and not loc.IsIdentity()
     transform = loc.Transformation() if use_transform else None
-    
+
     # Extract vertices once
     vertices = np.zeros((len(node_points), 3), dtype=np.float64)
     for idx, point in enumerate(node_points):
@@ -931,14 +1011,15 @@ def _triangulate_face_mapped(
 
     # Group triangles by (material_id, item_id)
     # We need to re-index vertices for each group to keep meshes clean (optional but good)
-    # For simplicity, we can just slice the global vertex array if we want, 
+    # For simplicity, we can just slice the global vertex array if we want,
     # but usually we want compact vertex arrays for each sub-mesh.
-    # Let's just store indices into the full vertex array for now, 
+    # Let's just store indices into the full vertex array for now,
     # and maybe optimize later if needed. But OCCFaceMesh expects a vertex array.
     # So we should probably subset the vertices.
 
     # Tolerance for coordinate matching
     TOL = 1e-6
+
     def coord_key(p):
         # We assume vertices are already float64
         return tuple((np.round(p / TOL) * TOL).tolist())
@@ -956,25 +1037,25 @@ def _triangulate_face_mapped(
         try:
             i1, i2, i3 = tri.Get()
             # OCC indices are 1-based
-            idx1, idx2, idx3 = int(i1)-1, int(i2)-1, int(i3)-1
+            idx1, idx2, idx3 = int(i1) - 1, int(i2) - 1, int(i3) - 1
         except Exception:
             continue
-        
+
         # Map to canonical triangle
         c1 = occ_vid_to_canon_vid.get(idx1)
         c2 = occ_vid_to_canon_vid.get(idx2)
         c3 = occ_vid_to_canon_vid.get(idx3)
-        
+
         mat_id = -1
         item_id = -1
-        
+
         if c1 is not None and c2 is not None and c3 is not None:
             tri_key = tuple(sorted((c1, c2, c3)))
             if tri_key in tri_map:
                 info = tri_map[tri_key]
                 mat_id = info.get("material_id", -1)
                 item_id = info.get("item_id", -1)
-        
+
         key = (mat_id, item_id)
         if key not in groups:
             groups[key] = []
@@ -986,30 +1067,35 @@ def _triangulate_face_mapped(
         # Find unique vertex indices used in this group
         used_vids = sorted(list(set(idx for tri in tri_indices for idx in tri)))
         vid_map = {old: new for new, old in enumerate(used_vids)}
-        
+
         sub_vertices = vertices[used_vids]
-        sub_faces = np.array([[vid_map[i1], vid_map[i2], vid_map[i3]] for i1, i2, i3 in tri_indices], dtype=np.int32)
-        
+        sub_faces = np.array(
+            [[vid_map[i1], vid_map[i2], vid_map[i3]] for i1, i2, i3 in tri_indices],
+            dtype=np.int32,
+        )
+
         # Construct material key (this will be used by semantic splitter later)
         # We can pass a dict or tuple. The semantic splitter expects something it can understand.
         # Currently OCCFaceMesh.material_key is used for grouping.
         # We should probably pass a dict with 'material_id' and 'item_id'.
-        
+
         # Note: The semantic splitter in process_ifc.py uses 'occ_mesh_dict' which comes from 'mesh_from_detail_mesh'.
         # 'mesh_from_detail_mesh' aggregates everything.
         # We need to ensure that the semantic splitter can access this info.
         # The 'OCCFaceMesh' has 'material_key'.
-        
+
         # Let's use a dict as the key, it's flexible.
         mat_key = {"material_id": mat_id, "item_id": item_id}
-        
-        results.append(OCCFaceMesh(
-            face_index=0, # Will be set by caller
-            vertices=sub_vertices,
-            faces=sub_faces,
-            material_key=mat_key
-        ))
-        
+
+        results.append(
+            OCCFaceMesh(
+                face_index=0,  # Will be set by caller
+                vertices=sub_vertices,
+                faces=sub_faces,
+                material_key=mat_key,
+            )
+        )
+
     return results
 
 
@@ -1125,7 +1211,10 @@ def _primary_subshape_list(topo_shape: Any) -> List[tuple[str, Any]]:
             if entries:
                 return entries
         if not had_volumetric:
-            log.info("Detail mesh: compound %s contains no solids; returning compound as-is.", label)
+            log.info(
+                "Detail mesh: compound %s contains no solids; returning compound as-is.",
+                label,
+            )
         return [(label, shape)]
 
     occ_utils = None
@@ -1144,7 +1233,10 @@ def _primary_subshape_list(topo_shape: Any) -> List[tuple[str, Any]]:
                 base_label = f"{shape_name}_{len(bucket)}"
                 bucket.extend(_flatten_subshape(subshape, base_label))
         except Exception as exc:
-            log.debug("OCC detail: yield_subshapes failed (%s); falling back to TopExp iterator.", exc)
+            log.debug(
+                "OCC detail: yield_subshapes failed (%s); falling back to TopExp iterator.",
+                exc,
+            )
         if type_buckets:
             for preferred in ("SOLID", "COMPSOLID", "SHELL", "COMPOUND"):
                 entries = type_buckets.get(preferred)
@@ -1197,7 +1289,9 @@ def _primary_subshape_list(topo_shape: Any) -> List[tuple[str, Any]]:
             )
             return collected
 
-    log.debug("OCC detail: no subshapes discovered for %s", _shape_type_name(topo_shape))
+    log.debug(
+        "OCC detail: no subshapes discovered for %s", _shape_type_name(topo_shape)
+    )
     return []
 
 
@@ -1245,11 +1339,17 @@ def build_detail_mesh_payload(
 
     if detail_level != "subshape":
         if logref:
-            logref.debug("Detail level '%s' is deprecated; using 'subshape'.", detail_level)
+            logref.debug(
+                "Detail level '%s' is deprecated; using 'subshape'.", detail_level
+            )
         detail_level = "subshape"
 
-    linear_def = _setting_float(settings, "mesher-linear-deflection", default_linear_def)
-    angular_def = _setting_float(settings, "mesher-angular-deflection", default_angular_def)
+    linear_def = _setting_float(
+        settings, "mesher-linear-deflection", default_linear_def
+    )
+    angular_def = _setting_float(
+        settings, "mesher-angular-deflection", default_angular_def
+    )
     try:
         angular_rad = math.radians(float(angular_def))
     except Exception:
@@ -1286,7 +1386,7 @@ def build_detail_mesh_payload(
                     face_cap,
                 )
             return None
-    
+
     if canonical_map and "vertices" in canonical_map and "faces" in canonical_map:
         try:
             coord_to_vid, tri_map = _build_canonical_maps(canonical_map)
@@ -1340,10 +1440,15 @@ def build_detail_mesh_payload(
             if abs_inv is not None:
                 setattr(detail_mesh, "pre_xform", abs_inv)
                 if logref:
-                    logref.debug("OCC detail: mesh normalized with inverse abs matrix (source=%s)", type(candidate).__name__)
+                    logref.debug(
+                        "OCC detail: mesh normalized with inverse abs matrix (source=%s)",
+                        type(candidate).__name__,
+                    )
                 return
         if logref:
-            logref.debug("OCC detail: abs matrix not invertible or unavailable; writing as-is")
+            logref.debug(
+                "OCC detail: abs matrix not invertible or unavailable; writing as-is"
+            )
 
     detail_mesh = None
 
@@ -1352,7 +1457,12 @@ def build_detail_mesh_payload(
     # merging them into a monolithic shape where material assignments are lost.
     # This is critical for 'force-occ' workflows where the iterator mesh (and thus canonical map)
     # might be unavailable or unreliable.
-    if detail_mesh is None and material_resolver is not None and not canonical_map and product is not None:
+    if (
+        detail_mesh is None
+        and material_resolver is not None
+        and not canonical_map
+        and product is not None
+    ):
         detail_mesh = _build_representation_detail_mesh(
             product,
             settings,
@@ -1370,7 +1480,7 @@ def build_detail_mesh_payload(
         product_occ_shape = _create_occ_product_shape(settings, product, logger=logref)
         detail_mesh = _run_occ_detail(product_occ_shape, "product")
         if detail_mesh is not None and product is not None:
-             _attach_pre_xform(detail_mesh, product_occ_shape)
+            _attach_pre_xform(detail_mesh, product_occ_shape)
 
     # If that failed, fall back to iterator OCC and attach a normalization matrix if possible.
     if detail_mesh is None and shape_obj is not None:
@@ -1398,7 +1508,9 @@ def build_detail_mesh_payload(
                 getattr(product, "GlobalId", None),
             )
     if detail_mesh is None:
-        target_name = type(shape_obj).__name__ if shape_obj is not None else "IfcProduct"
+        target_name = (
+            type(shape_obj).__name__ if shape_obj is not None else "IfcProduct"
+        )
         if logref:
             logref.warning("OCC detail: no mesh generated for %s", target_name)
         return None
@@ -1462,9 +1574,11 @@ def precompute_detail_meshes(
     return cache
 
 
-def _iter_representation_items(product) -> Iterator[Tuple[int, int, Any, Optional[np.ndarray]]]:
+def _iter_representation_items(
+    product,
+) -> Iterator[Tuple[int, int, Any, Optional[np.ndarray]]]:
     """Iterate representation items, expanding IfcMappedItem recursively.
-    
+
     Yields:
         (rep_index, item_index, item, transform_matrix)
     """
@@ -1472,17 +1586,23 @@ def _iter_representation_items(product) -> Iterator[Tuple[int, int, Any, Optiona
     if representation is None:
         return
     reps = getattr(representation, "Representations", None) or []
-    
+
     def _recurse(item, current_xform=None):
         # If item is IfcMappedItem, expand it
         if item.is_a("IfcMappedItem"):
             source = getattr(item, "MappingSource", None)
-            mapped_rep = getattr(source, "MappedRepresentation", None) if source else None
+            mapped_rep = (
+                getattr(source, "MappedRepresentation", None) if source else None
+            )
             if mapped_rep:
                 # Calculate transform
                 local_xform = _repmap_rt_matrix(item)
-                new_xform = local_xform @ current_xform if current_xform is not None else local_xform
-                
+                new_xform = (
+                    local_xform @ current_xform
+                    if current_xform is not None
+                    else local_xform
+                )
+
                 mapped_items = getattr(mapped_rep, "Items", None) or []
                 for sub_item in mapped_items:
                     yield from _recurse(sub_item, new_xform)
@@ -1498,7 +1618,7 @@ def _iter_representation_items(product) -> Iterator[Tuple[int, int, Any, Optiona
         for item_index, item in enumerate(items):
             if item is None:
                 continue
-            
+
             # Expand mapped items
             for expanded_item, xform in _recurse(item):
                 yield rep_index, item_index, expanded_item, xform
@@ -1542,7 +1662,7 @@ def _build_representation_detail_mesh(
         if detail_mesh is None:
             continue
         # Track cumulative face count for next item
-        if hasattr(detail_mesh, 'face_count'):
+        if hasattr(detail_mesh, "face_count"):
             face_offset += detail_mesh.face_count
         item_meshes.append(detail_mesh)
     if not item_meshes:
@@ -1573,8 +1693,10 @@ def _describe_rep_item(item) -> str:
 def _product_name(product) -> str:
     if product is None:
         return "<product>"
-    return getattr(product, "Name", None) or getattr(product, "GlobalId", None) or (
-        product.is_a() if hasattr(product, "is_a") else "<product>"
+    return (
+        getattr(product, "Name", None)
+        or getattr(product, "GlobalId", None)
+        or (product.is_a() if hasattr(product, "is_a") else "<product>")
     )
 
 
@@ -1598,7 +1720,9 @@ def _detail_mesh_for_item(
     logref = logger or log
     if detail_level != "subshape":
         if logref:
-            logref.debug("Detail level '%s' is deprecated; using 'subshape'.", detail_level)
+            logref.debug(
+                "Detail level '%s' is deprecated; using 'subshape'.", detail_level
+            )
         detail_level = "subshape"
     if item is None:
         return None
@@ -1612,11 +1736,11 @@ def _detail_mesh_for_item(
     )
     if occ_source is None:
         return None
-        
+
     # Apply transform if present (from IfcMappedItem expansion)
     if transform is not None:
         occ_source = _apply_transform_to_occ_shape(occ_source, transform)
-        
+
     detail_mesh = build_detail_mesh(
         occ_source,
         linear_deflection=float(linear_def),
@@ -1624,7 +1748,7 @@ def _detail_mesh_for_item(
         logger=logref,
     )
     material_key = material_resolver(item) if material_resolver else None
-    
+
     # Build per-face material mapping from face_style_groups
     face_material_map: Optional[Dict[int, Any]] = None
     if face_style_groups:
@@ -1641,7 +1765,7 @@ def _detail_mesh_for_item(
                     # We'll check validity when we iterate through actual OCC faces
                     if local_face_idx >= 0:
                         face_material_map[local_face_idx] = mat_token
-        
+
         if logger and face_material_map:
             logger.debug(
                 "Detail mesh item: found %d faces with per-face materials for item rep=%s/%s (face_offset=%d, mapped_faces=%s)",
@@ -1651,25 +1775,38 @@ def _detail_mesh_for_item(
                 face_offset,
                 sorted(face_material_map.keys())[:10],
             )
-    
+
     if detail_mesh is None and logref:
         logref.debug(
             "Detail mode: OCC tessellation yielded no faces for product=%s step=%s item=%s rep=%s/%s",
-            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+            getattr(product, "Name", None)
+            or getattr(product, "GlobalId", None)
+            or "<product>",
             getattr(product, "id", lambda: None)(),
             _describe_rep_item(item),
             rep_index,
             item_index,
         )
     elif detail_mesh is not None:
-        _apply_material_key(detail_mesh, material_key, face_material_map=face_material_map)
+        _apply_material_key(
+            detail_mesh, material_key, face_material_map=face_material_map
+        )
         if product is not None and rep_index is not None and item_index is not None:
-            _annotate_detail_subshapes(detail_mesh, product, rep_index, item_index, item, material_key=material_key)
+            _annotate_detail_subshapes(
+                detail_mesh,
+                product,
+                rep_index,
+                item_index,
+                item,
+                material_key=material_key,
+            )
         if logref:
             subshape_count = len(getattr(detail_mesh, "subshapes", None) or [])
             logref.debug(
                 "Detail mode: OCC tessellation succeeded for product=%s step=%s item=%s rep=%s/%s subshapes=%d",
-                getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+                getattr(product, "Name", None)
+                or getattr(product, "GlobalId", None)
+                or "<product>",
                 getattr(product, "id", lambda: None)(),
                 _describe_rep_item(item),
                 rep_index,
@@ -1777,7 +1914,9 @@ def _create_occ_shape(
         if logger:
             logger.debug(
                 "Detail OCC fallback: create_shape failed for product=%s step=%s item=%s rep=%s/%s error=%s",
-                getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+                getattr(product, "Name", None)
+                or getattr(product, "GlobalId", None)
+                or "<product>",
                 getattr(product, "id", lambda: None)(),
                 _describe_rep_item(element),
                 rep_index,
@@ -1789,7 +1928,9 @@ def _create_occ_shape(
     if not geometry and logger:
         logger.debug(
             "Detail OCC fallback: create_shape returned empty geometry for product=%s item=%s rep=%s/%s",
-            getattr(product, "Name", None) or getattr(product, "GlobalId", None) or "<product>",
+            getattr(product, "Name", None)
+            or getattr(product, "GlobalId", None)
+            or "<product>",
             _describe_rep_item(element),
             rep_index,
             item_index,
@@ -1797,7 +1938,9 @@ def _create_occ_shape(
     return geometry or shape_obj
 
 
-def _create_occ_product_shape(settings, product, *, logger: Optional[logging.Logger] = None):
+def _create_occ_product_shape(
+    settings, product, *, logger: Optional[logging.Logger] = None
+):
     try:
         shape_obj = ifcopenshell.geom.create_shape(
             settings,
@@ -1823,17 +1966,29 @@ def _create_occ_product_shape(settings, product, *, logger: Optional[logging.Log
 _CLEAN_RE = re.compile(r"[^A-Za-z0-9_]+")
 
 
-def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index: int, item, material_key: Optional[Any] = None):
+def _annotate_detail_subshapes(
+    detail_mesh,
+    product,
+    rep_index: int,
+    item_index: int,
+    item,
+    material_key: Optional[Any] = None,
+):
     """Tag OCC subshape labels so downstream USD meshes remain traceable."""
     subshapes = getattr(detail_mesh, "subshapes", None) or []
     if not subshapes:
         return
-    product_label = getattr(product, "Name", None) or getattr(product, "GlobalId", None) or product.is_a()
+    product_label = (
+        getattr(product, "Name", None)
+        or getattr(product, "GlobalId", None)
+        or product.is_a()
+    )
     item_name = (
         getattr(item, "Name", None)
         or getattr(item, "Description", None)
         or (item.is_a() if hasattr(item, "is_a") else f"Item{item_index}")
     )
+
     def _clean(text: str) -> str:
         try:
             token = _CLEAN_RE.sub("_", str(text)).strip("_") or "Part"
@@ -1858,9 +2013,13 @@ def _annotate_detail_subshapes(detail_mesh, product, rep_index: int, item_index:
                 face.material_key = material_key
 
 
-def _apply_material_key(detail_mesh, material_key: Optional[Any], face_material_map: Optional[Dict[int, Any]] = None) -> None:
+def _apply_material_key(
+    detail_mesh,
+    material_key: Optional[Any],
+    face_material_map: Optional[Dict[int, Any]] = None,
+) -> None:
     """Apply material keys to mesh faces.
-    
+
     Args:
         detail_mesh: The OCCDetailMesh to update
         material_key: Single material key to apply to all faces (if face_material_map is None)
@@ -1868,19 +2027,21 @@ def _apply_material_key(detail_mesh, material_key: Optional[Any], face_material_
     """
     if material_key is None and not face_material_map:
         return
-    
+
     subshapes = getattr(detail_mesh, "subshapes", None) or []
     face_index = 0
-    
+
     for subshape in subshapes:
         if getattr(subshape, "material_key", None) is None and material_key is not None:
             subshape.material_key = material_key
-        
+
         for face in getattr(subshape, "faces", None) or []:
             if face_material_map and face_index in face_material_map:
                 # Use per-face material assignment from mapping
                 face.material_key = face_material_map[face_index]
-            elif getattr(face, "material_key", None) is None and material_key is not None:
+            elif (
+                getattr(face, "material_key", None) is None and material_key is not None
+            ):
                 # Fall back to single material key
                 face.material_key = material_key
             face_index += 1
@@ -1911,7 +2072,9 @@ def _merge_detail_meshes(meshes: List[OCCDetailMesh]) -> Optional[OCCDetailMesh]
     return OCCDetailMesh(shape=None, subshapes=combined)
 
 
-def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict[str, Any]]:
+def mesh_from_detail_mesh(
+    detail_mesh: Optional[OCCDetailMesh],
+) -> Optional[Dict[str, Any]]:
     """Flatten OCC detail meshes into the standard vertex/face dict used by proto pipeline."""
     if detail_mesh is None:
         return None
@@ -1933,13 +2096,13 @@ def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict
             continue
         vert_arrays.append(verts)
         face_arrays.append(tris + offset)
-        
+
         # Store material key for each face (triangle)
         # We need to replicate the key for each triangle in this face mesh
         mat_key = getattr(face, "material_key", None)
         num_tris = tris.shape[0]
         material_keys.extend([mat_key] * num_tris)
-        
+
         offset += verts.shape[0]
     if not vert_arrays or not face_arrays:
         return None
@@ -1954,7 +2117,7 @@ def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict
             vertices = _apply_matrix_to_vertices(vertices, pre_xform)
         except Exception:
             pass
-            
+
     # Extract integer material IDs for standard pipeline compatibility
     material_ids = []
     for k in material_keys:
@@ -1965,12 +2128,12 @@ def mesh_from_detail_mesh(detail_mesh: Optional[OCCDetailMesh]) -> Optional[Dict
             material_ids.append(k)
         else:
             material_ids.append(-1)
-            
+
     return {
-        "vertices": vertices, 
-        "faces": faces_arr, 
+        "vertices": vertices,
+        "faces": faces_arr,
         "material_keys": material_keys,
-        "material_ids": material_ids
+        "material_ids": material_ids,
     }
 
 
@@ -1988,12 +2151,13 @@ def proxy_requires_high_detail(stats: Dict[str, float]) -> Tuple[bool, List[str]
     thin = shortest <= _PROXY_SHORT_DIM_THRESHOLD
     slender = shortest > 0.0 and longest / max(shortest, 1e-6) >= _PROXY_SLENDER_RATIO
     small = diagonal <= _PROXY_SMALL_DIAGONAL
-    sparse = face_count <= _PROXY_FACE_COUNT_THRESHOLD or area_per_face >= _PROXY_AREA_PER_FACE_THRESHOLD
+    sparse = (
+        face_count <= _PROXY_FACE_COUNT_THRESHOLD
+        or area_per_face >= _PROXY_AREA_PER_FACE_THRESHOLD
+    )
 
     if thin and slender:
-        reasons.append(
-            f"slender (shortest={shortest:.3f}m longest={longest:.3f}m)"
-        )
+        reasons.append(f"slender (shortest={shortest:.3f}m longest={longest:.3f}m)")
     if small and sparse:
         reasons.append(
             f"small_sparse (diag={diagonal:.3f}m faces={face_count} area/face={area_per_face:.4f})"

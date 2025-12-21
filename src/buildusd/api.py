@@ -66,7 +66,9 @@ def _normalize_anchor_mode(value: Optional[str]) -> Optional[AnchorMode]:
         return "site"
     if normalized in ("none", ""):
         return None
-    logging.getLogger(__name__).debug("Unknown anchor_mode '%s'; defaulting to None", value)
+    logging.getLogger(__name__).debug(
+        "Unknown anchor_mode '%s'; defaulting to None", value
+    )
     return None
 
 
@@ -78,6 +80,7 @@ class ConversionDefaults:
     checkpoint: bool = False
     offline: bool = False
     anchor_mode: AnchorModeSetting = None
+    geospatial_mode: str = "auto"
 
     def options(self) -> ConversionOptions:
         return replace(DEFAULT_CONVERSION_OPTIONS)
@@ -99,10 +102,13 @@ class ConversionSettings:
     process_all: bool = False
     exclude_names: Optional[Sequence[str]] = None
     usd_format: str = CONVERSION_DEFAULTS.usd_format
-    usd_auto_binary_threshold_mb: Optional[float] = CONVERSION_DEFAULTS.usd_auto_binary_threshold_mb
+    usd_auto_binary_threshold_mb: Optional[float] = (
+        CONVERSION_DEFAULTS.usd_auto_binary_threshold_mb
+    )
     checkpoint: bool = CONVERSION_DEFAULTS.checkpoint
     offline: bool = CONVERSION_DEFAULTS.offline
     anchor_mode: AnchorModeSetting = CONVERSION_DEFAULTS.anchor_mode
+    geospatial_mode: str = CONVERSION_DEFAULTS.geospatial_mode
     logger: Optional[logging.Logger] = None
     geom_overrides: dict[str, Any] = field(default_factory=dict)
 
@@ -115,7 +121,9 @@ def convert(
 ) -> list[ConversionResult]:
     """Convert IFC inputs described by ``settings``."""
 
-    effective_options = replace(DEFAULT_CONVERSION_OPTIONS) if options is None else options
+    effective_options = (
+        replace(DEFAULT_CONVERSION_OPTIONS) if options is None else options
+    )
     # Merge geom_overrides from settings if provided
     if settings.geom_overrides:
         merged_geom = dict(getattr(effective_options, "geom_overrides", {}) or {})
@@ -139,6 +147,7 @@ def convert(
         checkpoint=settings.checkpoint,
         offline=settings.offline,
         anchor_mode=normalized_anchor_mode,
+        geospatial_mode=settings.geospatial_mode,
         cancel_event=cancel_event,
     )
 
@@ -168,8 +177,12 @@ def set_stage_up_axis(
 @dataclass(frozen=True)
 class FederationDefaults:
     map_coordinate_system: str = "EPSG:7855"
-    fallback_base_point: BasePointConfig = field(default_factory=lambda: _clone_base_point(DEFAULT_BASE_POINT))
-    fallback_shared_site_base_point: BasePointConfig = field(default_factory=lambda: _clone_base_point(DEFAULT_SHARED_BASE_POINT))
+    fallback_base_point: BasePointConfig = field(
+        default_factory=lambda: _clone_base_point(DEFAULT_BASE_POINT)
+    )
+    fallback_shared_site_base_point: BasePointConfig = field(
+        default_factory=lambda: _clone_base_point(DEFAULT_SHARED_BASE_POINT)
+    )
     fallback_master_stage: str = DEFAULT_MASTER_STAGE
     fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS
     parent_prim: str = "/World"
@@ -190,8 +203,12 @@ class FederationSettings:
     masters_root: Optional[PathLike] = None
     parent_prim: str = FEDERATION_DEFAULTS.parent_prim
     map_coordinate_system: str = FEDERATION_DEFAULTS.map_coordinate_system
-    fallback_base_point: BasePointConfig = field(default_factory=lambda: _clone_base_point(DEFAULT_BASE_POINT))
-    fallback_shared_site_base_point: BasePointConfig = field(default_factory=lambda: _clone_base_point(DEFAULT_SHARED_BASE_POINT))
+    fallback_base_point: BasePointConfig = field(
+        default_factory=lambda: _clone_base_point(DEFAULT_BASE_POINT)
+    )
+    fallback_shared_site_base_point: BasePointConfig = field(
+        default_factory=lambda: _clone_base_point(DEFAULT_SHARED_BASE_POINT)
+    )
     fallback_master_stage: str = DEFAULT_MASTER_STAGE
     fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS
     anchor_mode: AnchorModeSetting = FEDERATION_DEFAULTS.anchor_mode
@@ -203,12 +220,18 @@ class FederationSettings:
         return self.masters_root
 
 
-def _resolve_manifest(manifest: Optional[ConversionManifest], manifest_path: Optional[PathLike]) -> ConversionManifest:
+def _resolve_manifest(
+    manifest: Optional[ConversionManifest], manifest_path: Optional[PathLike]
+) -> ConversionManifest:
     if manifest is not None:
         return manifest
     if manifest_path is None:
-        raise ValueError("FederationSettings requires either 'manifest' or 'manifest_path'.")
-    path_obj = Path(manifest_path) if not isinstance(manifest_path, Path) else manifest_path
+        raise ValueError(
+            "FederationSettings requires either 'manifest' or 'manifest_path'."
+        )
+    path_obj = (
+        Path(manifest_path) if not isinstance(manifest_path, Path) else manifest_path
+    )
     return ConversionManifest.from_file(path_obj.resolve())
 
 
@@ -232,7 +255,9 @@ def federate_stages(settings: FederationSettings) -> Sequence[FederationTask]:
             normalized_stage_paths.append(raw)
         else:
             text = str(raw)
-            normalized_stage_paths.append(Path(text) if is_omniverse_path(text) else Path(text).resolve())
+            normalized_stage_paths.append(
+                Path(text) if is_omniverse_path(text) else Path(text).resolve()
+            )
 
     return _federate_stages(
         stage_paths=normalized_stage_paths,

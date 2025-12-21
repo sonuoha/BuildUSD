@@ -4,7 +4,7 @@ import argparse
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal, Optional, Sequence, Union
+from typing import Iterable, Optional, Sequence, Union
 
 from .config.manifest import BasePointConfig, ConversionManifest, ResolvedFilePlan
 from .io_utils import (
@@ -61,7 +61,9 @@ def _normalise_stage_root(path: str | None) -> Path:
     return Path(path).resolve()
 
 
-def _candidate_stage_files(stage_root: Path, stage_filters: Sequence[str] | None) -> list[Path]:
+def _candidate_stage_files(
+    stage_root: Path, stage_filters: Sequence[str] | None
+) -> list[Path]:
     if stage_filters:
         files: list[Path] = []
         for raw in stage_filters:
@@ -77,7 +79,9 @@ def _candidate_stage_files(stage_root: Path, stage_filters: Sequence[str] | None
             files.append(candidate)
         return files
     if is_omniverse_path(str(stage_root)):
-        raise ValueError("Automatic discovery is not supported for omniverse stage roots; provide --stage entries.")
+        raise ValueError(
+            "Automatic discovery is not supported for omniverse stage roots; provide --stage entries."
+        )
     patterns = ("*.usd", "*.usda", "*.usdc")
     stage_files: list[Path] = []
     for pattern in patterns:
@@ -88,7 +92,12 @@ def _candidate_stage_files(stage_root: Path, stage_filters: Sequence[str] | None
         if not path.is_file():
             continue
         lowered = name.lower()
-        if lowered.endswith("_prototypes") or lowered.endswith("_materials") or lowered.endswith("_instances") or lowered.endswith("_geometry2d"):
+        if (
+            lowered.endswith("_prototypes")
+            or lowered.endswith("_materials")
+            or lowered.endswith("_instances")
+            or lowered.endswith("_geometry2d")
+        ):
             continue
         filtered.append(path)
     filtered.sort()
@@ -150,7 +159,11 @@ def _plan_federation(
         except Exception as exc:
             LOG.error("Failed to resolve manifest entry for %s: %s", stage_path, exc)
             continue
-        tasks.append(FederationTask(stage_path=stage_path, plan=plan, anchor_mode=resolved_anchor_mode))
+        tasks.append(
+            FederationTask(
+                stage_path=stage_path, plan=plan, anchor_mode=resolved_anchor_mode
+            )
+        )
     return tasks
 
 
@@ -233,14 +246,18 @@ def federate_stages(
 
     initialize_usd(offline=offline)
     try:
-        _apply_federation(tasks, masters_root=masters_root_path, parent_prim=parent_prim)
+        _apply_federation(
+            tasks, masters_root=masters_root_path, parent_prim=parent_prim
+        )
     finally:
         shutdown_usd_context()
     return tasks
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Assemble federated USD master stages from converted stage files.")
+    parser = argparse.ArgumentParser(
+        description="Assemble federated USD master stages from converted stage files."
+    )
     parser.add_argument(
         "--stage-root",
         dest="stage_root",
@@ -298,7 +315,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv)
     stage_root = _normalise_stage_root(args.stage_root)
-    masters_root = _normalise_stage_root(args.masters_root) if args.masters_root else stage_root
+    masters_root = (
+        _normalise_stage_root(args.masters_root) if args.masters_root else stage_root
+    )
     manifest_path = Path(args.manifest_path).resolve()
     manifest = _load_manifest(manifest_path)
     stage_paths = _candidate_stage_files(stage_root, args.stage_filters)

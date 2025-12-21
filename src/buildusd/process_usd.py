@@ -1,4 +1,4 @@
-﻿"""USD authoring helpers for the buildusd pipeline.
+"""USD authoring helpers for the buildusd pipeline.
 
 The functions below consume the prototype/instance caches produced by
 ``process_ifc`` and emit the various USD layers (prototypes, materials,
@@ -10,25 +10,48 @@ the new iterator-driven workflow.
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
-from textwrap import dedent
 from contextlib import nullcontext
 import fnmatch
 import hashlib
 import json
 import re
 import logging
+import os
 import weakref
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 
 from .pxr_utils import Gf, Sdf, Usd, UsdGeom, UsdShade, Vt
 
 from .config.manifest import BasePointConfig, GeodeticCoordinate
-from .io_utils import join_path, path_stem, write_text, is_omniverse_path, stat_entry
-from .process_ifc import ConversionOptions, CurveWidthRule, InstanceRecord, PrototypeCaches, PrototypeKey
+from .io_utils import join_path, path_stem, write_text, is_omniverse_path
+from .geospatial import (
+    resolve_geospatial_mode,
+    ensure_geospatial_root,
+    _geospatial_root_paths,
+    _author_wgs84_reference_attrs_on_prim,
+)
+from .process_ifc import (
+    ConversionOptions,
+    CurveWidthRule,
+    InstanceRecord,
+    PrototypeCaches,
+    PrototypeKey,
+)
 from .utils.matrix_utils import np_to_gf_matrix, scale_matrix_translation_only
 
 try:
@@ -58,6 +81,7 @@ LOG = logging.getLogger(__name__)
 
 try:
     from pyproj import CRS, Transformer
+
     _HAVE_PYPROJ = True
     _TRANSFORMER_CACHE: Dict[Tuple[str, str], Transformer] = {}
 except Exception:  # pragma: no cover - optional dependency
@@ -71,7 +95,9 @@ def _unit_factor(unit: Optional[str]) -> float:
     return _UNIT_FACTORS.get(str(unit).strip().lower(), 1.0)
 
 
-def _base_point_components_in_meters(bp: BasePointConfig) -> Tuple[float, float, float, str]:
+def _base_point_components_in_meters(
+    bp: BasePointConfig,
+) -> Tuple[float, float, float, str]:
     unit = bp.unit or "m"
     factor = _unit_factor(unit)
     easting = float(bp.easting) * factor
@@ -80,7 +106,9 @@ def _base_point_components_in_meters(bp: BasePointConfig) -> Tuple[float, float,
     return easting, northing, height, unit
 
 
-def _derive_lonlat_from_base_point(bp: BasePointConfig, projected_crs: Optional[str]) -> Optional[GeodeticCoordinate]:
+def _derive_lonlat_from_base_point(
+    bp: BasePointConfig, projected_crs: Optional[str]
+) -> Optional[GeodeticCoordinate]:
     if not _HAVE_PYPROJ:
         return None
     source_crs = bp.epsg or projected_crs
@@ -96,12 +124,16 @@ def _derive_lonlat_from_base_point(bp: BasePointConfig, projected_crs: Optional[
             _TRANSFORMER_CACHE[key] = transformer
         easting_m, northing_m, height_m, _ = _base_point_components_in_meters(bp)
         longitude, latitude = transformer.transform(easting_m, northing_m)
-        return GeodeticCoordinate(longitude=float(longitude), latitude=float(latitude), height=float(height_m))
+        return GeodeticCoordinate(
+            longitude=float(longitude), latitude=float(latitude), height=float(height_m)
+        )
     except Exception as exc:  # pragma: no cover - logging only
         LOG.debug("Unable to derive lon/lat for CRS %s: %s", source_crs, exc)
         return None
 
+
 # ---------------- Name helpers ----------------
+
 
 def sanitize_name(raw_name, fallback=None):
     """Make a USD-legal prim name (deterministic; no time-based suffix)."""
@@ -118,7 +150,10 @@ def sanitize_name(raw_name, fallback=None):
         name = "_" + name
     return name[:63]
 
-def _sanitize_identifier(raw_name: Optional[str], fallback: Optional[str] = None) -> str:
+
+def _sanitize_identifier(
+    raw_name: Optional[str], fallback: Optional[str] = None
+) -> str:
     """Return a USD-safe token useful for attribute or namespace names."""
     base = str(raw_name or fallback or "Unnamed")
     name = re.sub(r"[^A-Za-z0-9_]", "_", base)
@@ -139,14 +174,18 @@ def _unique_name(base: str, used: Dict[str, int]) -> str:
     return f"{base}_{count}"
 
 
-def _author_namespaced_dictionary_attributes(prim: Usd.Prim, namespace: str, entries: Dict[str, Any]) -> None:
+def _author_namespaced_dictionary_attributes(
+    prim: Usd.Prim, namespace: str, entries: Dict[str, Any]
+) -> None:
     """Write IFC property dictionaries into BIMData:* USD attributes."""
     if not entries:
         return
 
     root_ns = "BIMData"
     ns_map = {"pset": "Psets", "qtos": "QTO", "qto": "QTO"}
-    ns1 = ns_map.get(namespace.lower(), _sanitize_identifier(namespace, fallback="Meta"))
+    ns1 = ns_map.get(
+        namespace.lower(), _sanitize_identifier(namespace, fallback="Meta")
+    )
 
     def _set_attr(full_name: str, value: Any) -> None:
         if isinstance(value, bool):
@@ -201,7 +240,9 @@ def _author_namespaced_dictionary_attributes(prim: Usd.Prim, namespace: str, ent
             _set_attr(full_attr, payload)
 
 
-def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, Any]]) -> None:
+def _author_instance_attributes(
+    prim: Usd.Prim, attributes: Optional[Dict[str, Any]]
+) -> None:
     if not attributes or not isinstance(attributes, dict):
         return
     psets = attributes.get("psets", {})
@@ -211,6 +252,7 @@ def _author_instance_attributes(prim: Usd.Prim, attributes: Optional[Dict[str, A
 
 
 # ---------------- PreparedInstance (used by grouping/variants) ----------------
+
 
 @dataclass
 class PreparedInstance:
@@ -231,6 +273,7 @@ class PreparedInstance:
 
 
 # ---------------- Stage helpers ----------------
+
 
 def create_usd_stage(usd_path, meters_per_unit=1.0):
     """Create a new USD stage with Z-up and a `/World` default prim."""
@@ -271,67 +314,67 @@ def _reindex_for_uv_seams(
     """Duplicate vertices at UV seams using vectorized operations."""
     # Combine vertex index and UV coordinates into a unique key for each corner
     # We use a structured array or lexsort to find unique combinations
-    
+
     # Create a composite key array: (original_index, u, v)
     # We need to ensure float UVs are handled correctly (precision issues might occur, but typically exact match is needed for seams)
-    
+
     # Stack data to form rows of [original_index, u, v]
     # original_index is int, u,v are floats. We can view all as float64 or similar for sorting if indices fit.
     # Safer to use structured array or lexsort.
-    
+
     # Let's use lexsort.
     # keys: v, u, original_index
     u = uv_per_corner[:, 0]
     v = uv_per_corner[:, 1]
     orig_idx = face_vertex_indices
-    
+
     # Lexsort keys (last key is primary)
     # We want to group by (orig_idx, u, v)
     # So we sort by v, then u, then orig_idx
     sort_order = np.lexsort((v, u, orig_idx))
-    
+
     # Apply sort
     sorted_orig_idx = orig_idx[sort_order]
     sorted_u = u[sort_order]
     sorted_v = v[sort_order]
-    
+
     # Find unique changes
     # A row is different if any of orig_idx, u, v changed
     diff_orig = np.diff(sorted_orig_idx) != 0
     diff_u = np.diff(sorted_u) != 0
     diff_v = np.diff(sorted_v) != 0
-    
+
     # Combine diffs (boolean OR)
     diff_mask = diff_orig | diff_u | diff_v
-    
+
     # Prepend True for the first element
     unique_mask = np.concatenate(([True], diff_mask))
-    
+
     # These are the unique vertices we need to create
     # The number of unique vertices is the sum of unique_mask
     num_unique = np.sum(unique_mask)
-    
+
     # We need to map from the sorted position to the new unique index
     # cumsum of unique_mask gives the new index for each sorted entry (0-based if we subtract 1)
     new_indices_sorted = np.cumsum(unique_mask) - 1
-    
+
     # Now we need to map back to the original order
     # We can create an array that maps 'sort_order' back to original positions
     # Or simply scatter 'new_indices_sorted' back to their original positions
     new_indices = np.empty_like(face_vertex_indices)
     new_indices[sort_order] = new_indices_sorted
-    
+
     # Extract the unique data to form the new vertex arrays
     # We can just take the values at the unique positions in the sorted arrays
     unique_orig_indices = sorted_orig_idx[unique_mask]
     unique_uvs = np.column_stack((sorted_u[unique_mask], sorted_v[unique_mask]))
-    
+
     new_points = points[unique_orig_indices]
-    
+
     new_normals = None
     if normals is not None:
         new_normals = normals[unique_orig_indices]
-        
+
     return new_points, new_normals, new_indices, unique_uvs
 
 
@@ -353,7 +396,9 @@ def _material_name_from_entry(entry: Any) -> Optional[str]:
     return None
 
 
-def _material_name_for_index(index: int, materials: Optional[Sequence[Any]]) -> Optional[str]:
+def _material_name_for_index(
+    index: int, materials: Optional[Sequence[Any]]
+) -> Optional[str]:
     if materials is None:
         return None
     entry: Any = None
@@ -387,7 +432,9 @@ def _material_name_from_style_entry(
     return fallback
 
 
-def _material_identifier_for_index(index: int, materials: Optional[Sequence[Any]]) -> Any:
+def _material_identifier_for_index(
+    index: int, materials: Optional[Sequence[Any]]
+) -> Any:
     if not materials:
         return index
     try:
@@ -476,7 +523,9 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 normals_values = normals_np
                 normals_interp = UsdGeom.Tokens.vertex
         except Exception:
-            LOG.debug("Unable to process normals; continuing without them.", exc_info=True)
+            LOG.debug(
+                "Unable to process normals; continuing without them.", exc_info=True
+            )
 
     def _first_available(*names: str) -> Optional[Any]:
         for name in names:
@@ -485,7 +534,9 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
         return None
 
     uv_values = _first_available("uvs", "uv_coords", "uvcoordinates", "uv", "texcoords")
-    uv_indices = _first_available("uv_indices", "uv_index", "uvs_indices", "uvfaces", "uv_faces")
+    uv_indices = _first_available(
+        "uv_indices", "uv_index", "uvs_indices", "uvfaces", "uv_faces"
+    )
     st_values: Optional[np.ndarray] = None
     st_interp: Optional[str] = None
 
@@ -511,7 +562,9 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     st_interp = UsdGeom.Tokens.vertex
 
             if uv_per_corner is not None:
-                normals_for_reindex = normals_values if normals_interp == UsdGeom.Tokens.vertex else None
+                normals_for_reindex = (
+                    normals_values if normals_interp == UsdGeom.Tokens.vertex else None
+                )
                 new_points, new_normals, new_indices, new_st = _reindex_for_uv_seams(
                     points, normals_for_reindex, face_vertex_indices, uv_per_corner
                 )
@@ -524,7 +577,10 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     normals_values = new_normals
                     normals_interp = UsdGeom.Tokens.vertex
         except Exception:
-            LOG.debug("Unable to process UV data; continuing without primvars:st.", exc_info=True)
+            LOG.debug(
+                "Unable to process UV data; continuing without primvars:st.",
+                exc_info=True,
+            )
 
     return {
         "points": points,
@@ -537,7 +593,9 @@ def _prepare_mesh_payload(mesh_data: Dict[str, Any]) -> Optional[Dict[str, Any]]
     }
 
 
-def _collect_material_subsets(imageable: UsdGeom.Imageable, family_name: str) -> List[UsdGeom.Subset]:
+def _collect_material_subsets(
+    imageable: UsdGeom.Imageable, family_name: str
+) -> List[UsdGeom.Subset]:
     # Prefer the filtered API when available (USD 24/25)
     try:
         subsets = UsdGeom.Subset.GetGeomSubsets(
@@ -601,7 +659,9 @@ def _compute_face_components(
     return faces, adjacency
 
 
-def _face_area_and_normal(points: Sequence[Tuple[float, float, float]], face_vertices: Sequence[int]) -> Tuple[float, Tuple[float, float, float]]:
+def _face_area_and_normal(
+    points: Sequence[Tuple[float, float, float]], face_vertices: Sequence[int]
+) -> Tuple[float, Tuple[float, float, float]]:
     """Return (area, normal) for a polygon (fan triangulation)."""
     count = len(face_vertices)
     if count < 3:
@@ -723,20 +783,26 @@ def _color_brightness(color: Optional[Tuple[float, float, float]]) -> float:
         return 0.0
     return (r + g + b) / 3.0
 
+
 # ---------- NEW helpers: robust per-component banding & centroids ----------
-def _face_centroid(points: Sequence[Tuple[float,float,float]], face_vertices: Sequence[int]) -> Tuple[float,float,float]:
+def _face_centroid(
+    points: Sequence[Tuple[float, float, float]], face_vertices: Sequence[int]
+) -> Tuple[float, float, float]:
     if not face_vertices:
-        return (0.0,0.0,0.0)
+        return (0.0, 0.0, 0.0)
     xs = ys = zs = 0.0
     n = float(len(face_vertices))
     for v in face_vertices:
-        x,y,z = points[v]
-        xs += float(x); ys += float(y); zs += float(z)
-    return (xs/n, ys/n, zs/n)
+        x, y, z = points[v]
+        xs += float(x)
+        ys += float(y)
+        zs += float(z)
+    return (xs / n, ys / n, zs / n)
+
 
 def _local_z_bands(
-    points: Sequence[Tuple[float,float,float]],
-    faces: Sequence[Tuple[int,...]],
+    points: Sequence[Tuple[float, float, float]],
+    faces: Sequence[Tuple[int, ...]],
     comp_min_z: float,
     comp_max_z: float,
     top_frac: float = 0.18,
@@ -787,7 +853,11 @@ def _resolve_component_styles(
             token = style_tokens.get(key)
             if not token:
                 continue
-            faces = [int(idx) for idx in (entry.get("faces") or []) if 0 <= int(idx) < face_count]
+            faces = [
+                int(idx)
+                for idx in (entry.get("faces") or [])
+                if 0 <= int(idx) < face_count
+            ]
             if faces:
                 result[token] = faces
         return result, {}, {}
@@ -807,7 +877,11 @@ def _resolve_component_styles(
     )
     high_saturation_threshold = 0.18
     primary_high_saturation_token = next(
-        (token for token, sat in sorted_styles_by_saturation if sat >= high_saturation_threshold),
+        (
+            token
+            for token, sat in sorted_styles_by_saturation
+            if sat >= high_saturation_threshold
+        ),
         None,
     )
     neutral_style_token = (
@@ -851,7 +925,9 @@ def _resolve_component_styles(
 
     material_color_cache: Dict[int, Optional[Tuple[float, float, float]]] = {}
 
-    def _material_color_for_id(material_id: int) -> Optional[Tuple[float, float, float]]:
+    def _material_color_for_id(
+        material_id: int,
+    ) -> Optional[Tuple[float, float, float]]:
         if material_id in material_color_cache:
             return material_color_cache[material_id]
         color: Optional[Tuple[float, float, float]] = None
@@ -872,7 +948,9 @@ def _resolve_component_styles(
         material_color_cache[material_id] = color
         return color
 
-    face_vertices, adjacency = _compute_face_components(face_vertex_counts, face_vertex_indices)
+    face_vertices, adjacency = _compute_face_components(
+        face_vertex_counts, face_vertex_indices
+    )
     face_geometry = _prepare_face_geometry(points, face_vertices)
     face_normals = face_geometry.normals
     face_centroids = face_geometry.centroids
@@ -1016,16 +1094,21 @@ def _resolve_component_styles(
         if centroid_weight > 0.0:
             centroid = centroid_sum / centroid_weight
         elif faces_in_component:
-            centroid = np.asarray(face_centroids[faces_in_component[0]], dtype=np.float64)
+            centroid = np.asarray(
+                face_centroids[faces_in_component[0]], dtype=np.float64
+            )
         else:
             centroid = np.zeros(3, dtype=np.float64)
 
         normal_variation = 0.0
         if face_metrics and area > 0.0 and np.linalg.norm(normal_acc) > 0.0:
-            normal_variation = sum(
-                face_area * (1.0 - float(abs(np.dot(normal_acc, face_normal))))
-                for face_area, face_normal in face_metrics
-            ) / area
+            normal_variation = (
+                sum(
+                    face_area * (1.0 - float(abs(np.dot(normal_acc, face_normal))))
+                    for face_area, face_normal in face_metrics
+                )
+                / area
+            )
 
         orientation_abs = (
             float(abs(normal_acc[0])),
@@ -1035,7 +1118,9 @@ def _resolve_component_styles(
 
         dominant_style_token = None
         if style_presence:
-            dominant_style_token = max(style_presence.items(), key=lambda item: item[1])[0]
+            dominant_style_token = max(
+                style_presence.items(), key=lambda item: item[1]
+            )[0]
 
         components.append(
             {
@@ -1079,7 +1164,9 @@ def _resolve_component_styles(
             if base_color is None:
                 # Without a base color fall back to the first style encountered.
                 return token if best_token is None else best_token
-            dist = sum((float(a) - float(b)) ** 2 for a, b in zip(style_color, base_color))
+            dist = sum(
+                (float(a) - float(b)) ** 2 for a, b in zip(style_color, base_color)
+            )
             if dist < best_distance:
                 best_distance = dist
                 best_token = token
@@ -1101,11 +1188,11 @@ def _resolve_component_styles(
     min_override_area = 2.0
     panel_area_threshold = 2.5
     trim_mid_threshold = 0.25
-    handle_length_threshold = 0.4         # meters - min long edge of a handle bar
-    handle_thickness_threshold = 0.06     # meters - thin section
+    handle_length_threshold = 0.4  # meters - min long edge of a handle bar
+    handle_thickness_threshold = 0.06  # meters - thin section
     handle_mid_threshold = 0.15
     handle_area_threshold = 0.6
-    handle_aspect_threshold = 8.0         # very elongated
+    handle_aspect_threshold = 8.0  # very elongated
     roof_brightness_threshold = 0.35
     front_panel_area_threshold = panel_area_threshold
     front_panel_normal_variation_threshold = 0.25
@@ -1143,8 +1230,12 @@ def _resolve_component_styles(
             detail = face_details.get(face_idx)
             if detail:
                 face_area = float(detail.get("area", 0.0))
-                normal_vec_np = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
-                tri_centroid = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
+                normal_vec_np = np.asarray(
+                    detail.get("normal", np.zeros(3)), dtype=np.float64
+                )
+                tri_centroid = np.asarray(
+                    detail.get("centroid", np.zeros(3)), dtype=np.float64
+                )
             else:
                 face_area = float(face_areas[face_idx])
                 normal_vec_np = np.asarray(face_normals[face_idx], dtype=np.float64)
@@ -1191,10 +1282,13 @@ def _resolve_component_styles(
         normal_variation = 0.0
         if face_metrics and normal_len > 0.0:
             unit_normal = normal_acc / normal_len
-            normal_variation = sum(
-                face_area * (1.0 - float(abs(np.dot(unit_normal, face_normal))))
-                for face_area, face_normal in face_metrics
-            ) / area
+            normal_variation = (
+                sum(
+                    face_area * (1.0 - float(abs(np.dot(unit_normal, face_normal))))
+                    for face_area, face_normal in face_metrics
+                )
+                / area
+            )
 
         bounds_min_t = tuple(float(v) for v in bounds_min)
         bounds_max_t = tuple(float(v) for v in bounds_max)
@@ -1249,8 +1343,12 @@ def _resolve_component_styles(
             detail = face_details.get(face_idx)
             if detail:
                 area = float(detail.get("area", 0.0))
-                normal_vec = np.asarray(detail.get("normal", np.zeros(3)), dtype=np.float64)
-                centroid_vec = np.asarray(detail.get("centroid", np.zeros(3)), dtype=np.float64)
+                normal_vec = np.asarray(
+                    detail.get("normal", np.zeros(3)), dtype=np.float64
+                )
+                centroid_vec = np.asarray(
+                    detail.get("centroid", np.zeros(3)), dtype=np.float64
+                )
             else:
                 area = float(face_areas[face_idx])
                 normal_vec = np.asarray(face_normals[face_idx], dtype=np.float64)
@@ -1263,7 +1361,11 @@ def _resolve_component_styles(
             axis_label = ("X", "Y", "Z")[axis]
             sign_positive = normal_vec[axis] >= 0.0
             span = extents[axis]
-            rel = 0.5 if span <= 1e-6 else (centroid_vec[axis] - bounds_min[axis]) / max(span, 1e-6)
+            rel = (
+                0.5
+                if span <= 1e-6
+                else (centroid_vec[axis] - bounds_min[axis]) / max(span, 1e-6)
+            )
             near_min = rel <= edge_tol
             near_max = rel >= (1.0 - edge_tol)
 
@@ -1301,7 +1403,12 @@ def _resolve_component_styles(
     for component in components:
         bounds_min = component.get("bounds_min")
         bounds_max = component.get("bounds_max")
-        if not bounds_min or not bounds_max or len(bounds_min) < 3 or len(bounds_max) < 3:
+        if (
+            not bounds_min
+            or not bounds_max
+            or len(bounds_min) < 3
+            or len(bounds_max) < 3
+        ):
             continue
         try:
             global_min_z = min(global_min_z, float(bounds_min[2]))
@@ -1343,7 +1450,7 @@ def _resolve_component_styles(
         if sat < neutral_sat:
             neutral_sat, neutral_token = sat, tkn
     # thresholds
-    PANEL_SAT = 0.18      # what we consider panel-like colour
+    PANEL_SAT = 0.18  # what we consider panel-like colour
     FRONT_MAJ_COV = 0.45  # min coverage hint to prefer panel on fronts
 
     for component in components:
@@ -1381,7 +1488,11 @@ def _resolve_component_styles(
         min_z = float(bounds_min[2]) if len(bounds_min) >= 3 else 0.0
         max_z = float(bounds_max[2]) if len(bounds_max) >= 3 else 0.0
         local_height = max(1e-6, max_z - min_z)
-        centroid_z = float(component.get("centroid", (0.0, 0.0, 0.0))[2]) if len(component.get("centroid", (0.0, 0.0, 0.0))) >= 3 else (min_z + max_z) * 0.5
+        centroid_z = (
+            float(component.get("centroid", (0.0, 0.0, 0.0))[2])
+            if len(component.get("centroid", (0.0, 0.0, 0.0))) >= 3
+            else (min_z + max_z) * 0.5
+        )
         rel_local = (centroid_z - min_z) / local_height
         near_top = False
         near_bottom = False
@@ -1404,7 +1515,11 @@ def _resolve_component_styles(
         )
 
         axis_tag = direction_label.split("_")[1] if "_" in direction_label else ""
-        is_vertical_direction = direction_label.startswith("POS_") or direction_label.startswith("NEG_") or direction_label.startswith("VERT_")
+        is_vertical_direction = (
+            direction_label.startswith("POS_")
+            or direction_label.startswith("NEG_")
+            or direction_label.startswith("VERT_")
+        )
         is_horizontal_direction = direction_label in ("TOP", "BOTTOM", "HORIZONTAL", "")
 
         # ---------- HANDLE RULE (aspect ratio + small area) ----------
@@ -1414,7 +1529,12 @@ def _resolve_component_styles(
             and (is_vertical or abs_normal_z <= 0.3)
         )
         if is_handle_component:
-            handle_token = preferred_token or aluminium_style_token or neutral_token or chosen_token
+            handle_token = (
+                preferred_token
+                or aluminium_style_token
+                or neutral_token
+                or chosen_token
+            )
             if handle_token:
                 chosen_token = handle_token
                 _assign_faces(chosen_token, faces_in_component)
@@ -1441,21 +1561,14 @@ def _resolve_component_styles(
         )
 
         auto_panel_applied = False
-        is_roof_panel = (
-            (direction_label == "TOP")
-            or (
-                is_horizontal_direction
-                and component["area"] >= horizontal_area_threshold
-                and (near_top or is_top_band)
-                and material_brightness >= roof_brightness_threshold
-            )
+        is_roof_panel = (direction_label == "TOP") or (
+            is_horizontal_direction
+            and component["area"] >= horizontal_area_threshold
+            and (near_top or is_top_band)
+            and material_brightness >= roof_brightness_threshold
         )
-        is_front_panel = (
-            (is_vertical_direction and axis_tag in ("X", "Y"))
-            or (
-                is_vertical
-                and (orientation_abs[0] >= 0.6 or orientation_abs[1] >= 0.6)
-            )
+        is_front_panel = (is_vertical_direction and axis_tag in ("X", "Y")) or (
+            is_vertical and (orientation_abs[0] >= 0.6 or orientation_abs[1] >= 0.6)
         )
         is_front_panel = (
             is_front_panel
@@ -1494,7 +1607,11 @@ def _resolve_component_styles(
             chosen_token
             and material_color is not None
             and chosen_color is not None
-            and sum((float(material_color[i]) - float(chosen_color[i])) ** 2 for i in range(3)) < color_match_threshold
+            and sum(
+                (float(material_color[i]) - float(chosen_color[i])) ** 2
+                for i in range(3)
+            )
+            < color_match_threshold
             and _color_saturation(chosen_color) > saturation_threshold
         )
         component["color_match"] = color_match_value
@@ -1507,7 +1624,11 @@ def _resolve_component_styles(
         color_match = component.get("color_match", False)
 
         # Prefer explicit style on component if good coverage; else apply heuristics
-        if chosen_token is None and style_coverage >= 0.50 and component.get("style_token"):
+        if (
+            chosen_token is None
+            and style_coverage >= 0.50
+            and component.get("style_token")
+        ):
             chosen_token = component["style_token"]
             chosen_from_style = True
 
@@ -1534,9 +1655,13 @@ def _resolve_component_styles(
             auto_panel_applied = True
 
         # --- FINAL VETO: never leave bottom-band/trim/very-thin painted as a coloured panel ---
-        if (near_bottom or is_bottom_band or is_bottom_trim or thin_trim) and chosen_token:
+        if (
+            near_bottom or is_bottom_band or is_bottom_trim or thin_trim
+        ) and chosen_token:
             if _color_saturation(style_color_map.get(chosen_token)) >= PANEL_SAT:
-                chosen_token = neutral_token or component.get("style_token") or chosen_token
+                chosen_token = (
+                    neutral_token or component.get("style_token") or chosen_token
+                )
 
         if (direction_label == "TOP" or is_top_band) and roof_candidate:
             if chosen_token is None or chosen_token == neutral_token:
@@ -1571,8 +1696,13 @@ def _resolve_component_styles(
                 candidate_token = chosen_token
                 candidate_score = 0.0
                 neighbor_area_threshold = 1.0
-                for neighbor_token, neighbor_count in component["neighbor_styles"].items():
-                    if style_area_map.get(neighbor_token, 0.0) < neighbor_area_threshold:
+                for neighbor_token, neighbor_count in component[
+                    "neighbor_styles"
+                ].items():
+                    if (
+                        style_area_map.get(neighbor_token, 0.0)
+                        < neighbor_area_threshold
+                    ):
                         continue
                     neighbor_color = style_color_map.get(neighbor_token)
                     neighbor_sat = _color_saturation(neighbor_color)
@@ -1581,7 +1711,9 @@ def _resolve_component_styles(
                     if component_normal is not None:
                         neighbor_normal = style_normals.get(neighbor_token)
                         if neighbor_normal is not None:
-                            orientation = float(np.dot(component_normal, neighbor_normal))
+                            orientation = float(
+                                np.dot(component_normal, neighbor_normal)
+                            )
                             if abs(orientation) < 0.4:
                                 continue
                     score = neighbor_sat * float(neighbor_count)
@@ -1607,8 +1739,10 @@ def _resolve_component_styles(
                             orientation = float(np.dot(component_normal, token_normal))
                             if abs(orientation) < 0.6:
                                 if (
-                                    style_area_map.get(token, 0.0) >= orientation_override_area
-                                    and token_sat - chosen_sat > orientation_override_sat
+                                    style_area_map.get(token, 0.0)
+                                    >= orientation_override_area
+                                    and token_sat - chosen_sat
+                                    > orientation_override_sat
                                 ):
                                     orientation_ok = True
                                 else:
@@ -1628,7 +1762,10 @@ def _resolve_component_styles(
             color_match = bool(
                 material_color is not None
                 and chosen_color is not None
-                and sum((float(material_color[i]) - float(chosen_color[i])) ** 2 for i in range(3))
+                and sum(
+                    (float(material_color[i]) - float(chosen_color[i])) ** 2
+                    for i in range(3)
+                )
                 < color_match_threshold
                 and _color_saturation(chosen_color) > saturation_threshold
             )
@@ -1679,9 +1816,16 @@ def _resolve_component_styles(
 
     for token, counter in direction_counters.items():
         if counter:
-            cluster_direction_map[token] = _sanitize_direction_label(counter.most_common(1)[0][0])
+            cluster_direction_map[token] = _sanitize_direction_label(
+                counter.most_common(1)[0][0]
+            )
 
-    if cluster_styles and points is not None and face_vertices is not None and len(mapping) > 1:
+    if (
+        cluster_styles
+        and points is not None
+        and face_vertices is not None
+        and len(mapping) > 1
+    ):
         face_set_adjacency = adjacency
 
         def _cluster_faces_by_plane(face_list: List[int]) -> List[List[int]]:
@@ -1723,7 +1867,10 @@ def _resolve_component_styles(
                     placed = False
                     for entry in planes:
                         ref_n, ref_d, lst = entry
-                        if abs(np.dot(ref_n, n)) >= N_DOT_TOL and abs(ref_d - d) <= PLANE_D_TOL:
+                        if (
+                            abs(np.dot(ref_n, n)) >= N_DOT_TOL
+                            and abs(ref_d - d) <= PLANE_D_TOL
+                        ):
                             lst.append(fid)
                             placed = True
                             break
@@ -1783,7 +1930,9 @@ def _ensure_material_subsets(
         stage.RemovePrim(subset.GetPrim().GetPath())
 
     try:
-        UsdGeom.Subset.SetFamilyType(imageable, family_name, UsdGeom.Tokens.nonOverlapping)
+        UsdGeom.Subset.SetFamilyType(
+            imageable, family_name, UsdGeom.Tokens.nonOverlapping
+        )
     except Exception:
         pass
 
@@ -1819,7 +1968,9 @@ def _ensure_material_subsets(
                 try:
                     subset.CreateElementTypeAttr().Set(element_token)
                 except AttributeError:
-                    subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+                    subset.GetPrim().CreateAttribute(
+                        "elementType", Sdf.ValueTypeNames.Token
+                    ).Set(str(element_token))
             indices_attr = subset.GetIndicesAttr()
             if not indices_attr:
                 indices_attr = subset.CreateIndicesAttr()
@@ -1827,18 +1978,34 @@ def _ensure_material_subsets(
             prim = subset.GetPrim()
             material_name = _material_name_from_style_entry(entry, fallback=str(key))
             _set_subset_material_name(prim, material_name)
-            prim.CreateAttribute("ifc:sourceStyleKey", Sdf.ValueTypeNames.String).Set(str(key))
-            prim.CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(subset_token)
+            prim.CreateAttribute("ifc:sourceStyleKey", Sdf.ValueTypeNames.String).Set(
+                str(key)
+            )
+            prim.CreateAttribute("ifc:sourceStyleToken", Sdf.ValueTypeNames.String).Set(
+                subset_token
+            )
             if material_ids:
-                mids = sorted({int(material_ids[i]) for i in valid_faces if 0 <= int(i) < face_count})
+                mids = sorted(
+                    {
+                        int(material_ids[i])
+                        for i in valid_faces
+                        if 0 <= int(i) < face_count
+                    }
+                )
                 if len(mids) == 1:
-                    prim.CreateAttribute("ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int).Set(mids[0])
+                    prim.CreateAttribute(
+                        "ifc:baseMaterialIndex", Sdf.ValueTypeNames.Int
+                    ).Set(mids[0])
                 elif mids:
-                    prim.CreateAttribute("ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray).Set(Vt.IntArray(mids))
+                    prim.CreateAttribute(
+                        "ifc:baseMaterialIndices", Sdf.ValueTypeNames.IntArray
+                    ).Set(Vt.IntArray(mids))
             try:
                 subset.CreateFamilyNameAttr().Set(family_name)
             except Exception:
-                subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+                subset.GetPrim().CreateAttribute(
+                    "familyName", Sdf.ValueTypeNames.String
+                ).Set(family_name)
             created_subsets = True
             stats.append((str(subset_path), len(valid_faces)))
             for face_int in valid_faces:
@@ -1858,7 +2025,9 @@ def _ensure_material_subsets(
         for material_index, face_indices in sorted(indices_by_material.items()):
             if not face_indices:
                 continue
-            subset_token = _subset_token_for_material(_material_identifier_for_index(material_index, materials))
+            subset_token = _subset_token_for_material(
+                _material_identifier_for_index(material_index, materials)
+            )
             subset_path = mesh.GetPath().AppendChild(subset_token)
             subset = UsdGeom.Subset.Define(stage, subset_path)
             try:
@@ -1867,7 +2036,9 @@ def _ensure_material_subsets(
                 try:
                     subset.CreateElementTypeAttr().Set(element_token)
                 except AttributeError:
-                    subset.GetPrim().CreateAttribute("elementType", Sdf.ValueTypeNames.Token).Set(str(element_token))
+                    subset.GetPrim().CreateAttribute(
+                        "elementType", Sdf.ValueTypeNames.Token
+                    ).Set(str(element_token))
             indices_attr = subset.GetIndicesAttr()
             if not indices_attr:
                 indices_attr = subset.CreateIndicesAttr()
@@ -1876,11 +2047,15 @@ def _ensure_material_subsets(
             subset_prim = subset.GetPrim()
             material_name = _material_name_for_index(material_index, materials)
             _set_subset_material_name(subset_prim, material_name)
-            subset_prim.CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int).Set(int(material_index))
+            subset_prim.CreateAttribute(
+                "ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int
+            ).Set(int(material_index))
             try:
                 subset.CreateFamilyNameAttr().Set(family_name)
             except Exception:
-                subset.GetPrim().CreateAttribute("familyName", Sdf.ValueTypeNames.String).Set(family_name)
+                subset.GetPrim().CreateAttribute(
+                    "familyName", Sdf.ValueTypeNames.String
+                ).Set(family_name)
             created_subsets = True
             stats.append((str(subset_path), len(face_indices)))
 
@@ -1899,9 +2074,18 @@ def _ensure_material_subsets(
     return created_subsets
 
 
-def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
-                   material_ids=None, style_groups=None, materials=None, stage_meters_per_unit=1.0,
-                   scale_matrix_translation=False):
+def write_usd_mesh(
+    stage,
+    parent_path,
+    mesh_name,
+    mesh_data,
+    abs_mat=None,
+    material_ids=None,
+    style_groups=None,
+    materials=None,
+    stage_meters_per_unit=1.0,
+    scale_matrix_translation=False,
+):
     """Author a Mesh prim beneath ``parent_path`` with the supplied data."""
     mesh_path = Sdf.Path(parent_path).AppendChild(mesh_name)
     mesh = UsdGeom.Mesh.Define(stage, mesh_path)
@@ -1926,8 +2110,12 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
         points_attr[i] = Gf.Vec3f(float(x), float(y), float(z))
     mesh.CreatePointsAttr(points_attr)
 
-    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray([int(i) for i in payload["face_vertex_indices"]]))
-    mesh.CreateFaceVertexCountsAttr(Vt.IntArray([int(c) for c in payload["face_vertex_counts"]]))
+    mesh.CreateFaceVertexIndicesAttr(
+        Vt.IntArray([int(i) for i in payload["face_vertex_indices"]])
+    )
+    mesh.CreateFaceVertexCountsAttr(
+        Vt.IntArray([int(c) for c in payload["face_vertex_counts"]])
+    )
 
     normals_values = payload.get("normals")
     if normals_values:
@@ -1946,7 +2134,9 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
         for i, (u, v) in enumerate(st_values):
             st_attr[i] = (float(u), float(v))
         primvars_api = UsdGeom.PrimvarsAPI(mesh)
-        st_primvar = primvars_api.CreatePrimvar("st", st_interp, Sdf.ValueTypeNames.TexCoord2fArray)
+        st_primvar = primvars_api.CreatePrimvar(
+            "st", st_interp, Sdf.ValueTypeNames.TexCoord2fArray
+        )
         st_primvar.Set(st_attr)
 
     if abs_mat is not None:
@@ -1969,7 +2159,9 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
 
     if material_ids:
         mat_attr = Vt.IntArray([int(i) for i in material_ids])
-        mesh.GetPrim().CreateAttribute("ifc:materialIds", Sdf.ValueTypeNames.IntArray).Set(mat_attr)
+        mesh.GetPrim().CreateAttribute(
+            "ifc:materialIds", Sdf.ValueTypeNames.IntArray
+        ).Set(mat_attr)
         subsets_use_styles = _ensure_material_subsets(
             mesh,
             list(mat_attr),
@@ -2007,7 +2199,9 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
                 material = entry.get("material")
                 if not faces or len(faces) != face_count:
                     continue
-                display = getattr(material, "base_color", None) or getattr(material, "display_color", None)
+                display = getattr(material, "base_color", None) or getattr(
+                    material, "display_color", None
+                )
                 if not display and isinstance(material, dict):
                     display = (
                         material.get("diffuseColor")
@@ -2018,7 +2212,11 @@ def write_usd_mesh(stage, parent_path, mesh_name, mesh_data, abs_mat=None,
                     )
                 if not display:
                     continue
-                display_values = display[:3] if hasattr(display, "__getitem__") else (display, display, display)
+                display_values = (
+                    display[:3]
+                    if hasattr(display, "__getitem__")
+                    else (display, display, display)
+                )
                 display_tuple = tuple(float(c) for c in display_values)
                 color = Vt.Vec3fArray([Gf.Vec3f(*_normalize_color(display_tuple))])
                 UsdGeom.Gprim(mesh.GetPrim()).CreateDisplayColorAttr().Set(color)
@@ -2042,11 +2240,19 @@ def _author_occ_detail_meshes(
     faces = getattr(detail_mesh, "faces", None) or []
     if not subshapes and faces:
         subshapes = [
-            {"index": idx, "label": f"Face_{idx}", "shape_type": "FACE", "faces": [face]}
+            {
+                "index": idx,
+                "label": f"Face_{idx}",
+                "shape_type": "FACE",
+                "faces": [face],
+            }
             for idx, face in enumerate(faces)
         ]
     if not subshapes:
-        LOG.debug("Detail mesh authoring skipped: no subshapes or faces found for %s", detail_root_path)
+        LOG.debug(
+            "Detail mesh authoring skipped: no subshapes or faces found for %s",
+            detail_root_path,
+        )
         return []
 
     detail_root = UsdGeom.Xform.Define(stage, detail_root_path)
@@ -2070,7 +2276,9 @@ def _author_occ_detail_meshes(
         except Exception:
             composed_abs = abs_mat
 
-    def _combine_faces(face_entries: List[Any]) -> Tuple[Optional[Dict[str, Any]], List[Any]]:
+    def _combine_faces(
+        face_entries: List[Any],
+    ) -> Tuple[Optional[Dict[str, Any]], List[Any]]:
         verts_list: List[np.ndarray] = []
         faces_list: List[np.ndarray] = []
         offset = 0
@@ -2109,7 +2317,10 @@ def _author_occ_detail_meshes(
                 getattr(entry, "label", "<unnamed>"),
             )
             continue
-        label = getattr(entry, "label", None) or f"Subshape_{getattr(entry, 'index', len(authored))}"
+        label = (
+            getattr(entry, "label", None)
+            or f"Subshape_{getattr(entry, 'index', len(authored))}"
+        )
         sanitized = _sanitize_identifier(label, fallback="Subshape")
         candidate = sanitized
         counter = 1
@@ -2139,6 +2350,7 @@ def _author_occ_detail_meshes(
 
 # ---------------- Prototype authoring ----------------
 
+
 def _name_for_repmap(proto: Any) -> str:
     """Return the prototype prim name for a repmap-backed prototype."""
     # Use Defining Type name EXACTLY (as requested)
@@ -2149,8 +2361,9 @@ def _name_for_repmap(proto: Any) -> str:
 
 def _name_for_hash(proto: Any) -> str:
     """Return the prototype name for a hash-backed (occurrence) mesh."""
-    base = (getattr(proto, "name", None) or getattr(proto, "type_name", None)
-            or "Fallback")
+    base = (
+        getattr(proto, "name", None) or getattr(proto, "type_name", None) or "Fallback"
+    )
     digest = getattr(proto, "digest", "unknown")
     return _sanitize_identifier(f"{base}_Fallback_{str(digest)[:12]}")
 
@@ -2181,26 +2394,51 @@ def _sublayer_identifier(parent_layer: Sdf.Layer, child_path: PathLike) -> str:
 
     Preference order:
         1. Omniverse identifiers stay absolute (already portable).
-        2. Relative path from the parent layer directory when possible.
+        2. Relative path from the parent layer directory when possible (anchored).
         3. Raw POSIX string fallback.
     """
     raw_child = str(child_path)
     if is_omniverse_path(raw_child):
         return raw_child.replace("\\", "/")
 
-    parent_real = getattr(parent_layer, "realPath", None)
-    if parent_real:
-        try:
-            parent_dir = Path(parent_real).resolve().parent
-            child_path_obj = Path(child_path) if isinstance(child_path, Path) else Path(raw_child)
-            child_abs = child_path_obj.resolve()
-            rel = child_abs.relative_to(parent_dir)
-            return PurePosixPath(rel.as_posix()).as_posix()
-        except Exception:
-            pass
+    def _anchor_relative(rel: str) -> str:
+        rel_norm = rel.replace("\\", "/")
+        posix_rel = PurePosixPath(rel_norm).as_posix()
+        if posix_rel.startswith("../") or posix_rel.startswith("./"):
+            return posix_rel
+        return f"./{posix_rel}"
 
-    if isinstance(child_path, Path):
-        return child_path.as_posix()
+    parent_dir: Optional[Path] = None
+    for attr in ("realPath", "identifier"):
+        candidate = getattr(parent_layer, attr, None)
+        if not candidate:
+            continue
+        try:
+            parent_dir = Path(candidate).resolve().parent
+            break
+        except Exception:
+            continue
+
+    child_path_obj = (
+        Path(child_path) if isinstance(child_path, Path) else Path(raw_child)
+    )
+
+    if parent_dir is not None:
+        try:
+            base_path = (
+                child_path_obj
+                if child_path_obj.is_absolute()
+                else parent_dir / child_path_obj
+            )
+            child_abs = base_path.resolve()
+            rel = PurePosixPath(os.path.relpath(str(child_abs), parent_dir)).as_posix()
+            return _anchor_relative(rel)
+        except Exception:
+            if not child_path_obj.is_absolute():
+                return _anchor_relative(child_path_obj.as_posix())
+
+    if not child_path_obj.is_absolute():
+        return _anchor_relative(child_path_obj.as_posix())
 
     try:
         return PurePosixPath(raw_child).as_posix()
@@ -2218,7 +2456,9 @@ def _iter_prototypes(caches: PrototypeCaches) -> Iterable[Tuple[PrototypeKey, An
         yield PrototypeKey(kind="hash", identifier=digest), proto
 
 
-def _prototype_from_key(caches: PrototypeCaches, key: Optional[PrototypeKey]) -> Optional[Any]:
+def _prototype_from_key(
+    caches: PrototypeCaches, key: Optional[PrototypeKey]
+) -> Optional[Any]:
     """Return the prototype record referenced by ``key``."""
     if key is None:
         return None
@@ -2259,7 +2499,8 @@ def author_prototype_layer(
     used_names: Dict[str, int] = {}
     detail_scope = getattr(options, "detail_scope", "all") or "all"
     detail_mode_enabled = bool(
-        getattr(options, "detail_mode", False) or getattr(options, "enable_high_detail_remesh", False)
+        getattr(options, "detail_mode", False)
+        or getattr(options, "enable_high_detail_remesh", False)
     )
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
@@ -2268,6 +2509,11 @@ def author_prototype_layer(
         used_names[base] = c + 1
         return base if c == 0 else f"{base}_{c}"
 
+    def _ensure_geom_container(path: Sdf.Path) -> None:
+        prim = stage.GetPrimAtPath(path)
+        if not prim or prim.GetTypeName() == "":
+            UsdGeom.Xform.Define(stage, path)
+
     with Usd.EditContext(stage, proto_layer):
         UsdGeom.Scope.Define(stage, proto_root)
         UsdGeom.Scope.Define(stage, proto_root_detail)
@@ -2275,7 +2521,11 @@ def author_prototype_layer(
         for key, proto in _iter_prototypes(caches):
             mesh_payload = getattr(proto, "mesh", None)
             detail_payload = getattr(proto, "detail_mesh", None)
-            has_detail = bool(detail_mode_enabled and detail_payload and getattr(detail_payload, "faces", None))
+            has_detail = bool(
+                detail_mode_enabled
+                and detail_payload
+                and getattr(detail_payload, "faces", None)
+            )
 
             if not mesh_payload and not has_detail:
                 continue
@@ -2289,7 +2539,9 @@ def author_prototype_layer(
                 base = _name_for_hash(proto)
             prim_name = _unique_name(base)
 
-            parent_scope = proto_root_detail if key.kind == "repmap_detail" else proto_root
+            parent_scope = (
+                proto_root_detail if key.kind == "repmap_detail" else proto_root
+            )
             proto_path = parent_scope.AppendChild(prim_name)
             proto_paths[key] = proto_path
 
@@ -2310,6 +2562,7 @@ def author_prototype_layer(
             # Semantic parts on the base prototype take precedence and short-circuit
             if semantic_parts_base and key.kind != "repmap_detail":
                 geom_parent = proto_path.AppendChild("Geom")
+                _ensure_geom_container(geom_parent)
                 for label, part in semantic_parts_base.items():
                     mesh_name = sanitize_name(label, fallback="Part")
                     part_mesh_dict = {
@@ -2331,11 +2584,14 @@ def author_prototype_layer(
 
             if has_detail and key.kind == "repmap_detail":
                 detail_parent = proto_path.AppendChild("Geom")
+                _ensure_geom_container(detail_parent)
                 if semantic_parts_detail:
                     for label, part in semantic_parts_detail.items():
                         mesh_name = sanitize_name(label, fallback="Part")
                         part_mesh_dict = {
-                            "vertices": np.asarray(part.get("vertices"), dtype=np.float32),
+                            "vertices": np.asarray(
+                                part.get("vertices"), dtype=np.float32
+                            ),
                             "faces": np.asarray(part.get("faces"), dtype=np.int64),
                         }
                         part_material_ids = part.get("material_ids") or []
@@ -2345,7 +2601,9 @@ def author_prototype_layer(
                             mesh_name,
                             part_mesh_dict,
                             abs_mat=None,
-                            material_ids=part_material_ids if part_material_ids else None,
+                            material_ids=part_material_ids
+                            if part_material_ids
+                            else None,
                             style_groups=part.get("style_groups") or {},
                             materials=full_materials,
                             stage_meters_per_unit=stage_meters_per_unit,
@@ -2360,10 +2618,13 @@ def author_prototype_layer(
             elif key.kind != "repmap_detail":
                 if semantic_parts_base:
                     geom_parent = proto_path.AppendChild("Geom")
+                    _ensure_geom_container(geom_parent)
                     for label, part in semantic_parts_base.items():
                         mesh_name = sanitize_name(label, fallback="Part")
                         part_mesh_dict = {
-                            "vertices": np.asarray(part.get("vertices"), dtype=np.float32),
+                            "vertices": np.asarray(
+                                part.get("vertices"), dtype=np.float32
+                            ),
                             "faces": np.asarray(part.get("faces"), dtype=np.int64),
                         }
                         part_material_ids = part.get("material_ids") or []
@@ -2373,7 +2634,9 @@ def author_prototype_layer(
                             mesh_name,
                             part_mesh_dict,
                             abs_mat=None,
-                            material_ids=part_material_ids if part_material_ids else None,
+                            material_ids=part_material_ids
+                            if part_material_ids
+                            else None,
                             style_groups=part.get("style_groups") or {},
                             materials=full_materials,
                             stage_meters_per_unit=stage_meters_per_unit,
@@ -2394,8 +2657,8 @@ def author_prototype_layer(
     return proto_layer, proto_paths
 
 
-
 # ---------------- Materials (kept minimal; wiring points preserved) ----------------
+
 
 def _prototype_materials(caches: PrototypeCaches, key: PrototypeKey) -> Any:
     if key.kind == "repmap":
@@ -2414,8 +2677,9 @@ def _prototype_materials(caches: PrototypeCaches, key: PrototypeKey) -> Any:
     return materials
 
 
-
-def _prototype_style_groups(caches: PrototypeCaches, key: PrototypeKey) -> Dict[str, Dict[str, Any]]:
+def _prototype_style_groups(
+    caches: PrototypeCaches, key: PrototypeKey
+) -> Dict[str, Dict[str, Any]]:
     if key.kind == "repmap":
         proto = caches.repmaps.get(int(key.identifier))
     else:
@@ -2427,6 +2691,7 @@ def _prototype_style_groups(caches: PrototypeCaches, key: PrototypeKey) -> Dict[
     if not groups:
         return {}
     return groups
+
 
 def _merge_style_face_groups(
     instance_groups: Optional[Dict[str, Dict[str, Any]]],
@@ -2469,6 +2734,8 @@ def _merge_style_face_groups(
                 entry[extra] = P[extra]
         merged[key] = entry
     return merged
+
+
 def _iter_material_entries(materials: Any) -> Iterable[Tuple[Any, Any]]:
     if isinstance(materials, dict):
         return materials.items()
@@ -2496,12 +2763,12 @@ class _MaterialProperties:
 
 @dataclass(frozen=True)
 class _FaceGeometry:
-    normals: np.ndarray       # (F, 3)
-    centroids: np.ndarray     # (F, 3)
-    areas: np.ndarray         # (F,)
-    plane_d: np.ndarray       # (F,)
-    bbox_min: np.ndarray      # (F, 3)
-    bbox_max: np.ndarray      # (F, 3)
+    normals: np.ndarray  # (F, 3)
+    centroids: np.ndarray  # (F, 3)
+    areas: np.ndarray  # (F,)
+    plane_d: np.ndarray  # (F,)
+    bbox_min: np.ndarray  # (F, 3)
+    bbox_max: np.ndarray  # (F, 3)
 
 
 @dataclass
@@ -2510,7 +2777,9 @@ class MaterialLibrary:
 
 
 # ---------- helpers used by binding ----------
-_MATERIAL_NAME_CACHE: "weakref.WeakKeyDictionary[Usd.Stage, Dict[str, Sdf.Path]]" = weakref.WeakKeyDictionary()
+_MATERIAL_NAME_CACHE: "weakref.WeakKeyDictionary[Usd.Stage, Dict[str, Sdf.Path]]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _mesh_has_geom_subsets(stage: Usd.Stage, mesh_path: Optional[Sdf.Path]) -> bool:
@@ -2537,7 +2806,9 @@ def _material_name_key(name: Any) -> Optional[str]:
     return text.lower()
 
 
-def _register_material_name(stage: Optional[Usd.Stage], name: Any, path: Optional[Sdf.Path]) -> None:
+def _register_material_name(
+    stage: Optional[Usd.Stage], name: Any, path: Optional[Sdf.Path]
+) -> None:
     if stage is None or path is None:
         return
     key = _material_name_key(name)
@@ -2574,7 +2845,22 @@ def _material_path_by_name(stage: Optional[Usd.Stage], name: Any) -> Optional[Sd
     return None
 
 
-def _set_subset_material_name(subset_prim: Usd.Prim, material_name: Optional[str], *, overwrite: bool = False) -> None:
+def _material_binding_api(prim: Usd.Prim) -> Optional[UsdShade.MaterialBindingAPI]:
+    """Ensure MaterialBindingAPI is applied before use and return the API handle."""
+    if prim is None or not prim.IsValid():
+        return None
+    try:
+        return UsdShade.MaterialBindingAPI.Apply(prim)
+    except Exception:
+        try:
+            return UsdShade.MaterialBindingAPI(prim)
+        except Exception:
+            return None
+
+
+def _set_subset_material_name(
+    subset_prim: Usd.Prim, material_name: Optional[str], *, overwrite: bool = False
+) -> None:
     if subset_prim is None or material_name is None:
         return
     text = str(material_name).strip()
@@ -2583,7 +2869,9 @@ def _set_subset_material_name(subset_prim: Usd.Prim, material_name: Optional[str
     attr = subset_prim.GetAttribute("ifc:materialName")
     if attr and attr.HasAuthoredValue() and not overwrite:
         return
-    subset_prim.CreateAttribute("ifc:materialName", Sdf.ValueTypeNames.String, custom=True).Set(text)
+    subset_prim.CreateAttribute(
+        "ifc:materialName", Sdf.ValueTypeNames.String, custom=True
+    ).Set(text)
 
 
 def _subset_indices_from_attrs(subset_prim: Usd.Prim) -> List[int]:
@@ -2611,7 +2899,11 @@ def _subset_indices_from_attrs(subset_prim: Usd.Prim) -> List[int]:
             except Exception:
                 return
 
-    for name in ("ifc:sourceMaterialIndex", "ifc:baseMaterialIndex", "ifc:baseMaterialIndices"):
+    for name in (
+        "ifc:sourceMaterialIndex",
+        "ifc:baseMaterialIndex",
+        "ifc:baseMaterialIndices",
+    ):
         _collect(name)
     return sorted(indices)
 
@@ -2629,7 +2921,9 @@ def _update_material_metadata(
     if material_name:
         text = str(material_name).strip()
         if text:
-            material_prim.CreateAttribute("ifc:materialName", Sdf.ValueTypeNames.String, custom=True).Set(text)
+            material_prim.CreateAttribute(
+                "ifc:materialName", Sdf.ValueTypeNames.String, custom=True
+            ).Set(text)
             _register_material_name(stage, text, material_path)
     new_values: Set[int] = set()
     if source_indices:
@@ -2657,9 +2951,9 @@ def _update_material_metadata(
         )
         target_attr.Set(Vt.IntArray(combined))
         if len(combined) == 1:
-            material_prim.CreateAttribute("ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int, custom=True).Set(
-                int(combined[0])
-            )
+            material_prim.CreateAttribute(
+                "ifc:sourceMaterialIndex", Sdf.ValueTypeNames.Int, custom=True
+            ).Set(int(combined[0]))
 
 
 def _propagate_subset_metadata_to_material(
@@ -2677,7 +2971,9 @@ def _propagate_subset_metadata_to_material(
         except Exception:
             material_name = None
     source_indices = _subset_indices_from_attrs(subset_prim)
-    _update_material_metadata(stage, material_path, material_name=material_name, source_indices=source_indices)
+    _update_material_metadata(
+        stage, material_path, material_name=material_name, source_indices=source_indices
+    )
 
 
 def _material_name_from_usd_material(material: UsdShade.Material) -> Optional[str]:
@@ -2695,10 +2991,14 @@ def _material_name_from_usd_material(material: UsdShade.Material) -> Optional[st
     return None
 
 
-def _bind_material_from_ifc_name(stage: Usd.Stage, prim: Usd.Prim) -> Optional[Sdf.Path]:
+def _bind_material_from_ifc_name(
+    stage: Usd.Stage, prim: Usd.Prim
+) -> Optional[Sdf.Path]:
     if prim is None:
         return None
-    binding_api = UsdShade.MaterialBindingAPI(prim)
+    binding_api = _material_binding_api(prim)
+    if binding_api is None:
+        return None
     if binding_api.GetDirectBinding().GetMaterial():
         return None
     attr = prim.GetAttribute("ifc:materialName")
@@ -2717,7 +3017,9 @@ def _bind_material_from_ifc_name(stage: Usd.Stage, prim: Usd.Prim) -> Optional[S
     if not material:
         return None
     binding_api.Bind(material)
-    prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(material_path))
+    prim.CreateAttribute(
+        "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+    ).Set(str(material_path))
     _propagate_subset_metadata_to_material(stage, prim, material_path)
     return material_path
 
@@ -2753,7 +3055,12 @@ def _resolve_color_value(obj: Any) -> Optional[Tuple[float, float, float]]:
             return tuple(vals)
         return None
     if isinstance(obj, dict):
-        for keys in (("Red", "Green", "Blue"), ("R", "G", "B"), ("red", "green", "blue"), ("x", "y", "z")):
+        for keys in (
+            ("Red", "Green", "Blue"),
+            ("R", "G", "B"),
+            ("red", "green", "blue"),
+            ("x", "y", "z"),
+        ):
             if all(k in obj for k in keys):
                 try:
                     vals = [float(obj[k]) for k in keys]
@@ -2823,7 +3130,9 @@ def _material_properties_from_pbr(
                 emissive_value = material.get("emissive")
                 emissive = None
                 if emissive_value is not None:
-                    emissive = _normalize_color(tuple(float(c) for c in emissive_value[:3]))
+                    emissive = _normalize_color(
+                        tuple(float(c) for c in emissive_value[:3])
+                    )
                 name = str(material.get("name", fallback_name))
                 return _MaterialProperties(
                     name=name,
@@ -2866,9 +3175,15 @@ def _bind_materials_on_prototype_mesh(
             continue
 
         numeric_materials: Dict[int, Sdf.Path] = {}
-        proto_label = getattr(proto, "type_name", None) or getattr(proto, "name", None) or "Prototype"
+        proto_label = (
+            getattr(proto, "type_name", None)
+            or getattr(proto, "name", None)
+            or "Prototype"
+        )
         for idx, mat in enumerate(getattr(proto, "materials", None) or []):
-            props = _extract_material_properties(mat, prototype_label=proto_label, index=idx)
+            props = _extract_material_properties(
+                mat, prototype_label=proto_label, index=idx
+            )
             if props is None:
                 LOG.debug(
                     "Prototype %s material[%d] produced no usable properties (raw type=%s)",
@@ -2898,7 +3213,9 @@ def _bind_materials_on_prototype_mesh(
                     material_ids_seq = list(raw_ids)
             except Exception:
                 material_ids_seq = []
-        LOG.debug("Prototype %s materialIds count: %d", mesh_path, len(material_ids_seq))
+        LOG.debug(
+            "Prototype %s materialIds count: %d", mesh_path, len(material_ids_seq)
+        )
 
         style_tokens: Set[str] = set()
         style_token_to_material: Dict[str, Sdf.Path] = {}
@@ -2937,7 +3254,10 @@ def _bind_materials_on_prototype_mesh(
                         existing = material_id_to_style_path.get(material_id)
                         if existing is None:
                             material_id_to_style_path[material_id] = material_path
-                        elif existing != material_path and material_id not in material_conflicts_reported:
+                        elif (
+                            existing != material_path
+                            and material_id not in material_conflicts_reported
+                        ):
                             LOG.debug(
                                 "Material ID %d already mapped to %s; skipping alternate style %s for prototype %s",
                                 material_id,
@@ -2959,7 +3279,9 @@ def _bind_materials_on_prototype_mesh(
             if not material:
                 continue
 
-            UsdShade.MaterialBindingAPI(subset_prim).Bind(material)
+            api = _material_binding_api(subset_prim)
+            if api:
+                api.Bind(material)
             LOG.debug("Bound style subset %s -> %s", subset_path, material_path)
 
         try:
@@ -2988,9 +3310,15 @@ def _bind_materials_on_prototype_mesh(
                     if mat_path:
                         material = UsdShade.Material.Get(stage, mat_path)
                         if material:
-                            UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(material)
+                            api = _material_binding_api(subset.GetPrim())
+                            if api:
+                                api.Bind(material)
                             style_tokens.add(name)
-                            LOG.debug("Bound clustered style subset %s -> %s", subset.GetPath(), mat_path)
+                            LOG.debug(
+                                "Bound clustered style subset %s -> %s",
+                                subset.GetPath(),
+                                mat_path,
+                            )
                             continue
                 for prefix, mat_path in cluster_binding.items():
                     if not name.startswith(prefix + "_C"):
@@ -2998,9 +3326,15 @@ def _bind_materials_on_prototype_mesh(
                     material = UsdShade.Material.Get(stage, mat_path)
                     if not material:
                         continue
-                    UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(material)
+                    api = _material_binding_api(subset.GetPrim())
+                    if api:
+                        api.Bind(material)
                     style_tokens.add(name)
-                    LOG.debug("Bound clustered style subset %s -> %s", subset.GetPath(), mat_path)
+                    LOG.debug(
+                        "Bound clustered style subset %s -> %s",
+                        subset.GetPath(),
+                        mat_path,
+                    )
                     break
 
         for subset in subset_list:
@@ -3023,7 +3357,9 @@ def _bind_materials_on_prototype_mesh(
             material = UsdShade.Material.Get(stage, material_path)
             if not material:
                 continue
-            UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(material)
+            api = _material_binding_api(subset.GetPrim())
+            if api:
+                api.Bind(material)
             LOG.debug(
                 "Bound numeric subset %s -> %s (%s)",
                 subset.GetPath(),
@@ -3033,7 +3369,10 @@ def _bind_materials_on_prototype_mesh(
             try:
                 indices = subset.GetIndicesAttr().Get()
                 if not indices:
-                    LOG.debug("Numeric subset %s had no indices after binding.", subset.GetPath())
+                    LOG.debug(
+                        "Numeric subset %s had no indices after binding.",
+                        subset.GetPath(),
+                    )
             except Exception:
                 pass
 
@@ -3049,7 +3388,9 @@ def _bind_materials_on_prototype_mesh(
                     mesh_path,
                 )
         except Exception:
-            LOG.debug("Unable to validate material subsets for %s", mesh_path, exc_info=True)
+            LOG.debug(
+                "Unable to validate material subsets for %s", mesh_path, exc_info=True
+            )
 
 
 def _extract_material_properties(
@@ -3076,7 +3417,9 @@ def _extract_material_properties(
                     return value
         return None
 
-    name_value = _get_value(material, "name", "Name", "label", "Label", "description", "Description")
+    name_value = _get_value(
+        material, "name", "Name", "label", "Label", "description", "Description"
+    )
     if isinstance(name_value, str):
         name_value = name_value.strip()
     if not name_value:
@@ -3188,7 +3531,9 @@ def _material_signature(props: _MaterialProperties) -> Tuple[Any, ...]:
     )
 
 
-def _author_preview_surface(stage: Usd.Stage, material_path: Sdf.Path, props: _MaterialProperties) -> UsdShade.Material:
+def _author_preview_surface(
+    stage: Usd.Stage, material_path: Sdf.Path, props: _MaterialProperties
+) -> UsdShade.Material:
     """
     Author a UsdPreviewSurface network and expose PBR controls via material inputs.
     This allows downstream edits on </World/Materials/...>.inputs:* and wires textures when available.
@@ -3211,12 +3556,16 @@ def _author_preview_surface(stage: Usd.Stage, material_path: Sdf.Path, props: _M
         in_emiss = material.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f)
         in_emiss.Set(Gf.Vec3f(*props.emissive_color))
 
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(in_base)
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+        in_base
+    )
     shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).ConnectToSource(in_opacity)
     shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).ConnectToSource(in_metal)
     shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).ConnectToSource(in_rough)
     if in_emiss:
-        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(in_emiss)
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+            in_emiss
+        )
 
     st_reader: Optional[UsdShade.Shader] = None
 
@@ -3224,20 +3573,30 @@ def _author_preview_surface(stage: Usd.Stage, material_path: Sdf.Path, props: _M
         nonlocal st_reader
         if st_reader:
             return st_reader
-        st_reader = UsdShade.Shader.Define(stage, material_path.AppendChild("Primvar_st"))
+        st_reader = UsdShade.Shader.Define(
+            stage, material_path.AppendChild("Primvar_st")
+        )
         st_reader.CreateIdAttr("UsdPrimvarReader_float2")
         st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
         return st_reader
 
-    def _connect_uv_texture(slot: str, asset_path: Optional[str], channel: str = "rgb") -> None:
+    def _connect_uv_texture(
+        slot: str, asset_path: Optional[str], channel: str = "rgb"
+    ) -> None:
         if not asset_path:
             return
         tex = UsdShade.Shader.Define(stage, material_path.AppendChild(f"Tex_{slot}"))
         tex.CreateIdAttr("UsdUVTexture")
-        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(str(asset_path)))
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+            Sdf.AssetPath(str(asset_path))
+        )
         reader = _ensure_st_reader()
-        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader, "result")
-        target = material.GetInput(slot) or material.CreateInput(slot, Sdf.ValueTypeNames.Token)
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+            reader, "result"
+        )
+        target = material.GetInput(slot) or material.CreateInput(
+            slot, Sdf.ValueTypeNames.Token
+        )
         target.ConnectToSource(tex, channel)
 
     if getattr(props, "base_color_tex", None):
@@ -3246,24 +3605,40 @@ def _author_preview_surface(stage: Usd.Stage, material_path: Sdf.Path, props: _M
         _connect_uv_texture("roughness", props.orm_tex, "g")
         _connect_uv_texture("metallic", props.orm_tex, "b")
     if getattr(props, "normal_tex", None):
-        in_norm = material.GetInput("normal") or material.CreateInput("normal", Sdf.ValueTypeNames.Normal3f)
-        shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).ConnectToSource(in_norm)
+        in_norm = material.GetInput("normal") or material.CreateInput(
+            "normal", Sdf.ValueTypeNames.Normal3f
+        )
+        shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).ConnectToSource(
+            in_norm
+        )
         tex = UsdShade.Shader.Define(stage, material_path.AppendChild("Tex_normal"))
         tex.CreateIdAttr("UsdUVTexture")
-        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(str(props.normal_tex)))
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+            Sdf.AssetPath(str(props.normal_tex))
+        )
         reader = _ensure_st_reader()
-        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader, "result")
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+            reader, "result"
+        )
         in_norm.ConnectToSource(tex, "rgb")
 
-    material.CreateSurfaceOutput().ConnectToSource(shader.CreateOutput("surface", Sdf.ValueTypeNames.Token))
+    material.CreateSurfaceOutput().ConnectToSource(
+        shader.CreateOutput("surface", Sdf.ValueTypeNames.Token)
+    )
 
     prim = material.GetPrim()
-    prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(Gf.Vec3f(*props.display_color))
-    prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(float(props.opacity))
+    prim.CreateAttribute("displayColor", Sdf.ValueTypeNames.Color3f, custom=True).Set(
+        Gf.Vec3f(*props.display_color)
+    )
+    prim.CreateAttribute("displayOpacity", Sdf.ValueTypeNames.Float, custom=True).Set(
+        float(props.opacity)
+    )
     if props.name:
         text = str(props.name).strip()
         if text:
-            prim.CreateAttribute("ifc:materialName", Sdf.ValueTypeNames.String, custom=True).Set(text)
+            prim.CreateAttribute(
+                "ifc:materialName", Sdf.ValueTypeNames.String, custom=True
+            ).Set(text)
             _register_material_name(stage, text, material_path)
     return material
 
@@ -3281,7 +3656,9 @@ def _resolve_instance_materials(
     proto_paths: Dict[PrototypeKey, Sdf.Path],
     material_library: Optional[MaterialLibrary],
 ) -> Tuple[Dict[Any, Sdf.Path], Optional[Gf.Vec3f], Dict[str, Dict[str, Any]]]:
-    materials_container: Any = record.materials if getattr(record, "materials", None) else None
+    materials_container: Any = (
+        record.materials if getattr(record, "materials", None) else None
+    )
     label = sanitize_name(record.name, fallback=f"Ifc_{record.step_id}")
     if not materials_container and record.prototype is not None:
         materials_container = _prototype_materials(caches, record.prototype)
@@ -3321,12 +3698,20 @@ def _resolve_instance_materials(
 
     # Merge instance-level style groups over prototype groups so the
     # resolved view always reflects "how this instance presents".
-    proto_groups = _prototype_style_groups(caches, record.prototype) if record.prototype is not None else {}
+    proto_groups = (
+        _prototype_style_groups(caches, record.prototype)
+        if record.prototype is not None
+        else {}
+    )
     inst_groups = record.style_face_groups or {}
     style_groups = _merge_style_face_groups(inst_groups, proto_groups)
 
-    for entry_index, (material_key, material_value) in enumerate(_iter_material_entries(materials_container)):
-        props = _extract_material_properties(material_value, prototype_label=label, index=entry_index)
+    for entry_index, (material_key, material_value) in enumerate(
+        _iter_material_entries(materials_container)
+    ):
+        props = _extract_material_properties(
+            material_value, prototype_label=label, index=entry_index
+        )
         if props is not None and display_color is None:
             display_color = Gf.Vec3f(*props.display_color)
         if "ARX" in label.upper() or "PROP" in label.upper():
@@ -3339,7 +3724,11 @@ def _resolve_instance_materials(
                     props,
                 )
             except Exception:
-                LOG.info("IFC material debug for %s idx=%s (unprintable material)", label, material_key)
+                LOG.info(
+                    "IFC material debug for %s idx=%s (unprintable material)",
+                    label,
+                    material_key,
+                )
         if material_library is None or props is None:
             continue
         signature = _material_signature(props)
@@ -3402,7 +3791,9 @@ def _apply_material_bindings_to_prim(
         return None
 
     primary_key = _style_primary_key()
-    primary_path = resolved_materials.get(primary_key) if primary_key is not None else None
+    primary_path = (
+        resolved_materials.get(primary_key) if primary_key is not None else None
+    )
 
     if primary_path is None:
         numeric_items = [item for item in items if isinstance(item[0], int)]
@@ -3417,11 +3808,17 @@ def _apply_material_bindings_to_prim(
             _bind_ifc_named_materials(stage, mesh_path)
         return None
     mesh_has_subsets = _mesh_has_geom_subsets(stage, mesh_path)
-    binding_api = UsdShade.MaterialBindingAPI(prim)
+    binding_api = _material_binding_api(prim)
+    if binding_api is None:
+        return None
     if mesh_path is None or not mesh_has_subsets:
         binding_api.Bind(primary_material)
-        prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(primary_path))
-        _set_subset_material_name(prim, _material_name_from_usd_material(primary_material))
+        prim.CreateAttribute(
+            "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(primary_path))
+        _set_subset_material_name(
+            prim, _material_name_from_usd_material(primary_material)
+        )
         _bind_ifc_named_materials(stage, mesh_path)
         return primary_path
 
@@ -3447,17 +3844,23 @@ def _apply_material_bindings_to_prim(
         subset_material = UsdShade.Material.Get(stage, material_path)
         if not subset_material:
             return
-        UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
+        subset_api = _material_binding_api(subset_prim)
+        if subset_api:
+            subset_api.Bind(subset_material)
         subset_name = _material_name_from_usd_material(subset_material)
         if subset_name:
             _set_subset_material_name(subset_prim, subset_name, overwrite=False)
-        subset_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(material_path))
+        subset_prim.CreateAttribute(
+            "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(material_path))
         _propagate_subset_metadata_to_material(stage, subset_prim, material_path)
         bound_subset_keys.add(key)
         subset_bound = True
 
     style_keys = {
-        key for key in resolved_materials if isinstance(key, str) and key.strip("'\"").startswith("__style__")
+        key
+        for key in resolved_materials
+        if isinstance(key, str) and key.strip("'\"").startswith("__style__")
     }
 
     for key, material_path in items:
@@ -3472,7 +3875,9 @@ def _apply_material_bindings_to_prim(
                 continue
             _bind_subset(key, material_path)
 
-    subset_bound = subset_bound or _bind_style_subsets(stage, mesh_path, style_groups, resolved_materials)
+    subset_bound = subset_bound or _bind_style_subsets(
+        stage, mesh_path, style_groups, resolved_materials
+    )
 
     if subset_bound:
         try:
@@ -3483,7 +3888,9 @@ def _apply_material_bindings_to_prim(
         return None
 
     binding_api.Bind(primary_material)
-    prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(primary_path))
+    prim.CreateAttribute(
+        "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+    ).Set(str(primary_path))
     _set_subset_material_name(prim, _material_name_from_usd_material(primary_material))
     _bind_ifc_named_materials(stage, mesh_path)
     return primary_path
@@ -3574,13 +3981,13 @@ def _bind_detail_materials(
             resolved_canonical[ck] = rp
 
     valid_keys = [k for k in normalized_keys if k in resolved_canonical]
-    
+
     if LOG.isEnabledFor(logging.DEBUG):
         LOG.debug(
             "Detail material binding: mesh=%s face_keys_sample=%s resolved_keys_sample=%s",
             mesh_path,
             normalized_keys[:5],
-            list(resolved_canonical.keys())[:5]
+            list(resolved_canonical.keys())[:5],
         )
         # If no matches, also log ALL keys for debugging
         if not valid_keys:
@@ -3588,11 +3995,14 @@ def _bind_detail_materials(
                 "No material key matches for mesh %s. All normalized_keys: %s. All resolved_keys: %s",
                 mesh_path,
                 set(normalized_keys),
-                set(resolved_canonical.keys())
+                set(resolved_canonical.keys()),
             )
-    
+
     if not valid_keys:
-        LOG.debug("No valid material keys after canonicalization; skipping detail material binding for %s", mesh_path)
+        LOG.debug(
+            "No valid material keys after canonicalization; skipping detail material binding for %s",
+            mesh_path,
+        )
         _bind_ifc_named_materials(stage, mesh_path)
         return
 
@@ -3609,13 +4019,18 @@ def _bind_detail_materials(
         _bind_ifc_named_materials(stage, mesh_path)
         return
 
-    binding_api = UsdShade.MaterialBindingAPI(mesh_geom)
+    binding_api = _material_binding_api(mesh_geom.GetPrim())
+    if binding_api is None:
+        _bind_ifc_named_materials(stage, mesh_path)
+        return
     binding_api.UnbindAllBindings()
 
     primary_key = order[0]
     primary_material = UsdShade.Material.Get(stage, resolved_canonical.get(primary_key))
     if not primary_material:
-        LOG.debug("Primary material not found for key %s on mesh %s", primary_key, mesh_path)
+        LOG.debug(
+            "Primary material not found for key %s on mesh %s", primary_key, mesh_path
+        )
         _bind_ifc_named_materials(stage, mesh_path)
         return
 
@@ -3623,10 +4038,12 @@ def _bind_detail_materials(
     mesh_prim = mesh_geom.GetPrim()
     primary_material_path = resolved_canonical.get(primary_key)
     if primary_material_path:
-        mesh_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(
-            str(primary_material_path)
-        )
-    _set_subset_material_name(mesh_prim, _material_name_from_usd_material(primary_material))
+        mesh_prim.CreateAttribute(
+            "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(primary_material_path))
+    _set_subset_material_name(
+        mesh_prim, _material_name_from_usd_material(primary_material)
+    )
 
     family_name = "materialBind"
     face_lookup: Dict[Any, List[int]] = {}
@@ -3644,7 +4061,7 @@ def _bind_detail_materials(
             continue
         try:
             subset_token = _subset_token_for_material(ck)
-            
+
             # Use CreateUniqueGeomSubset for per-face material binding
             subset = UsdGeom.Subset.CreateUniqueGeomSubset(
                 UsdGeom.Imageable(mesh_prim),
@@ -3653,23 +4070,34 @@ def _bind_detail_materials(
                 elementType=UsdGeom.Tokens.face,
                 subsetName=subset_token,
             )
-            
+
             subset_material = UsdShade.Material.Get(stage, mat_path)
             if subset_material:
                 subset_prim = subset.GetPrim()
                 mat_name = _material_name_from_usd_material(subset_material)
                 _set_subset_material_name(subset_prim, mat_name)
-                UsdShade.MaterialBindingAPI(subset_prim).Bind(subset_material)
+                subset_api = _material_binding_api(subset_prim)
+                if subset_api:
+                    subset_api.Bind(subset_material)
                 subset_path_val = subset_material.GetPath()
-                subset_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(
-                    str(subset_path_val)
+                subset_prim.CreateAttribute(
+                    "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+                ).Set(str(subset_path_val))
+                _propagate_subset_metadata_to_material(
+                    stage, subset_prim, subset_path_val
                 )
-                _propagate_subset_metadata_to_material(stage, subset_prim, subset_path_val)
         except Exception as exc:
-            LOG.debug("Failed to create subset for material key %s on %s: %s", ck, mesh_path, exc)
+            LOG.debug(
+                "Failed to create subset for material key %s on %s: %s",
+                ck,
+                mesh_path,
+                exc,
+            )
 
     try:
-        UsdGeom.Subset.SetFamilyType(mesh_geom, family_name, UsdGeom.Tokens.nonOverlapping)
+        UsdGeom.Subset.SetFamilyType(
+            mesh_geom, family_name, UsdGeom.Tokens.nonOverlapping
+        )
     except Exception:
         pass
     _bind_ifc_named_materials(stage, mesh_path)
@@ -3691,17 +4119,23 @@ def _bind_style_subsets(
         material = UsdShade.Material.Get(stage, material_path)
         if not material:
             continue
-        subset_token = (entry or {}).get("subset_token") or _subset_token_for_material(key)
+        subset_token = (entry or {}).get("subset_token") or _subset_token_for_material(
+            key
+        )
         subset_path = mesh_path.AppendChild(subset_token)
         existing = stage.GetPrimAtPath(subset_path)
         if not existing or existing.GetTypeName() != "GeomSubset":
             continue
         subset_prim = stage.OverridePrim(subset_path)
-        UsdShade.MaterialBindingAPI(subset_prim).Bind(material)
+        subset_api = _material_binding_api(subset_prim)
+        if subset_api:
+            subset_api.Bind(material)
         subset_name = _material_name_from_usd_material(material)
         if subset_name:
             _set_subset_material_name(subset_prim, subset_name, overwrite=False)
-        subset_prim.CreateAttribute("ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True).Set(str(material_path))
+        subset_prim.CreateAttribute(
+            "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(material_path))
         _propagate_subset_metadata_to_material(stage, subset_prim, material_path)
         bound = True
     return bound
@@ -3758,7 +4192,11 @@ def author_material_layer(
         for key, proto in _iter_prototypes(caches):
             materials = _prototype_materials(caches, key)
             proto_path = proto_paths.get(key) if proto_paths else None
-            label_source = proto_path.name if proto_path else getattr(proto, "type_name", None) or getattr(proto, "name", None)
+            label_source = (
+                proto_path.name
+                if proto_path
+                else getattr(proto, "type_name", None) or getattr(proto, "name", None)
+            )
             label = sanitize_name(label_source, fallback="Prototype")
             if materials:
                 yield label, materials
@@ -3779,8 +4217,12 @@ def author_material_layer(
         UsdGeom.Scope.Define(stage, material_root)
 
         for label, materials in _material_sources():
-            for entry_index, (material_key, material_value) in enumerate(_iter_material_entries(materials)):
-                props = _extract_material_properties(material_value, prototype_label=label, index=entry_index)
+            for entry_index, (material_key, material_value) in enumerate(
+                _iter_material_entries(materials)
+            ):
+                props = _extract_material_properties(
+                    material_value, prototype_label=label, index=entry_index
+                )
                 if props is None:
                     continue
                 signature = _material_signature(props)
@@ -3791,7 +4233,11 @@ def author_material_layer(
                 material_prim_path = material_root.AppendChild(token)
                 _author_preview_surface(stage, material_prim_path, props)
                 signature_to_path[signature] = material_prim_path
-                log.debug("Authored material %s for signature %s", material_prim_path, signature)
+                log.debug(
+                    "Authored material %s for signature %s",
+                    material_prim_path,
+                    signature,
+                )
 
     library = MaterialLibrary(signature_to_path)
     # Do not bind materials on /World/__Prototypes. We want all style/material
@@ -3800,6 +4246,7 @@ def author_material_layer(
 
 
 # ---------------- Instance authoring ----------------
+
 
 def author_instance_layer(
     stage: Usd.Stage,
@@ -3833,19 +4280,23 @@ def author_instance_layer(
     if root_sub_path not in root_layer.subLayerPaths:
         root_layer.subLayerPaths.append(root_sub_path)
 
-    inst_root_name = _sanitize_identifier(f"{base_name}_Instances", fallback="Instances")
+    inst_root_name = _sanitize_identifier(
+        f"{base_name}_Instances", fallback="Instances"
+    )
     inst_root = Sdf.Path(f"/World/{inst_root_name}")
     setattr(caches, "instance_layer", inst_layer)
     setattr(caches, "instance_root_path", inst_root)
 
     from collections import defaultdict
+
     name_counters: Dict[Sdf.Path, Dict[str, int]] = defaultdict(dict)
     hierarchy_nodes_by_step: Dict[int, Sdf.Path] = {}
     hierarchy_nodes_by_label: Dict[Tuple[Sdf.Path, str], Sdf.Path] = {}
 
     detail_scope = getattr(options, "detail_scope", "all") or "all"
     detail_mode_enabled = bool(
-        getattr(options, "detail_mode", False) or getattr(options, "enable_high_detail_remesh", False)
+        getattr(options, "detail_mode", False)
+        or getattr(options, "enable_high_detail_remesh", False)
     )
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
 
@@ -3855,10 +4306,15 @@ def author_instance_layer(
         used[base] = count + 1
         return base if count == 0 else f"{base}_{count}"
 
-    def _ensure_group(parent_path: Sdf.Path, label: str, step_id: Optional[int]) -> Sdf.Path:
+    def _ensure_group(
+        parent_path: Sdf.Path, label: str, step_id: Optional[int]
+    ) -> Sdf.Path:
         if step_id is not None and step_id in hierarchy_nodes_by_step:
             return hierarchy_nodes_by_step[step_id]
-        sanitized = _sanitize_identifier(label, fallback=f"Group_{step_id or 'Node'}") or "Group"
+        sanitized = (
+            _sanitize_identifier(label, fallback=f"Group_{step_id or 'Node'}")
+            or "Group"
+        )
         if step_id is None:
             existing = hierarchy_nodes_by_label.get((parent_path, sanitized))
             if existing is not None:
@@ -3870,7 +4326,7 @@ def author_instance_layer(
             xf = UsdGeom.Xform.Define(stage, child_path)
             xf.ClearXformOpOrder()
             prim = xf.GetPrim()
-            Usd.ModelAPI(prim).SetKind('group')
+            Usd.ModelAPI(prim).SetKind("group")
             prim.SetCustomDataByKey("ifc:label", label)
             if step_id is not None:
                 try:
@@ -3886,7 +4342,12 @@ def author_instance_layer(
     with Usd.EditContext(stage, inst_layer):
         inst_root_xf = UsdGeom.Xform.Define(stage, inst_root)
         inst_root_xf.ClearXformOpOrder()
-        inst_root_xf.GetPrim().SetCustomDataByKey("ifc:sourceFile", base_name)
+        inst_root_prim = inst_root_xf.GetPrim()
+        inst_root_prim.SetCustomDataByKey("ifc:sourceFile", base_name)
+        try:
+            Usd.ModelAPI(inst_root_prim).SetKind("assembly")
+        except Exception:
+            pass
 
         for record in caches.instances.values():
             has_prototype = record.prototype is not None
@@ -3894,14 +4355,16 @@ def author_instance_layer(
             for label, step_id in record.hierarchy:
                 parent_path = _ensure_group(parent_path, label, step_id)
 
-            base_name_candidate = _sanitize_identifier(record.name, fallback=f"Ifc_{record.step_id}")
+            base_name_candidate = _sanitize_identifier(
+                record.name, fallback=f"Ifc_{record.step_id}"
+            )
             inst_name = _unique_child_name(parent_path, base_name_candidate)
             inst_path = parent_path.AppendChild(inst_name)
 
             xform = UsdGeom.Xform.Define(stage, inst_path)
             xform.ClearXformOpOrder()
             inst_prim = xform.GetPrim()
-            Usd.ModelAPI(inst_prim).SetKind('component')
+            Usd.ModelAPI(inst_prim).SetKind("component")
 
             # ✅ Make the INSTANCE prim instanceable (per your requirement)
             inst_prim.SetInstanceable(bool(options.enable_instancing))
@@ -3913,38 +4376,52 @@ def author_instance_layer(
             if getattr(record, "guid", None):
                 inst_prim.SetCustomDataByKey("ifc:guid", str(record.guid))
                 try:
-                    inst_prim.CreateAttribute("ifc:GlobalId", Sdf.ValueTypeNames.String).Set(str(record.guid))
+                    inst_prim.CreateAttribute(
+                        "ifc:GlobalId", Sdf.ValueTypeNames.String
+                    ).Set(str(record.guid))
                 except Exception:
                     pass
             if record.step_id is not None:
                 try:
-                    inst_prim.CreateAttribute("ifc:StepId", Sdf.ValueTypeNames.Int).Set(int(record.step_id))
+                    inst_prim.CreateAttribute("ifc:StepId", Sdf.ValueTypeNames.Int).Set(
+                        int(record.step_id)
+                    )
                 except Exception:
                     try:
-                        inst_prim.CreateAttribute("ifc:StepId", Sdf.ValueTypeNames.String).Set(str(record.step_id))
+                        inst_prim.CreateAttribute(
+                            "ifc:StepId", Sdf.ValueTypeNames.String
+                        ).Set(str(record.step_id))
                     except Exception:
                         pass
 
             if getattr(record, "ifc_path", None):
                 try:
-                    inst_prim.CreateAttribute("ifc:sourcePath", Sdf.ValueTypeNames.String).Set(str(record.ifc_path))
+                    inst_prim.CreateAttribute(
+                        "ifc:sourcePath", Sdf.ValueTypeNames.String
+                    ).Set(str(record.ifc_path))
                 except Exception:
                     pass
 
             if record.transform is not None:
                 xform.AddTransformOp().Set(np_to_gf_matrix(record.transform))
 
-            if getattr(options, "convert_metadata", True) and getattr(record, "attributes", None):
+            if getattr(options, "convert_metadata", True) and getattr(
+                record, "attributes", None
+            ):
                 _author_instance_attributes(inst_prim, record.attributes)
 
-            resolved_materials, resolved_color, style_groups = _resolve_instance_materials(
-                record, caches, proto_paths, material_library
+            resolved_materials, resolved_color, style_groups = (
+                _resolve_instance_materials(
+                    record, caches, proto_paths, material_library
+                )
             )
             material_ids = list(record.material_ids or [])
 
             detail_payload = getattr(record, "detail_mesh", None)
             has_detail_mesh = bool(
-                detail_mode_enabled and detail_payload and getattr(detail_payload, "faces", None)
+                detail_mode_enabled
+                and detail_payload
+                and getattr(detail_payload, "faces", None)
             )
 
             semantic_parts = getattr(record, "semantic_parts", None) or {}
@@ -3981,7 +4458,9 @@ def author_instance_layer(
                     if resolved_color is not None:
                         try:
                             mesh_gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
-                            mesh_gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
+                            mesh_gprim.CreateDisplayColorAttr().Set(
+                                Vt.Vec3fArray([resolved_color])
+                            )
                         except Exception:
                             pass
                 if resolved_color is not None:
@@ -4008,7 +4487,9 @@ def author_instance_layer(
                     for mesh_geom, _ in detail_entries:
                         try:
                             mesh_gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
-                            mesh_gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
+                            mesh_gprim.CreateDisplayColorAttr().Set(
+                                Vt.Vec3fArray([resolved_color])
+                            )
                         except Exception:
                             pass
                 continue
@@ -4038,7 +4519,9 @@ def author_instance_layer(
                     _apply_display_color_to_prim(inst_prim, resolved_color)
                     try:
                         mesh_gprim = UsdGeom.Gprim(mesh_geom.GetPrim())
-                        mesh_gprim.CreateDisplayColorAttr().Set(Vt.Vec3fArray([resolved_color]))
+                        mesh_gprim.CreateDisplayColorAttr().Set(
+                            Vt.Vec3fArray([resolved_color])
+                        )
                     except Exception:
                         pass
                 continue
@@ -4051,8 +4534,12 @@ def author_instance_layer(
                 continue
 
             proto_detail = _prototype_from_key(caches, record.prototype)
-            proto_detail_mesh = getattr(proto_detail, "detail_mesh", None) if proto_detail else None
-            proto_has_detail = bool(proto_detail_mesh and getattr(proto_detail_mesh, "faces", None))
+            proto_detail_mesh = (
+                getattr(proto_detail, "detail_mesh", None) if proto_detail else None
+            )
+            proto_has_detail = bool(
+                proto_detail_mesh and getattr(proto_detail_mesh, "faces", None)
+            )
 
             ref_path = inst_path.AppendChild("Prototype")
             ref_prim = stage.DefinePrim(ref_path, "Xform")
@@ -4072,7 +4559,9 @@ def author_instance_layer(
             UsdGeom.Imageable(ref_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
             mesh_child_path = ref_path.AppendChild("Geom")
             mesh_child_override = stage.OverridePrim(mesh_child_path)
-            UsdGeom.Imageable(mesh_child_override).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
+            UsdGeom.Imageable(mesh_child_override).CreatePurposeAttr().Set(
+                UsdGeom.Tokens.default_
+            )
 
             # If this instance supplies its own style groups and/or per-face material ids,
             # re-author the GeomSubsets on the *instance override* so faces match the instance.
@@ -4114,8 +4603,8 @@ def author_instance_layer(
     return inst_layer
 
 
-
 # ---------------- 2D annotation geometry ----------------
+
 
 @dataclass(frozen=True)
 class CurveWidthRuleParsed:
@@ -4133,32 +4622,47 @@ def _normalize_color(color: Tuple[float, float, float]) -> Tuple[float, float, f
 
 def _rule_from_mapping(mapping: dict[str, Any], *, context: str) -> CurveWidthRule:
     if not isinstance(mapping, dict):
-        raise ValueError(f"{context}: rule must be a mapping, got {type(mapping).__name__}.")
+        raise ValueError(
+            f"{context}: rule must be a mapping, got {type(mapping).__name__}."
+        )
     lowered = {str(k).lower(): v for k, v in mapping.items()}
     width_spec = lowered.pop("width", None)
     if width_spec is None:
         raise ValueError(f"{context}: missing required 'width' entry.")
     unit_hint = lowered.pop("unit", None)
 
-    def _parse_width_value(value: Any, unit_hint: Optional[str], *, context: str) -> tuple[float, Optional[str]]:
+    def _parse_width_value(
+        value: Any, unit_hint: Optional[str], *, context: str
+    ) -> tuple[float, Optional[str]]:
         if isinstance(value, dict):
             lowered = {str(k).lower(): v for k, v in value.items()}
             nested_value = lowered.get("value", lowered.get("amount"))
             if nested_value is None:
-                raise ValueError(f"{context}: width mapping requires 'value' or 'amount'.")
+                raise ValueError(
+                    f"{context}: width mapping requires 'value' or 'amount'."
+                )
             nested_unit = lowered.get("unit")
-            return _parse_width_value(nested_value, nested_unit or unit_hint, context=context)
+            return _parse_width_value(
+                nested_value, nested_unit or unit_hint, context=context
+            )
         unit = unit_hint
         if isinstance(value, (int, float)):
             numeric = float(value)
         elif isinstance(value, str):
-            m = re.match(r"^\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-z]+)?\s*$", value)
+            m = re.match(
+                r"^\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([A-Za-z]+)?\s*$", value
+            )
             if not m:
                 raise ValueError(f"{context}: could not parse width value {value!r}.")
-            numeric = float(m.group(1)); unit = m.group(2) or unit
+            numeric = float(m.group(1))
+            unit = m.group(2) or unit
         else:
-            raise ValueError(f"{context}: width must be numeric or string, got {type(value).__name__}.")
-        unit_normalized = unit.strip().lower() if isinstance(unit, str) and unit.strip() else None
+            raise ValueError(
+                f"{context}: width must be numeric or string, got {type(value).__name__}."
+            )
+        unit_normalized = (
+            unit.strip().lower() if isinstance(unit, str) and unit.strip() else None
+        )
         return numeric, unit_normalized
 
     width_value, width_unit = _parse_width_value(width_spec, unit_hint, context=context)
@@ -4173,7 +4677,9 @@ def _rule_from_mapping(mapping: dict[str, Any], *, context: str) -> CurveWidthRu
         try:
             step_id = int(step_id)
         except Exception as exc:
-            raise ValueError(f"{context}: step_id must be an integer, got {step_id!r}.") from exc
+            raise ValueError(
+                f"{context}: step_id must be an integer, got {step_id!r}."
+            ) from exc
     return CurveWidthRule(
         width=float(width_value),
         unit=width_unit,
@@ -4197,42 +4703,82 @@ def _rules_from_config_payload(payload: Any, *, source: str) -> list[CurveWidthR
     if not isinstance(payload, dict):
         raise ValueError(f"{source}: configuration must be a mapping or a list.")
     if "default" in payload:
-        rules.append(_rule_from_mapping({"width": payload["default"]}, context=f"{source} default"))
+        rules.append(
+            _rule_from_mapping(
+                {"width": payload["default"]}, context=f"{source} default"
+            )
+        )
     for idx, entry in enumerate(payload.get("rules", []) or []):
         if not isinstance(entry, dict):
-            raise ValueError(f"{source}: entry #{idx + 1} under 'rules' must be a mapping.")
+            raise ValueError(
+                f"{source}: entry #{idx + 1} under 'rules' must be a mapping."
+            )
         rules.append(_rule_from_mapping(entry, context=f"{source} rules[{idx}]"))
     for layer_pattern, value in (payload.get("layers") or {}).items():
         rule_mapping = {"width": value, "layer": layer_pattern}
-        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layers[{layer_pattern}]"))
+        rules.append(
+            _rule_from_mapping(
+                rule_mapping, context=f"{source} layers[{layer_pattern}]"
+            )
+        )
     for curve_pattern, value in (payload.get("curves") or {}).items():
         rule_mapping = {"width": value, "curve": curve_pattern}
-        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} curves[{curve_pattern}]"))
+        rules.append(
+            _rule_from_mapping(
+                rule_mapping, context=f"{source} curves[{curve_pattern}]"
+            )
+        )
     for layer_pattern, entries in (payload.get("layer_curves") or {}).items():
         if not isinstance(entries, dict):
-            raise ValueError(f"{source}: layer_curves[{layer_pattern}] must be a mapping.")
+            raise ValueError(
+                f"{source}: layer_curves[{layer_pattern}] must be a mapping."
+            )
         for curve_pattern, value in entries.items():
             if isinstance(value, dict):
                 rule_mapping = dict(value)
                 rule_mapping.setdefault("layer", layer_pattern)
                 rule_mapping.setdefault("curve", curve_pattern)
             else:
-                rule_mapping = {"width": value, "layer": layer_pattern, "curve": curve_pattern}
-            rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layer_curves[{layer_pattern}][{curve_pattern}]"))
+                rule_mapping = {
+                    "width": value,
+                    "layer": layer_pattern,
+                    "curve": curve_pattern,
+                }
+            rules.append(
+                _rule_from_mapping(
+                    rule_mapping,
+                    context=f"{source} layer_curves[{layer_pattern}][{curve_pattern}]",
+                )
+            )
     for hierarchy_pattern, value in (payload.get("hierarchies") or {}).items():
         rule_mapping = {"width": value, "hierarchy": hierarchy_pattern}
-        rules.append(_rule_from_mapping(rule_mapping, context=f"{source} hierarchies[{hierarchy_pattern}]"))
+        rules.append(
+            _rule_from_mapping(
+                rule_mapping, context=f"{source} hierarchies[{hierarchy_pattern}]"
+            )
+        )
     for layer_pattern, entries in (payload.get("layer_hierarchies") or {}).items():
         if not isinstance(entries, dict):
-            raise ValueError(f"{source}: layer_hierarchies[{layer_pattern}] must be a mapping.")
+            raise ValueError(
+                f"{source}: layer_hierarchies[{layer_pattern}] must be a mapping."
+            )
         for hierarchy_pattern, value in entries.items():
             if isinstance(value, dict):
                 rule_mapping = dict(value)
                 rule_mapping.setdefault("layer", layer_pattern)
                 rule_mapping.setdefault("hierarchy", hierarchy_pattern)
             else:
-                rule_mapping = {"width": value, "layer": layer_pattern, "hierarchy": hierarchy_pattern}
-            rules.append(_rule_from_mapping(rule_mapping, context=f"{source} layer_hierarchies[{layer_pattern}][{hierarchy_pattern}]"))
+                rule_mapping = {
+                    "width": value,
+                    "layer": layer_pattern,
+                    "hierarchy": hierarchy_pattern,
+                }
+            rules.append(
+                _rule_from_mapping(
+                    rule_mapping,
+                    context=f"{source} layer_hierarchies[{layer_pattern}][{hierarchy_pattern}]",
+                )
+            )
     return rules
 
 
@@ -4264,17 +4810,23 @@ def author_geometry2d_layer(
         used[base] = count + 1
         return base if count == 0 else f"{base}_{count}"
 
-    def _ensure_group(parent_path: Sdf.Path, label: str, step_id: Optional[int]) -> Sdf.Path:
+    def _ensure_group(
+        parent_path: Sdf.Path, label: str, step_id: Optional[int]
+    ) -> Sdf.Path:
         key = (parent_path, label, step_id)
         cached = hierarchy_nodes.get(key)
         if cached is not None:
             return cached
-        token = _unique_child_name(parent_path, _sanitize_identifier(label, fallback=f"Group_{step_id or 'Node'}") or "Group")
+        token = _unique_child_name(
+            parent_path,
+            _sanitize_identifier(label, fallback=f"Group_{step_id or 'Node'}")
+            or "Group",
+        )
         group_path = parent_path.AppendChild(token)
         xf = UsdGeom.Xform.Define(stage, group_path)
         xf.ClearXformOpOrder()
         prim = xf.GetPrim()
-        Usd.ModelAPI(prim).SetKind('group')
+        Usd.ModelAPI(prim).SetKind("group")
         prim.SetCustomDataByKey("ifc:label", label)
         if step_id is not None:
             try:
@@ -4295,7 +4847,7 @@ def author_geometry2d_layer(
         if not stage.GetPrimAtPath(container_path):
             curves_xf = UsdGeom.Xform.Define(stage, container_path)
             curves_xf.ClearXformOpOrder()
-            Usd.ModelAPI(curves_xf.GetPrim()).SetKind('group')
+            Usd.ModelAPI(curves_xf.GetPrim()).SetKind("group")
         curves_root_cache[parent_path] = container_path
         return container_path
 
@@ -4304,7 +4856,9 @@ def author_geometry2d_layer(
             UsdGeom.Xform.Define(stage, inst_root)
 
         # Resolve a default width helper (from rules)
-        rules: Tuple[CurveWidthRule, ...] = tuple(getattr(options, "curve_width_rules", ()) or ())
+        rules: Tuple[CurveWidthRule, ...] = tuple(
+            getattr(options, "curve_width_rules", ()) or ()
+        )
         stage_meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
 
         def _pattern_match(pattern: str, candidates: Iterable[str]) -> bool:
@@ -4322,7 +4876,11 @@ def author_geometry2d_layer(
             return False
 
         def _candidate_layer_names() -> Tuple[str, ...]:
-            sanitized = _sanitize_identifier(base_name, fallback=base_name) if base_name else None
+            sanitized = (
+                _sanitize_identifier(base_name, fallback=base_name)
+                if base_name
+                else None
+            )
             values = [base_name] if base_name else []
             if sanitized and sanitized not in values:
                 values.append(sanitized)
@@ -4349,7 +4907,8 @@ def author_geometry2d_layer(
                 if raw_path:
                     candidates.append(raw_path)
                 sanitized_labels = [
-                    _sanitize_identifier(label, fallback=label) or label for label in labels
+                    _sanitize_identifier(label, fallback=label) or label
+                    for label in labels
                 ]
                 san_path = "/".join(sanitized_labels)
                 if san_path and san_path not in candidates:
@@ -4364,15 +4923,23 @@ def author_geometry2d_layer(
         def _rule_applies(rule: CurveWidthRule, curve) -> bool:
             if rule.layer and not _pattern_match(rule.layer, _candidate_layer_names()):
                 return False
-            if rule.curve and not _pattern_match(rule.curve, _curve_name_candidates(curve)):
+            if rule.curve and not _pattern_match(
+                rule.curve, _curve_name_candidates(curve)
+            ):
                 return False
-            if rule.hierarchy and not _pattern_match(rule.hierarchy, _hierarchy_candidates(curve)):
+            if rule.hierarchy and not _pattern_match(
+                rule.hierarchy, _hierarchy_candidates(curve)
+            ):
                 return False
-            if rule.step_id is not None and rule.step_id != getattr(curve, "step_id", None):
+            if rule.step_id is not None and rule.step_id != getattr(
+                curve, "step_id", None
+            ):
                 return False
             return True
 
-        def _convert_rule_width_to_stage_units(width: float, unit: Optional[str]) -> Optional[float]:
+        def _convert_rule_width_to_stage_units(
+            width: float, unit: Optional[str]
+        ) -> Optional[float]:
             if width <= 0.0:
                 return None
             unit_norm = (unit or "stage").strip().lower()
@@ -4394,7 +4961,9 @@ def author_geometry2d_layer(
             for rule in rules:
                 if not _rule_applies(rule, curve):
                     continue
-                converted = _convert_rule_width_to_stage_units(float(rule.width), rule.unit)
+                converted = _convert_rule_width_to_stage_units(
+                    float(rule.width), rule.unit
+                )
                 if converted is None:
                     continue
                 resolved = converted
@@ -4407,7 +4976,10 @@ def author_geometry2d_layer(
 
             curves_parent = _ensure_curves_container(parent_path)
 
-            curve_base = sanitize_name(curve.name, fallback=f"Geometry2D_{curve.step_id}") or "Geometry2D"
+            curve_base = (
+                sanitize_name(curve.name, fallback=f"Geometry2D_{curve.step_id}")
+                or "Geometry2D"
+            )
             curve_token = _unique_child_name(curves_parent, curve_base)
             curve_path = curves_parent.AppendChild(curve_token)
 
@@ -4423,8 +4995,17 @@ def author_geometry2d_layer(
             basis.CreateCurveVertexCountsAttr(counts)
 
             pt_array = Vt.Vec3fArray(len(curve.points))
+            min_bounds = [float("inf"), float("inf"), float("inf")]
+            max_bounds = [float("-inf"), float("-inf"), float("-inf")]
             for idx, (x, y, z) in enumerate(curve.points):
-                pt_array[idx] = (float(x), float(y), float(z))
+                px, py, pz = float(x), float(y), float(z)
+                pt_array[idx] = (px, py, pz)
+                min_bounds[0] = min(min_bounds[0], px)
+                min_bounds[1] = min(min_bounds[1], py)
+                min_bounds[2] = min(min_bounds[2], pz)
+                max_bounds[0] = max(max_bounds[0], px)
+                max_bounds[1] = max(max_bounds[1], py)
+                max_bounds[2] = max(max_bounds[2], pz)
             basis.CreatePointsAttr(pt_array)
 
             width_value = _resolved_curve_width(curve)
@@ -4438,6 +5019,31 @@ def author_geometry2d_layer(
 
             prim = basis.GetPrim()
             try:
+                extent_vals = None
+                if all(v != float("inf") for v in min_bounds) and all(
+                    v != float("-inf") for v in max_bounds
+                ):
+                    extent_vals = [tuple(min_bounds), tuple(max_bounds)]
+                if extent_vals is None:
+                    try:
+                        computed = UsdGeom.Boundable.ComputeExtentFromPlugins(
+                            basis, Usd.TimeCode.Default()
+                        )
+                        if computed:
+                            extent_vals = [
+                                (computed[0][0], computed[0][1], computed[0][2]),
+                                (computed[1][0], computed[1][1], computed[1][2]),
+                            ]
+                    except Exception:
+                        pass
+                if extent_vals:
+                    extent = Vt.Vec3fArray(2)
+                    extent[0] = extent_vals[0]
+                    extent[1] = extent_vals[1]
+                    basis.CreateExtentAttr(extent)
+            except Exception:
+                pass
+            try:
                 prim.SetCustomDataByKey("ifc:annotationStepId", int(curve.step_id))
             except Exception:
                 prim.SetCustomDataByKey("ifc:annotationStepId", curve.step_id)
@@ -4447,6 +5053,7 @@ def author_geometry2d_layer(
 
 
 # ---------------- Persist instance cache (for debugging) ----------------
+
 
 def _json_safe(value: Any) -> Any:
     try:
@@ -4477,12 +5084,18 @@ def persist_instance_cache(
                 "step_id": record.step_id,
                 "name": record.name,
                 "guid": getattr(record, "guid", None),
-                "transform": list(record.transform) if record.transform is not None else None,
+                "transform": list(record.transform)
+                if record.transform is not None
+                else None,
                 "prototype": {
                     "kind": record.prototype.kind,
                     "identifier": record.prototype.identifier,
-                } if record.prototype is not None else None,
-                "prototype_path": proto_paths.get(record.prototype).pathString if (record.prototype and proto_paths.get(record.prototype)) else None,
+                }
+                if record.prototype is not None
+                else None,
+                "prototype_path": proto_paths.get(record.prototype).pathString
+                if (record.prototype and proto_paths.get(record.prototype))
+                else None,
                 "material_ids": list(record.material_ids or []),
                 "attributes": _json_safe(record.attributes),
             }
@@ -4496,6 +5109,7 @@ def persist_instance_cache(
 # ---------------- Georef + Anchor — stubs (retain signatures) ----------------
 # Plug back your full implementations here if you use pyproj & Cesium metadata.
 
+
 def assign_world_geolocation(
     stage: Usd.Stage,
     base_point: BasePointConfig,
@@ -4503,8 +5117,228 @@ def assign_world_geolocation(
     geodetic_crs: str = "EPSG:4326",
     unit_hint: Optional[str] = None,
     lonlat_override: Optional[GeodeticCoordinate] = None,
-):
-    return None
+    geospatial_mode: str = "auto",
+    offline: bool = False,
+    model_offset: Optional[Tuple[float, float, float]] = None,
+    model_offset_type: Optional[str] = None,
+    anchor_mode: Optional[str] = None,
+) -> Optional[Tuple[float, float, float]]:
+    """
+    Author lightweight geospatial metadata on the root prim/layer.
+
+    This keeps USD stages self-describing (USDGeospatial-style) and records
+    the selected driver mode so downstream tools can decide whether to stream
+    live OmniGeospatial content or rely on baked metadata.
+    """
+    mode = resolve_geospatial_mode(
+        geospatial_mode,
+        offline=offline,
+        output_path=getattr(stage.GetRootLayer(), "realPath", None),
+    )
+    if mode == "none":
+        return None
+
+    world_prim = stage.GetPrimAtPath("/World")
+    if not world_prim:
+        world_xf = UsdGeom.Xform.Define(stage, "/World")
+        world_prim = world_xf.GetPrim()
+
+    LOG.debug(
+        "Geospatial base point: easting=%s northing=%s height=%s unit=%s epsg=%s anchor=%s",
+        getattr(base_point, "easting", None),
+        getattr(base_point, "northing", None),
+        getattr(base_point, "height", None),
+        getattr(base_point, "unit", None),
+        getattr(base_point, "epsg", None),
+        anchor_mode,
+    )
+
+    # Resolve lon/lat/height
+    geo_coord = lonlat_override or _derive_lonlat_from_base_point(
+        base_point, projected_crs
+    )
+    if lonlat_override:
+        LOG.debug(
+            "Using lonlat_override for geospatial reference: lon=%s lat=%s height=%s",
+            lonlat_override.longitude,
+            lonlat_override.latitude,
+            lonlat_override.height,
+        )
+    elif geo_coord:
+        LOG.debug(
+            "Derived geospatial reference: lon=%s lat=%s height=%s from projected_crs=%s",
+            geo_coord.longitude,
+            geo_coord.latitude,
+            geo_coord.height,
+            projected_crs,
+        )
+    if geo_coord is None:
+        LOG.debug(
+            "Geospatial mode %s requested but no lon/lat could be derived; skipping metadata.",
+            mode,
+        )
+        return None
+
+    # Normalise units/up-axis for USDGeospatial consumers
+    meters_per_unit = _unit_factor(unit_hint or getattr(base_point, "unit", None))
+    if meters_per_unit <= 0:
+        meters_per_unit = 1.0
+    try:
+        UsdGeom.SetStageMetersPerUnit(stage, meters_per_unit)
+    except Exception:
+        pass
+    try:
+        current_up = UsdGeom.GetStageUpAxis(stage)
+        if not current_up:
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+    except Exception:
+        pass
+
+    # Stamp metadata on the prim and root layer for portability (use only crate-friendly scalar types)
+    try:
+        world_prim.SetCustomDataByKey("ifc:geospatialMode", mode)
+        world_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
+        world_prim.SetCustomDataByKey("ifc:projectedCRS", projected_crs)
+        if anchor_mode:
+            world_prim.SetCustomDataByKey("ifc:anchorMode", str(anchor_mode))
+        coords_payload = {
+            "lon": float(geo_coord.longitude),
+            "lat": float(geo_coord.latitude),
+            "height": float(geo_coord.height) if geo_coord.height is not None else 0.0,
+        }
+        world_prim.SetCustomDataByKey("ifc:geodeticCoordinates", coords_payload)
+        if model_offset:
+            world_prim.SetCustomDataByKey(
+                "ifc:modelOffset",
+                {
+                    "easting": float(model_offset[0]),
+                    "northing": float(model_offset[1]),
+                    "height": float(model_offset[2]),
+                },
+            )
+        if model_offset_type:
+            world_prim.SetCustomDataByKey("ifc:modelOffsetType", str(model_offset_type))
+    except Exception:
+        pass
+
+    # Also expose CRS + anchor metadata as prim properties for consumers that avoid customData.
+    try:
+        world_prim.CreateAttribute(
+            "ifc:projectedCRS", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(projected_crs))
+        world_prim.CreateAttribute(
+            "ifc:geodeticCRS", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(geodetic_crs))
+        if anchor_mode:
+            world_prim.CreateAttribute(
+                "ifc:anchorMode", Sdf.ValueTypeNames.Token, custom=True
+            ).Set(str(anchor_mode))
+        world_prim.CreateAttribute(
+            "ifc:geodeticCoordinates", Sdf.ValueTypeNames.Double3, custom=True
+        ).Set(
+            (
+                float(geo_coord.longitude),
+                float(geo_coord.latitude),
+                float(geo_coord.height) if geo_coord.height is not None else 0.0,
+            )
+        )
+        if model_offset:
+            world_prim.CreateAttribute(
+                "ifc:modelOffset", Sdf.ValueTypeNames.Double3, custom=True
+            ).Set(
+                (
+                    float(model_offset[0]),
+                    float(model_offset[1]),
+                    float(model_offset[2]),
+                )
+            )
+        if model_offset_type:
+            world_prim.CreateAttribute(
+                "ifc:modelOffsetType", Sdf.ValueTypeNames.Token, custom=True
+            ).Set(str(model_offset_type))
+    except Exception:
+        pass
+
+    try:
+        layer = stage.GetRootLayer()
+        data = dict(getattr(layer, "customLayerData", {}) or {})
+        data.update(
+            {
+                "geospatialMode": mode,
+                "geodeticCRS": geodetic_crs,
+                "projectedCRS": projected_crs,
+                "geodeticCoordinates": coords_payload,
+            }
+        )
+        if anchor_mode:
+            data["anchorMode"] = str(anchor_mode)
+        if model_offset:
+            data["modelOffset"] = {
+                "easting": float(model_offset[0]),
+                "northing": float(model_offset[1]),
+                "height": float(model_offset[2]),
+            }
+        if model_offset_type:
+            data["modelOffsetType"] = str(model_offset_type)
+        layer.customLayerData = data
+    except Exception:
+        pass
+
+    # OmniGeospatial WGS84 reference attrs (USD schema-friendly)
+    # Even in "usd" mode/offline conversion we author the canonical attribute names so Kit consumers can
+    # discover the stage georeference without relying on customData keys.
+    try:
+        root_layer = stage.GetRootLayer() if stage is not None else None
+        context = (
+            Usd.EditContext(stage, root_layer)
+            if root_layer is not None
+            else nullcontext()
+        )
+        with context:
+            for geo_path in _geospatial_root_paths(stage):
+                try:
+                    geo_xf = ensure_geospatial_root(stage, geo_path.pathString)
+                    geo_prim = geo_xf.GetPrim()
+                    _author_wgs84_reference_attrs_on_prim(
+                        geo_prim,
+                        latitude=float(geo_coord.latitude),
+                        longitude=float(geo_coord.longitude),
+                        altitude_m=float(geo_coord.height)
+                        if geo_coord.height is not None
+                        else 0.0,
+                        tangent_plane="ENU",
+                        orientation_ypr=(0.0, 0.0, 0.0),
+                    )
+                    geo_prim.SetCustomDataByKey("ifc:projectedCRS", projected_crs)
+                    geo_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
+                    if anchor_mode:
+                        geo_prim.SetCustomDataByKey("ifc:anchorMode", str(anchor_mode))
+                    LOG.debug(
+                        "Authored WGS84 reference on %s: lat=%s lon=%s height=%s",
+                        geo_path,
+                        float(geo_coord.latitude),
+                        float(geo_coord.longitude),
+                        float(geo_coord.height)
+                        if geo_coord.height is not None
+                        else 0.0,
+                    )
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    if anchor_mode and str(anchor_mode).strip().lower() == "local":
+        LOG.warning(
+            "Geospatial reference authored with anchorMode='local'. "
+            "Stage origin corresponds to a project-local origin; WGS84 reference "
+            "is contextual, not survey-authoritative."
+        )
+
+    return (
+        float(geo_coord.longitude),
+        float(geo_coord.latitude),
+        float(geo_coord.height) if geo_coord.height is not None else 0.0,
+    )
 
 
 def apply_stage_anchor_transform(
@@ -4531,7 +5365,11 @@ def apply_stage_anchor_transform(
     if anchor_mode is None:
         return
 
-    mode_key = anchor_mode.strip().lower() if isinstance(anchor_mode, str) else str(anchor_mode).strip().lower()
+    mode_key = (
+        anchor_mode.strip().lower()
+        if isinstance(anchor_mode, str)
+        else str(anchor_mode).strip().lower()
+    )
     if not mode_key:
         return
 
@@ -4565,17 +5403,23 @@ def apply_stage_anchor_transform(
         else zero_base_point
     )
     base_point_resolved = (
-        base_point.with_fallback(shared_site_resolved) if base_point else shared_site_resolved
+        base_point.with_fallback(shared_site_resolved)
+        if base_point
+        else shared_site_resolved
     )
 
     effective_mode = mode_normalised
     if effective_mode == "local" and base_point is None:
         effective_mode = "site"
-    anchor_bp = shared_site_resolved if effective_mode == "site" else base_point_resolved
+    anchor_bp = (
+        shared_site_resolved if effective_mode == "site" else base_point_resolved
+    )
 
-    anchor_easting_m, anchor_northing_m, anchor_height_m, anchor_unit = _base_point_components_in_meters(anchor_bp)
-    shared_easting_m, shared_northing_m, shared_height_m, shared_unit = _base_point_components_in_meters(
-        shared_site_resolved
+    anchor_easting_m, anchor_northing_m, anchor_height_m, anchor_unit = (
+        _base_point_components_in_meters(anchor_bp)
+    )
+    shared_easting_m, shared_northing_m, shared_height_m, shared_unit = (
+        _base_point_components_in_meters(shared_site_resolved)
     )
     (
         model_bp_easting_m,
@@ -4592,7 +5436,9 @@ def apply_stage_anchor_transform(
         scale = float(getattr(map_conv, "scale", 1.0) or 1.0)
         eastings_m = float(getattr(map_conv, "eastings", 0.0) or 0.0) * scale
         northings_m = float(getattr(map_conv, "northings", 0.0) or 0.0) * scale
-        ortho_height_m = float(getattr(map_conv, "orthogonal_height", 0.0) or 0.0) * scale
+        ortho_height_m = (
+            float(getattr(map_conv, "orthogonal_height", 0.0) or 0.0) * scale
+        )
         d_e = anchor_easting_m - eastings_m
         d_n = anchor_northing_m - northings_m
         ax, ay = map_conv.normalized_axes()
@@ -4640,26 +5486,42 @@ def apply_stage_anchor_transform(
         Sdf.ValueTypeNames.Double3,
         tuple(float(translation_stage[i]) for i in range(3)),
     )
-    _append_attr("ifc:stageAnchorRotationDegrees", Sdf.ValueTypeNames.Double, float(rotation_deg))
+    _append_attr(
+        "ifc:stageAnchorRotationDegrees", Sdf.ValueTypeNames.Double, float(rotation_deg)
+    )
     _append_attr(
         "ifc:stageAnchorBasePointMeters",
         Sdf.ValueTypeNames.Double3,
         (float(anchor_easting_m), float(anchor_northing_m), float(anchor_height_m)),
     )
-    _append_attr("ifc:stageAnchorBasePointUnit", Sdf.ValueTypeNames.String, anchor_unit or "")
+    _append_attr(
+        "ifc:stageAnchorBasePointUnit", Sdf.ValueTypeNames.String, anchor_unit or ""
+    )
     _append_attr(
         "ifc:stageAnchorModelBasePointMeters",
         Sdf.ValueTypeNames.Double3,
-        (float(model_bp_easting_m), float(model_bp_northing_m), float(model_bp_height_m)),
+        (
+            float(model_bp_easting_m),
+            float(model_bp_northing_m),
+            float(model_bp_height_m),
+        ),
     )
-    _append_attr("ifc:stageAnchorModelBasePointUnit", Sdf.ValueTypeNames.String, model_bp_unit or "")
+    _append_attr(
+        "ifc:stageAnchorModelBasePointUnit",
+        Sdf.ValueTypeNames.String,
+        model_bp_unit or "",
+    )
     _append_attr(
         "ifc:stageAnchorSharedSiteMeters",
         Sdf.ValueTypeNames.Double3,
         (float(shared_easting_m), float(shared_northing_m), float(shared_height_m)),
     )
-    _append_attr("ifc:stageAnchorSharedSiteUnit", Sdf.ValueTypeNames.String, shared_unit or "")
-    _append_attr("ifc:stageAnchorProjectedCRS", Sdf.ValueTypeNames.String, projected_crs or "")
+    _append_attr(
+        "ifc:stageAnchorSharedSiteUnit", Sdf.ValueTypeNames.String, shared_unit or ""
+    )
+    _append_attr(
+        "ifc:stageAnchorProjectedCRS", Sdf.ValueTypeNames.String, projected_crs or ""
+    )
     if map_conv is not None:
         _append_attr(
             "ifc:stageAnchorMapScale",
@@ -4668,42 +5530,98 @@ def apply_stage_anchor_transform(
         )
 
     if anchor_geodetic is not None:
-        _append_attr("ifc:longitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.longitude))
-        _append_attr("ifc:latitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.latitude))
+        _append_attr(
+            "ifc:longitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.longitude)
+        )
+        _append_attr(
+            "ifc:latitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.latitude)
+        )
         if anchor_geodetic.height is not None:
-            _append_attr("ifc:ellipsoidalHeight", Sdf.ValueTypeNames.Double, float(anchor_geodetic.height))
-        _append_attr("CesiumLongitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.longitude))
-        _append_attr("CesiumLatitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.latitude))
+            _append_attr(
+                "ifc:ellipsoidalHeight",
+                Sdf.ValueTypeNames.Double,
+                float(anchor_geodetic.height),
+            )
+        _append_attr(
+            "CesiumLongitude",
+            Sdf.ValueTypeNames.Double,
+            float(anchor_geodetic.longitude),
+        )
+        _append_attr(
+            "CesiumLatitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.latitude)
+        )
         if anchor_geodetic.height is not None:
-            _append_attr("CesiumHeight", Sdf.ValueTypeNames.Double, float(anchor_geodetic.height))
+            _append_attr(
+                "CesiumHeight", Sdf.ValueTypeNames.Double, float(anchor_geodetic.height)
+            )
 
     if base_geodetic is not None:
-        _append_attr("ifc:stageAnchorModelLongitude", Sdf.ValueTypeNames.Double, float(base_geodetic.longitude))
-        _append_attr("ifc:stageAnchorModelLatitude", Sdf.ValueTypeNames.Double, float(base_geodetic.latitude))
+        _append_attr(
+            "ifc:stageAnchorModelLongitude",
+            Sdf.ValueTypeNames.Double,
+            float(base_geodetic.longitude),
+        )
+        _append_attr(
+            "ifc:stageAnchorModelLatitude",
+            Sdf.ValueTypeNames.Double,
+            float(base_geodetic.latitude),
+        )
         if base_geodetic.height is not None:
             _append_attr(
                 "ifc:stageAnchorModelEllipsoidalHeight",
                 Sdf.ValueTypeNames.Double,
                 float(base_geodetic.height),
             )
-        _append_attr("CesiumModelLongitude", Sdf.ValueTypeNames.Double, float(base_geodetic.longitude))
-        _append_attr("CesiumModelLatitude", Sdf.ValueTypeNames.Double, float(base_geodetic.latitude))
+        _append_attr(
+            "CesiumModelLongitude",
+            Sdf.ValueTypeNames.Double,
+            float(base_geodetic.longitude),
+        )
+        _append_attr(
+            "CesiumModelLatitude",
+            Sdf.ValueTypeNames.Double,
+            float(base_geodetic.latitude),
+        )
         if base_geodetic.height is not None:
-            _append_attr("CesiumModelHeight", Sdf.ValueTypeNames.Double, float(base_geodetic.height))
+            _append_attr(
+                "CesiumModelHeight",
+                Sdf.ValueTypeNames.Double,
+                float(base_geodetic.height),
+            )
 
     if site_geodetic is not None:
-        _append_attr("ifc:stageAnchorSharedSiteLongitude", Sdf.ValueTypeNames.Double, float(site_geodetic.longitude))
-        _append_attr("ifc:stageAnchorSharedSiteLatitude", Sdf.ValueTypeNames.Double, float(site_geodetic.latitude))
+        _append_attr(
+            "ifc:stageAnchorSharedSiteLongitude",
+            Sdf.ValueTypeNames.Double,
+            float(site_geodetic.longitude),
+        )
+        _append_attr(
+            "ifc:stageAnchorSharedSiteLatitude",
+            Sdf.ValueTypeNames.Double,
+            float(site_geodetic.latitude),
+        )
         if site_geodetic.height is not None:
             _append_attr(
                 "ifc:stageAnchorSharedSiteEllipsoidalHeight",
                 Sdf.ValueTypeNames.Double,
                 float(site_geodetic.height),
             )
-        _append_attr("CesiumSharedSiteLongitude", Sdf.ValueTypeNames.Double, float(site_geodetic.longitude))
-        _append_attr("CesiumSharedSiteLatitude", Sdf.ValueTypeNames.Double, float(site_geodetic.latitude))
+        _append_attr(
+            "CesiumSharedSiteLongitude",
+            Sdf.ValueTypeNames.Double,
+            float(site_geodetic.longitude),
+        )
+        _append_attr(
+            "CesiumSharedSiteLatitude",
+            Sdf.ValueTypeNames.Double,
+            float(site_geodetic.latitude),
+        )
         if site_geodetic.height is not None:
-            _append_attr("CesiumSharedSiteHeight", Sdf.ValueTypeNames.Double, float(site_geodetic.height))
+            _append_attr(
+                "CesiumSharedSiteHeight",
+                Sdf.ValueTypeNames.Double,
+                float(site_geodetic.height),
+            )
 
     attr_names_to_cleanup = [name for name, _, _ in attr_values]
 
@@ -4716,11 +5634,16 @@ def apply_stage_anchor_transform(
             try:
                 instance_root_paths.append(Sdf.Path(str(recorded_root)))
             except Exception:
-                LOG.debug("Unable to coerce recorded instance root path %r into Sdf.Path", recorded_root)
+                LOG.debug(
+                    "Unable to coerce recorded instance root path %r into Sdf.Path",
+                    recorded_root,
+                )
 
     if not instance_root_paths:
         for child in world_prim.GetChildren():
-            if child.GetTypeName() == "Xform" and child.GetName().endswith("_Instances"):
+            if child.GetTypeName() == "Xform" and child.GetName().endswith(
+                "_Instances"
+            ):
                 instance_root_paths.append(child.GetPath())
 
     instance_layer = getattr(caches, "instance_layer", None)
@@ -4742,22 +5665,32 @@ def apply_stage_anchor_transform(
         applied_to_instance = True
 
     if not applied_to_instance:
-        LOG.debug("Instance root not found; applying geo anchor metadata on /World fallback.")
+        LOG.debug(
+            "Instance root not found; applying geo anchor metadata on /World fallback."
+        )
         _apply_to_prim(world_prim, None)
     else:
         # When we have an instance root, move the metadata off /World and onto the instance layer.
         root_layer = stage.GetRootLayer()
-        cleanup_context = Usd.EditContext(stage, root_layer) if root_layer is not None else nullcontext()
+        cleanup_context = (
+            Usd.EditContext(stage, root_layer)
+            if root_layer is not None
+            else nullcontext()
+        )
         with cleanup_context:
             for name in attr_names_to_cleanup:
                 if world_prim.HasProperty(name):
                     try:
                         world_prim.RemoveProperty(name)
                     except Exception:
-                        LOG.debug("Unable to remove world attribute %s during anchor relocation", name)
+                        LOG.debug(
+                            "Unable to remove world attribute %s during anchor relocation",
+                            name,
+                        )
 
 
 # ---------------- Federated master view - stub (retain signature) ----------------
+
 
 def update_federated_view(
     master_stage_path: PathLike,
@@ -4793,7 +5726,9 @@ def update_federated_view(
     try:
         mesh_child_path = target_path.AppendChild("Geom")
         mesh_override = stage.OverridePrim(mesh_child_path)
-        UsdGeom.Imageable(mesh_override).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
+        UsdGeom.Imageable(mesh_override).CreatePurposeAttr().Set(
+            UsdGeom.Tokens.default_
+        )
     except Exception:
         pass
     stage.GetRootLayer().Save()

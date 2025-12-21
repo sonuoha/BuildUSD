@@ -22,8 +22,8 @@ _INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
 
 def _sanitize_filename(value: str) -> str:
-    sanitized = ''.join(ch for ch in value if ch not in _INVALID_FILENAME_CHARS)
-    sanitized = sanitized.rstrip(' .')
+    sanitized = "".join(ch for ch in value if ch not in _INVALID_FILENAME_CHARS)
+    sanitized = sanitized.rstrip(" .")
     sanitized = sanitized.strip()
     return sanitized
 
@@ -51,7 +51,11 @@ class BasePointConfig:
     epsg: Optional[str] = None
 
     @classmethod
-    def from_mapping(cls, data: Optional[Dict[str, Any]], fallback: Optional["BasePointConfig"] = None) -> Optional["BasePointConfig"]:
+    def from_mapping(
+        cls,
+        data: Optional[Dict[str, Any]],
+        fallback: Optional["BasePointConfig"] = None,
+    ) -> Optional["BasePointConfig"]:
         if data is None:
             return fallback
         try:
@@ -71,7 +75,9 @@ class BasePointConfig:
             text = str(epsg_value).strip()
             if text:
                 epsg = text
-        return cls(easting=easting, northing=northing, height=height, unit=unit, epsg=epsg)
+        return cls(
+            easting=easting, northing=northing, height=height, unit=unit, epsg=epsg
+        )
 
     def with_fallback(self, fallback: Optional["BasePointConfig"]) -> "BasePointConfig":
         if fallback is None:
@@ -94,7 +100,9 @@ class GeodeticCoordinate:
     height: Optional[float] = None
 
     @classmethod
-    def from_mapping(cls, data: Optional[Dict[str, Any]]) -> Optional["GeodeticCoordinate"]:
+    def from_mapping(
+        cls, data: Optional[Dict[str, Any]]
+    ) -> Optional["GeodeticCoordinate"]:
         if not data:
             return None
         try:
@@ -208,7 +216,9 @@ class ConversionManifest:
             projected_crs=defaults_data.get("projected_crs"),
             geodetic_crs=defaults_data.get("geodetic_crs"),
             base_point=BasePointConfig.from_mapping(defaults_data.get("base_point")),
-            shared_site_base_point=BasePointConfig.from_mapping(defaults_data.get("shared_site_base_point")),
+            shared_site_base_point=BasePointConfig.from_mapping(
+                defaults_data.get("shared_site_base_point")
+            ),
             revision=_extract_revision(defaults_data),
         )
 
@@ -222,7 +232,9 @@ class ConversionManifest:
             projected = entry.get("projected_crs")
             geodetic = entry.get("geodetic_crs")
             base_point = BasePointConfig.from_mapping(entry.get("base_point"))
-            shared_site_base_point = BasePointConfig.from_mapping(entry.get("shared_site_base_point"), defaults.shared_site_base_point)
+            shared_site_base_point = BasePointConfig.from_mapping(
+                entry.get("shared_site_base_point"), defaults.shared_site_base_point
+            )
             lonlat = GeodeticCoordinate.from_mapping(entry.get("lonlat"))
             masters[mid] = MasterConfig(
                 id=mid,
@@ -238,7 +250,9 @@ class ConversionManifest:
         file_rules: List[FileRule] = []
         for entry in data.get("files", []) or []:
             base_point = BasePointConfig.from_mapping(entry.get("base_point"))
-            shared_site_base_point = BasePointConfig.from_mapping(entry.get("shared_site_base_point"), defaults.shared_site_base_point)
+            shared_site_base_point = BasePointConfig.from_mapping(
+                entry.get("shared_site_base_point"), defaults.shared_site_base_point
+            )
             lonlat = GeodeticCoordinate.from_mapping(entry.get("lonlat"))
             file_rules.append(
                 FileRule(
@@ -342,23 +356,38 @@ class ConversionManifest:
                 base_point = fallback_base_point
                 base_point_source = "fallback"
         if base_point is None:
-            raise ValueError(f"No base point defined for IFC '{name}' in manifest or fallbacks")
-        elif base_point_source in {"defaults", "fallback"} and master.base_point is not None:
+            raise ValueError(
+                f"No base point defined for IFC '{name}' in manifest or fallbacks"
+            )
+        elif (
+            base_point_source in {"defaults", "fallback"}
+            and master.base_point is not None
+        ):
             # Prefer the master's base point when the value currently stems from defaults/fallbacks.
             base_point = master.base_point
             base_point_source = "master"
 
         if shared_site_base_point is None and master.shared_site_base_point is not None:
             shared_site_base_point = master.shared_site_base_point
-        if shared_site_base_point is None and self.defaults.shared_site_base_point is not None:
+        if (
+            shared_site_base_point is None
+            and self.defaults.shared_site_base_point is not None
+        ):
             shared_site_base_point = self.defaults.shared_site_base_point
-        if shared_site_base_point is None and fallback_shared_site_base_point is not None:
+        if (
+            shared_site_base_point is None
+            and fallback_shared_site_base_point is not None
+        ):
             shared_site_base_point = fallback_shared_site_base_point
         if shared_site_base_point is None:
-            shared_site_base_point = BasePointConfig(easting=0.0, northing=0.0, height=0.0, unit="m")
+            shared_site_base_point = BasePointConfig(
+                easting=0.0, northing=0.0, height=0.0, unit="m"
+            )
 
         if projected_crs is None:
-            raise ValueError(f"No projected CRS defined for IFC '{name}' in manifest or fallbacks")
+            raise ValueError(
+                f"No projected CRS defined for IFC '{name}' in manifest or fallbacks"
+            )
         if geodetic_crs is None:
             geodetic_crs = _DEFAULT_GEODETIC_CRS
 
@@ -385,7 +414,12 @@ class ConversionManifest:
                 if rule.matches(ifc_path):
                     yield rule
             except Exception as exc:  # pragma: no cover - defensive logging
-                log.warning("Manifest rule %s failed to evaluate for %s: %s", rule, ifc_path, exc)
+                log.warning(
+                    "Manifest rule %s failed to evaluate for %s: %s",
+                    rule,
+                    ifc_path,
+                    exc,
+                )
 
     def _resolve_master(
         self,
@@ -399,11 +433,18 @@ class ConversionManifest:
         if master_id:
             master = self.masters.get(master_id)
             if master is None:
-                log.warning("Manifest references undefined master '%s'; treating as ad-hoc file name", master_id)
-                master = MasterConfig(id=master_id, name=master_id, revision=fallback_revision)
+                log.warning(
+                    "Manifest references undefined master '%s'; treating as ad-hoc file name",
+                    master_id,
+                )
+                master = MasterConfig(
+                    id=master_id, name=master_id, revision=fallback_revision
+                )
         if master is None:
             name = master_name or fallback_name
-            master = MasterConfig(id="__default__", name=name, revision=fallback_revision)
+            master = MasterConfig(
+                id="__default__", name=name, revision=fallback_revision
+            )
         resolved_name = master.resolved_name()
         if master.name != resolved_name:
             master = replace(master, name=resolved_name)

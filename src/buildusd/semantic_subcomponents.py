@@ -25,16 +25,28 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 
-SemanticParts = Dict[str, Dict[str, Any]]  # label -> {vertices, faces, material_ids, style_groups}
+SemanticParts = Dict[
+    str, Dict[str, Any]
+]  # label -> {vertices, faces, material_ids, style_groups}
 
 
-_PANEL_TOKENS = ("PANEL", "LEAF", "SASH", "CASEMENT", "DOOR PANEL", "DOOR_LEAF", "SHUTTER")
+_PANEL_TOKENS = (
+    "PANEL",
+    "LEAF",
+    "SASH",
+    "CASEMENT",
+    "DOOR PANEL",
+    "DOOR_LEAF",
+    "SHUTTER",
+)
 _FRAME_TOKENS = ("FRAME", "LINING", "JAMB", "MULLION", "TRANSOM", "REVEAL")
 _GLAZING_TOKENS = ("GLAZ", "GLASS", "IGU", "PANE")
 _HARDWARE_TOKENS = ("HANDLE", "HINGE", "LOCK", "LATCH", "KEEPER", "STRIKE")
 
 
-def _get_tokens(tokens_dict: Optional[Dict[str, Sequence[str]]], key: str, defaults: Sequence[str]) -> Sequence[str]:
+def _get_tokens(
+    tokens_dict: Optional[Dict[str, Sequence[str]]], key: str, defaults: Sequence[str]
+) -> Sequence[str]:
     if not tokens_dict:
         return defaults
     return tokens_dict.get(key) or defaults
@@ -93,7 +105,9 @@ def _aspect_name(aspect: Any) -> str:
     return ""
 
 
-def _classify_aspect_role(aspect: Any, tokens: Dict[str, Sequence[str]]) -> Optional[str]:
+def _classify_aspect_role(
+    aspect: Any, tokens: Dict[str, Sequence[str]]
+) -> Optional[str]:
     name = _norm(_aspect_name(aspect))
     if not name:
         return None
@@ -120,7 +134,12 @@ def _classify_rep_identifier(rep: Any, ifc_class: str) -> Optional[str]:
         return "Glazing"
     if ident in {"BODY", "TESSellation", "FACET"}:
         return None
-    if ifc_class in {"IFCDOOR", "IFCDOORSTANDARDCASE", "IFCWINDOW", "IFCWINDOWSTANDARDCASE"}:
+    if ifc_class in {
+        "IFCDOOR",
+        "IFCDOORSTANDARDCASE",
+        "IFCWINDOW",
+        "IFCWINDOWSTANDARDCASE",
+    }:
         if "PANEL" in ident or "LEAF" in ident:
             return "Panel"
         if "FRAME" in ident or "LINING" in ident or "JAMB" in ident:
@@ -208,7 +227,16 @@ def split_product_by_semantic_roles(
         "IFCWALLSTANDARDCASE",
         "IFCSLAB",
     }:
-        expected_roles = ["Panel", "Frame", "Glazing", "Core", "Cladding", "Insulation", "Lining", "Hardware"]
+        expected_roles = [
+            "Panel",
+            "Frame",
+            "Glazing",
+            "Core",
+            "Cladding",
+            "Insulation",
+            "Lining",
+            "Hardware",
+        ]
     elif ifc_cls in {"IFCCURTAINWALL"}:
         expected_roles = ["Panel", "Frame", "Mullion", "Transom"]
     elif ifc_cls in {"IFCRAILING"}:
@@ -235,8 +263,13 @@ def split_product_by_semantic_roles(
     # Relaxed check: We proceed if we have hints, expected roles, OR if we have style groups/material keys
     # that might allow for item-based splitting (even if unclassified).
     has_geometry_info = bool(face_style_groups) or bool(mesh_dict.get("material_keys"))
-    
-    if not rep_role_hints and not aspect_roles and not expected_roles and not has_geometry_info:
+
+    if (
+        not rep_role_hints
+        and not aspect_roles
+        and not expected_roles
+        and not has_geometry_info
+    ):
         return {}
 
     # Fallback: If we have no explicit style groups (e.g. from IfcStyledItem),
@@ -244,11 +277,12 @@ def split_product_by_semantic_roles(
     # Fallback: If we have no explicit style groups (e.g. from IfcStyledItem),
     # but we DO have material IDs on faces, synthesize groups so we can check material names.
     effective_style_groups = face_style_groups
-    
+
     # Check for material_keys (from OCC detail mesh)
     material_keys = mesh_dict.get("material_keys")
     if not effective_style_groups and material_keys:
         from collections import defaultdict
+
         key_to_faces = defaultdict(list)
         for f_idx, key in enumerate(material_keys):
             if key is not None:
@@ -260,7 +294,7 @@ def split_product_by_semantic_roles(
                 else:
                     map_key = key
                 key_to_faces[map_key].append(f_idx)
-        
+
         if key_to_faces:
             effective_style_groups = {}
             for map_key, f_indices in key_to_faces.items():
@@ -268,15 +302,15 @@ def split_product_by_semantic_roles(
                 if isinstance(map_key, tuple):
                     info = dict(map_key)
                 else:
-                    info = {"material_key": map_key} # Fallback
-                
+                    info = {"material_key": map_key}  # Fallback
+
                 mat_id = info.get("material_id", -1)
                 item_id = info.get("item_id", -1)
-                
+
                 mat_obj = None
                 if materials and 0 <= mat_id < len(materials):
                     mat_obj = materials[mat_id]
-                
+
                 # Create a synthetic group entry
                 # We include step_id (item_id) so the granular splitter can use it
                 group_key = f"MaterialKey_{mat_id}_{item_id}"
@@ -287,16 +321,17 @@ def split_product_by_semantic_roles(
                     "step_id": item_id if item_id != -1 else None,
                     # We could also pass item_type if we had it, but we only have ID.
                     # The splitter will use step_id for granular naming.
-                    "item_type": "IfcRepresentationItem" if item_id != -1 else None 
+                    "item_type": "IfcRepresentationItem" if item_id != -1 else None,
                 }
 
     elif not effective_style_groups and material_ids is not None and materials:
         from collections import defaultdict
+
         mat_to_faces: Dict[int, List[int]] = defaultdict(list)
         for f_idx, m_id in enumerate(material_ids):
             if m_id >= 0:
                 mat_to_faces[m_id].append(f_idx)
-        
+
         if mat_to_faces:
             effective_style_groups = {}
             for m_id, f_indices in mat_to_faces.items():
@@ -306,7 +341,9 @@ def split_product_by_semantic_roles(
                     effective_style_groups[f"Material_{m_id}"] = {
                         "material": mat_obj,
                         "faces": f_indices,
-                        "name": _material_name(mat_obj) # Helper to ensure _group_name finds it easily
+                        "name": _material_name(
+                            mat_obj
+                        ),  # Helper to ensure _group_name finds it easily
                     }
 
     group_role: Dict[str, str] = {}
@@ -331,20 +368,20 @@ def split_product_by_semantic_roles(
             item_type = entry.get("item_type")
             step_id = entry.get("step_id")
             mat_name = _material_name(entry.get("material"))
-            
+
             # Prioritize item info if available for granular splitting
             if item_type and step_id:
                 # e.g. Unclassified_IfcExtrudedAreaSolid_123
                 # Clean up item type (remove 'Ifc' prefix if desired, but full name is safer)
                 clean_type = item_type[3:] if item_type.startswith("Ifc") else item_type
                 label = f"Unclassified_{clean_type}_{step_id}"
-                # Optionally append material for clarity? 
-                # User asked for "isolate the post, panel...". 
+                # Optionally append material for clarity?
+                # User asked for "isolate the post, panel...".
                 # Item type + ID is unique. Material is helpful context.
                 # Let's stick to unique ID for now.
                 group_role[group_key] = label
                 continue
-            
+
             # Fallback to material name if no item info
             if mat_name:
                 group_role[group_key] = f"Unclassified_{mat_name}"
@@ -367,18 +404,22 @@ def split_product_by_semantic_roles(
         if group_key in group_role:
             continue
         gname = _group_name(entry)
-        
+
         # If we have a granular label already generated above (when gname was empty), use it?
-        # Wait, the logic above only runs if `not gname`. 
+        # Wait, the logic above only runs if `not gname`.
         # If `gname` exists (e.g. material name), we still want to potentially use item info if no role matched.
-        
+
         if "Panel" in expected_roles and any(tok in gname for tok in tokens["Panel"]):
             group_role[group_key] = "Panel"
         elif "Frame" in expected_roles and any(tok in gname for tok in tokens["Frame"]):
             group_role[group_key] = "Frame"
-        elif "Glazing" in expected_roles and any(tok in gname for tok in tokens["Glazing"]):
+        elif "Glazing" in expected_roles and any(
+            tok in gname for tok in tokens["Glazing"]
+        ):
             group_role[group_key] = "Glazing"
-        elif "Hardware" in expected_roles and any(tok in gname for tok in tokens["Hardware"]):
+        elif "Hardware" in expected_roles and any(
+            tok in gname for tok in tokens["Hardware"]
+        ):
             group_role[group_key] = "Hardware"
         else:
             # No semantic role matched. Use granular item label.
@@ -390,7 +431,6 @@ def split_product_by_semantic_roles(
             elif gname:
                 # Fallback to whatever gname is (likely material name)
                 group_role[group_key] = f"Unclassified_{gname}"
-
 
     face_role: List[Optional[str]] = [None] * face_count
     for group_key, entry in (effective_style_groups or {}).items():
@@ -429,27 +469,29 @@ def split_product_by_semantic_roles(
     # Or should "Unclassified" fallback to "Body"?
     # Let's say: if we have explicit roles, Unclassified stays Unclassified.
     # If we ONLY have Unclassified, it becomes Body.
-    
+
     unique_labels = set(label_to_faces.keys())
     if "Unclassified" in unique_labels:
         if len(unique_labels) == 1:
-             # Only Unclassified -> rename to Body (or default_label)
-             label_to_faces[default_label] = label_to_faces.pop("Unclassified")
+            # Only Unclassified -> rename to Body (or default_label)
+            label_to_faces[default_label] = label_to_faces.pop("Unclassified")
         elif default_label in unique_labels:
-             # We have Body and Unclassified. Merge Unclassified into Body?
-             # User requested "Only merge Unclassified into Body if Body is the only other part"
-             # But here we have Body. So we merge?
-             # Let's keep them separate as requested: "Introduce Unclassified... Only merge if Body is the only other part"
-             # Wait, if Body is the only other part, then we have [Body, Unclassified]. 
-             # Merging them makes sense to avoid fragmentation.
-             # If we have [Frame, Panel, Unclassified], we keep Unclassified separate.
-             if len(unique_labels) == 2:
-                 label_to_faces[default_label].extend(label_to_faces.pop("Unclassified"))
+            # We have Body and Unclassified. Merge Unclassified into Body?
+            # User requested "Only merge Unclassified into Body if Body is the only other part"
+            # But here we have Body. So we merge?
+            # Let's keep them separate as requested: "Introduce Unclassified... Only merge if Body is the only other part"
+            # Wait, if Body is the only other part, then we have [Body, Unclassified].
+            # Merging them makes sense to avoid fragmentation.
+            # If we have [Frame, Panel, Unclassified], we keep Unclassified separate.
+            if len(unique_labels) == 2:
+                label_to_faces[default_label].extend(label_to_faces.pop("Unclassified"))
 
     for label in list(label_to_faces.keys()):
         if len(label_to_faces[label]) < min_faces_per_part:
             if label != default_label:
-                label_to_faces.setdefault(default_label, []).extend(label_to_faces[label])
+                label_to_faces.setdefault(default_label, []).extend(
+                    label_to_faces[label]
+                )
                 del label_to_faces[label]
 
     effective_labels = [lbl for lbl in label_to_faces.keys()]
@@ -469,11 +511,12 @@ def split_product_by_semantic_roles(
         sub_style_groups = {}
         if sub_mat_ids and materials:
             from collections import defaultdict
+
             mat_to_faces = defaultdict(list)
             for f_idx, m_id in enumerate(sub_mat_ids):
                 if m_id >= 0:
                     mat_to_faces[m_id].append(f_idx)
-            
+
             for m_id, f_indices in mat_to_faces.items():
                 if 0 <= m_id < len(materials):
                     mat_obj = materials[m_id]
@@ -482,7 +525,7 @@ def split_product_by_semantic_roles(
                     sub_style_groups[group_name] = {
                         "material": mat_obj,
                         "faces": f_indices,
-                        "name": _material_name(mat_obj)
+                        "name": _material_name(mat_obj),
                     }
 
         parts[label] = {

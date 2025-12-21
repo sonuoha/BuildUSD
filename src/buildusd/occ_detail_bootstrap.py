@@ -56,7 +56,9 @@ def bootstrap_occ(strict: bool = True) -> None:
             except Exception as exc:
                 missing.append(f"{module_name}.{symbol_name}: {exc}")
         try:
-            occ_utils = __import__("ifcopenshell.geom", fromlist=["occ_utils"]).occ_utils
+            occ_utils = __import__(
+                "ifcopenshell.geom", fromlist=["occ_utils"]
+            ).occ_utils
             symbols["occ_utils"] = occ_utils
         except Exception as exc:
             missing.append(f"ifcopenshell.geom.occ_utils: {exc}")

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import importlib
 import os
@@ -18,10 +18,12 @@ _DEFAULT_MODE = _DEFAULT_ENV.strip().lower()
 if _DEFAULT_MODE not in {"kit", "offline"}:
     _DEFAULT_MODE = "kit"
 
+
 def get_mode() -> Optional[str]:
     """Return the current USD mode ('kit' or 'offline')."""
     global _MODE
     return _MODE
+
 
 # buildusd/usd_context.py  (replace initialize_usd with this)
 def initialize_usd(*, offline: Optional[bool] = None) -> str:
@@ -66,7 +68,11 @@ def _teardown() -> None:
 
 def _clear_pxr_modules() -> None:
     for name in list(sys.modules):
-        if name == "pxr" or name.startswith("pxr.") or name in {"Usd", "UsdGeom", "UsdShade", "UsdUtils", "Sdf", "Gf", "Vt"}:
+        if (
+            name == "pxr"
+            or name.startswith("pxr.")
+            or name in {"Usd", "UsdGeom", "UsdShade", "UsdUtils", "Sdf", "Gf", "Vt"}
+        ):
             sys.modules.pop(name, None)
 
 

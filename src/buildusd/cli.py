@@ -20,6 +20,7 @@ def parse_args(
     usd_format_choices: Sequence[str],
     default_usd_format: str,
     default_usd_auto_binary_threshold_mb: float,
+    default_geospatial_mode: str = "auto",
 ) -> argparse.Namespace:
     """Parse the CLI arguments for the standalone converter."""
 
@@ -156,6 +157,16 @@ def parse_args(
         help="Choose whether stages anchor to the file-local base point, shared site base point, or skip anchoring entirely.",
     )
     parser.add_argument(
+        "--geospatial-mode",
+        dest="geospatial_mode",
+        choices=("auto", "usd", "omni", "none"),
+        default=default_geospatial_mode,
+        help=(
+            "Select geospatial driver: 'usd' for self-contained metadata, "
+            "'omni' for OmniGeospatial/Kit contexts, 'none' to skip, 'auto' to pick based on offline/omniverse paths."
+        ),
+    )
+    parser.add_argument(
         "--usd-format",
         dest="usd_format",
         choices=usd_format_choices,
@@ -209,7 +220,14 @@ def parse_args(
     parser.add_argument(
         "--detail-engine",
         dest="detail_engine",
-        choices=("default", "occ", "opencascade", "semantic", "ifc-subcomponents", "ifc-parts"),
+        choices=(
+            "default",
+            "occ",
+            "opencascade",
+            "semantic",
+            "ifc-subcomponents",
+            "ifc-parts",
+        ),
         default="default",
         help=(
             "Select detail pipeline behavior: 'default' tries IFC subcomponents then OCC; "

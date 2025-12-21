@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path, PurePosixPath
-from typing import Iterable, List, Optional, Sequence, Union
+from pathlib import Path
+from typing import List, Optional, Sequence, Union
 
 from .kit_runtime import ensure_kit, shutdown_kit
 
@@ -17,6 +17,7 @@ _OMNI_CLIENT = None
 
 
 log = logging.getLogger(__name__)
+
 
 def _require_omni_client():
     """Ensure omni.client is ready, starting Kit in headless mode if needed."""
@@ -47,6 +48,7 @@ def shutdown_kit_if_running():
     global _OMNI_CLIENT
     _OMNI_CLIENT = None
     shutdown_kit()
+
 
 def is_omniverse_path(value: PathLike) -> bool:
     s = _as_string(value).lower()
@@ -122,23 +124,35 @@ def path_name(path: PathLike) -> str:
 def read_text(path: PathLike, encoding: str = "utf-8") -> str:
     if is_omniverse_path(path):
         client = _require_omni_client()
-        result, resolved, payload = client.read_file(_normalize_nucleus_path(_as_string(path)))
+        result, resolved, payload = client.read_file(
+            _normalize_nucleus_path(_as_string(path))
+        )
         if result != client.Result.OK:
-            raise RuntimeError(f"Failed to read {path} (resolved: {resolved}): {result}")
+            raise RuntimeError(
+                f"Failed to read {path} (resolved: {resolved}): {result}"
+            )
         data = _payload_bytes(payload)
         return data.decode(encoding)
     return Path(path).read_text(encoding=encoding)
 
+
 def read_bytes(path: PathLike) -> bytes:
     if is_omniverse_path(path):
         if get_mode() == "offline":
-            raise RuntimeError(f"Offline mode rejects omniverse:// paths: {path}. Use local files or remove --offline.")
+            raise RuntimeError(
+                f"Offline mode rejects omniverse:// paths: {path}. Use local files or remove --offline."
+            )
         client = _require_omni_client()
-        result, resolved, payload = client.read_file(_normalize_nucleus_path(_as_string(path)))
+        result, resolved, payload = client.read_file(
+            _normalize_nucleus_path(_as_string(path))
+        )
         if result != client.Result.OK:
-            raise RuntimeError(f"Failed to read {path} (resolved: {resolved}): {result}")
+            raise RuntimeError(
+                f"Failed to read {path} (resolved: {resolved}): {result}"
+            )
         return _payload_bytes(payload)
     return Path(path).read_bytes()
+
 
 def write_text(path: PathLike, data: str, encoding: str = "utf-8") -> None:
     if is_omniverse_path(path):
@@ -183,10 +197,14 @@ def _payload_bytes(payload: Any) -> bytes:
     try:
         return bytes(data)
     except TypeError:
-        raise RuntimeError("Unsupported omni.client payload type for binary data") from None
+        raise RuntimeError(
+            "Unsupported omni.client payload type for binary data"
+        ) from None
 
 
-def create_checkpoint(path: PathLike, *, note: Optional[str] = None, tags: Optional[Sequence[str]] = None) -> bool:
+def create_checkpoint(
+    path: PathLike, *, note: Optional[str] = None, tags: Optional[Sequence[str]] = None
+) -> bool:
     if not is_omniverse_path(path):
         return False
     if get_mode() == "offline":
@@ -196,9 +214,13 @@ def create_checkpoint(path: PathLike, *, note: Optional[str] = None, tags: Optio
     full_note = note or ""
     if tags:
         full_note += f" tags:{','.join(str(t).strip() for t in tags if str(t).strip())}"
-    result, checkpoint_id = client.create_checkpoint(_normalize_nucleus_path(_as_string(path)), full_note)
+    result, checkpoint_id = client.create_checkpoint(
+        _normalize_nucleus_path(_as_string(path)), full_note
+    )
     if result != client.Result.OK:
-        raise RuntimeError(f"Failed to checkpoint {path}: {result} (ID: {checkpoint_id})")
+        raise RuntimeError(
+            f"Failed to checkpoint {path}: {result} (ID: {checkpoint_id})"
+        )
     return True
 
 
@@ -206,7 +228,11 @@ def list_directory(path: PathLike, include_deleted: bool = False) -> List[ListEn
     if is_omniverse_path(path):
         client = _require_omni_client()
         uri = _normalize_nucleus_dir(_as_string(path))
-        opt = client.ListIncludeOption.ALL if include_deleted else client.ListIncludeOption.NO_DELETED_FILES
+        opt = (
+            client.ListIncludeOption.ALL
+            if include_deleted
+            else client.ListIncludeOption.NO_DELETED_FILES
+        )
         result, entries_tuple = client.list(uri, opt)
         if result != client.Result.OK:
             raise RuntimeError(f"Failed to list {path}: {result}")
@@ -222,14 +248,18 @@ def stat_entry(path: PathLike):
         client = _require_omni_client()
         response = client.stat(_normalize_nucleus_path(_as_string(path)))
         if not isinstance(response, tuple):
-            raise RuntimeError(f"Unexpected omni.client.stat response for {path}: {response!r}")
+            raise RuntimeError(
+                f"Unexpected omni.client.stat response for {path}: {response!r}"
+            )
         if len(response) == 3:
             result, resolved, entry = response
         elif len(response) == 2:
             result, entry = response
             resolved = None
         else:
-            raise RuntimeError(f"Unexpected omni.client.stat tuple size {len(response)} for {path}: {response!r}")
+            raise RuntimeError(
+                f"Unexpected omni.client.stat tuple size {len(response)} for {path}: {response!r}"
+            )
         if result != client.Result.OK:
             return None
         # Return the raw entry (and optionally stash resolved path for callers that expect it)
@@ -281,5 +311,10 @@ def _ensure_nucleus_directory(client, uri: str) -> None:
     if "/" in parent[len("omniverse://") :]:
         _ensure_nucleus_directory(client, parent.rsplit("/", 1)[0])
     create_result = client.create_folder(uri.rstrip("/"))
-    if create_result not in (client.Result.OK, getattr(client.Result, "ALREADY_EXISTS", client.Result.OK)):
-        raise RuntimeError(f"Failed to create omniverse directory {uri}: {create_result}")
+    if create_result not in (
+        client.Result.OK,
+        getattr(client.Result, "ALREADY_EXISTS", client.Result.OK),
+    ):
+        raise RuntimeError(
+            f"Failed to create omniverse directory {uri}: {create_result}"
+        )

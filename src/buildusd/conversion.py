@@ -1,4 +1,4 @@
-﻿# ===============================
+# ===============================
 # main.py — FULL REPLACEMENT (aligned to single-pass IFC process)
 # ===============================
 from __future__ import annotations
@@ -9,10 +9,15 @@ import tempfile
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 from .cli import parse_args as _cli_parse_args
-from .config.manifest import BasePointConfig, ConversionManifest, MasterConfig, ResolvedFilePlan
+from .config.manifest import (
+    BasePointConfig,
+    ConversionManifest,
+    MasterConfig,
+    ResolvedFilePlan,
+)
 from .io_utils import (
     ensure_directory,
     ensure_parent_directory,
@@ -40,7 +45,10 @@ from .process_usd import (
     create_usd_stage,
     persist_instance_cache,
 )
+from .geospatial import resolve_geospatial_mode, maybe_stream_omnigeospatial
+from .federation_contract import decide_offsets
 from .usd_context import initialize_usd, shutdown_usd_context
+
 __all__ = [
     "ConversionCancelledError",
     "ConversionResult",
@@ -73,8 +81,8 @@ DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB = 50.0
 _FALLBACK_MASTER_STAGE = "Federated Model.usda"
 _FALLBACK_GEODETIC_CRS = "EPSG:4326"
 _FALLBACK_BASE_POINT = BasePointConfig(
-    easting=318197.2518,    #333800.4900
-    northing=5815160.4723,  #5809101.4680,
+    easting=318197.2518,  # 333800.4900
+    northing=5815160.4723,  # 5809101.4680,
     height=0.0,
     unit="m",
     epsg="EPSG:7855",
@@ -96,6 +104,7 @@ _UNIT_FACTORS = {
     "decimeters": 0.1,
 }
 
+
 def _bp_offset_vector(bp: BasePointConfig) -> tuple[float, float, float]:
     """Return (easting, northing, height) in metres from a BasePointConfig."""
     if bp is None:
@@ -112,6 +121,49 @@ def _bp_offset_vector(bp: BasePointConfig) -> tuple[float, float, float]:
         return (0.0, 0.0, 0.0)
 
 
+def _stamp_federation_debug(
+    stage,
+    *,
+    anchor_mode: Optional[str],
+    pbp_m,
+    shared_site_m,
+    model_offset_m,
+    georef_origin: Optional[str],
+) -> None:
+    """Stamp small, crate-safe debug metadata for traceability."""
+    if stage is None:
+        return
+    try:
+        world = stage.GetPrimAtPath("/World")
+        if not world:
+            return
+        if anchor_mode:
+            world.SetCustomDataByKey("ifc:federation:anchorMode", str(anchor_mode))
+        if georef_origin:
+            world.SetCustomDataByKey("ifc:federation:georefOrigin", str(georef_origin))
+        if pbp_m:
+            world.SetCustomDataByKey(
+                "ifc:federation:pbpMeters",
+                {"x": pbp_m[0], "y": pbp_m[1], "z": pbp_m[2]},
+            )
+        if shared_site_m:
+            world.SetCustomDataByKey(
+                "ifc:federation:sharedSiteMeters",
+                {"x": shared_site_m[0], "y": shared_site_m[1], "z": shared_site_m[2]},
+            )
+        if model_offset_m:
+            world.SetCustomDataByKey(
+                "ifc:federation:modelOffsetMeters",
+                {
+                    "x": model_offset_m[0],
+                    "y": model_offset_m[1],
+                    "z": model_offset_m[2],
+                },
+            )
+    except Exception:
+        pass
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Delegate to the CLI parser with project defaults."""
 
@@ -122,6 +174,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         usd_format_choices=USD_FORMAT_CHOICES,
         default_usd_format=DEFAULT_USD_FORMAT,
         default_usd_auto_binary_threshold_mb=DEFAULT_USD_AUTO_BINARY_THRESHOLD_MB,
+        default_geospatial_mode="auto",
     )
 
 
@@ -138,7 +191,9 @@ def _detail_features_requested(args: argparse.Namespace) -> bool:
     )
 
 
-def _load_manifest_backed_defaults() -> tuple[BasePointConfig, str, str, BasePointConfig]:
+def _load_manifest_backed_defaults() -> (
+    tuple[BasePointConfig, str, str, BasePointConfig]
+):
     """Fetch project defaults from the local manifest when present."""
 
     base_point = _FALLBACK_BASE_POINT
@@ -159,7 +214,9 @@ def _load_manifest_backed_defaults() -> tuple[BasePointConfig, str, str, BasePoi
         try:
             manifest_obj = ConversionManifest.from_file(manifest_path)
         except Exception as exc:
-            LOG.debug("Failed to load manifest defaults from %s: %s", manifest_path, exc)
+            LOG.debug(
+                "Failed to load manifest defaults from %s: %s", manifest_path, exc
+            )
             manifest_obj = None
 
     if manifest_obj is not None:
@@ -182,14 +239,21 @@ def _load_manifest_backed_defaults() -> tuple[BasePointConfig, str, str, BasePoi
                     manifest_path,
                 )
         if master_candidate is None and defaults.master_name:
-            master_candidate = MasterConfig(id="__defaults__", name=defaults.master_name)
+            master_candidate = MasterConfig(
+                id="__defaults__", name=defaults.master_name
+            )
         if master_candidate is not None:
             master_stage = master_candidate.resolved_name()
 
     return base_point, geodetic_crs, master_stage, shared_site
 
 
-DEFAULT_BASE_POINT, DEFAULT_GEODETIC_CRS, DEFAULT_MASTER_STAGE, DEFAULT_SHARED_BASE_POINT = _load_manifest_backed_defaults()
+(
+    DEFAULT_BASE_POINT,
+    DEFAULT_GEODETIC_CRS,
+    DEFAULT_MASTER_STAGE,
+    DEFAULT_SHARED_BASE_POINT,
+) = _load_manifest_backed_defaults()
 PathLike = Union[str, Path]
 
 
@@ -227,13 +291,17 @@ def _is_cancelled(cancel_event: Any | None) -> bool:
     return bool(cancel_event)
 
 
-def _ensure_not_cancelled(cancel_event: Any | None, *, message: str | None = None) -> None:
+def _ensure_not_cancelled(
+    cancel_event: Any | None, *, message: str | None = None
+) -> None:
     if _is_cancelled(cancel_event):
         raise ConversionCancelledError(message or "Conversion cancelled.")
-    
+
+
 @dataclass(slots=True)
 class ConversionResult:
     """Artifacts produced for a single converted IFC file."""
+
     ifc_path: PathLike
     stage_path: PathLike
     master_stage_path: PathLike
@@ -241,9 +309,11 @@ class ConversionResult:
     projected_crs: str
     geodetic_crs: str
     geodetic_coordinates: tuple[float, ...] | None
+    geospatial_mode: str
     counts: dict[str, int]
     plan: ResolvedFilePlan | None
     revision: Optional[str] = None
+
     def as_dict(self) -> dict[str, Any]:
         """Legacy dict-compatible view of the conversion result."""
         return {
@@ -251,6 +321,7 @@ class ConversionResult:
             "stage": self.stage_path,
             "master_stage": self.master_stage_path,
             "layers": self.layers,
+            "geospatial_mode": self.geospatial_mode,
             "geodetic": {
                 "crs": self.geodetic_crs,
                 "coordinates": self.geodetic_coordinates,
@@ -261,10 +332,14 @@ class ConversionResult:
             "projected_crs": self.projected_crs,
             "revision": self.revision,
         }
+
+
 @dataclass(slots=True)
 class _IfcTarget:
     source: PathLike
     manifest_key: Path
+
+
 @dataclass(slots=True)
 class _OutputLayout:
     stage: PathLike
@@ -326,7 +401,9 @@ def _apply_stage_unit(target_path: PathLike, meters_per_unit: float) -> None:
     layer.Save()
 
 
-def set_stage_unit(target_path: PathLike, meters_per_unit: float = 1.0, *, offline: bool = False) -> None:
+def set_stage_unit(
+    target_path: PathLike, meters_per_unit: float = 1.0, *, offline: bool = False
+) -> None:
     """Update the meters-per-unit metadata on an existing USD layer or stage."""
     raw_path = str(target_path).strip() if target_path is not None else ""
     if not raw_path:
@@ -334,7 +411,9 @@ def set_stage_unit(target_path: PathLike, meters_per_unit: float = 1.0, *, offli
     if meters_per_unit <= 0.0:
         raise ValueError("--stage-unit-value must be greater than zero.")
     if offline and is_omniverse_path(raw_path):
-        raise ValueError("--offline cannot be combined with --set-stage-unit for omniverse:// targets.")
+        raise ValueError(
+            "--offline cannot be combined with --set-stage-unit for omniverse:// targets."
+        )
     initialize_usd(offline=offline)
     _apply_stage_unit(raw_path, meters_per_unit)
 
@@ -398,7 +477,9 @@ def set_stage_up_axis(
     if not raw_path:
         raise ValueError("--set-stage-up-axis requires a target USD path.")
     if offline and is_omniverse_path(raw_path):
-        raise ValueError("--offline cannot be combined with --set-stage-up-axis for omniverse:// targets.")
+        raise ValueError(
+            "--offline cannot be combined with --set-stage-up-axis for omniverse:// targets."
+        )
     initialize_usd(offline=offline)
     _apply_stage_up_axis(raw_path, axis_norm)
 
@@ -408,6 +489,8 @@ def _strip_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
+
+
 from .process_usd import (
     _layer_identifier,
     _rule_from_mapping,
@@ -440,7 +523,9 @@ def _parse_annotation_width_rule_spec(spec: str, *, index: int) -> CurveWidthRul
         value_norm = _strip_quotes(value.strip())
         mapping[key_norm] = value_norm
     if "width" not in mapping:
-        raise ValueError(f"--annotation-width-rule #{index}: missing required 'width=' entry.")
+        raise ValueError(
+            f"--annotation-width-rule #{index}: missing required 'width=' entry."
+        )
     return _rule_from_mapping(mapping, context=f"--annotation-width-rule #{index}")
 
 
@@ -450,7 +535,9 @@ def _load_annotation_width_config(path: PathLike) -> list[CurveWidthRule]:
     try:
         text = read_text(path)
     except Exception as exc:
-        raise ValueError(f"Failed to read annotation width config {source}: {exc}") from exc
+        raise ValueError(
+            f"Failed to read annotation width config {source}: {exc}"
+        ) from exc
     suffix = (path_suffix(path) or "").lower()
     payload: Any | None = None
     errors: list[str] = []
@@ -489,7 +576,9 @@ def _load_annotation_width_config(path: PathLike) -> list[CurveWidthRule]:
     return _rules_from_config_payload(payload, source=source)
 
 
-def _gather_annotation_width_rules(args: argparse.Namespace) -> tuple[CurveWidthRule, ...]:
+def _gather_annotation_width_rules(
+    args: argparse.Namespace,
+) -> tuple[CurveWidthRule, ...]:
     """Return ordered curve-width rules based on CLI defaults, configs, and overrides."""
     rules: list[CurveWidthRule] = []
     default_spec = getattr(args, "annotation_width_default", None)
@@ -507,6 +596,8 @@ def _gather_annotation_width_rules(args: argparse.Namespace) -> tuple[CurveWidth
     for index, spec in enumerate(inline_specs, start=1):
         rules.append(_parse_annotation_width_rule_spec(spec, index=index))
     return tuple(rules)
+
+
 # ------------- core convert -------------
 def convert(
     input_path: PathLike,
@@ -524,6 +615,7 @@ def convert(
     logger: logging.Logger | None = None,
     checkpoint: bool = False,
     offline: bool = False,
+    geospatial_mode: str = "auto",
     cancel_event: Any | None = None,
     anchor_mode: Optional[str] = None,
 ) -> list[ConversionResult]:
@@ -558,7 +650,9 @@ def convert(
         check_paths.append(manifest_path)
     if offline:
         if any(is_omniverse_path(p) for p in check_paths):
-            raise ValueError("--offline mode requires local input/output/manifest paths")
+            raise ValueError(
+                "--offline mode requires local input/output/manifest paths"
+            )
         initialize_usd(offline=True)
         if checkpoint:
             log.warning("--checkpoint is ignored in offline mode (Nucleus only).")
@@ -586,7 +680,10 @@ def convert(
     opts = options or OPTIONS
     normalized_anchor_mode = _normalize_anchor_mode(anchor_mode)
     run_options = replace(opts, manifest=manifest_obj)
-    if normalized_anchor_mode is not None and getattr(run_options, "anchor_mode", None) != normalized_anchor_mode:
+    if (
+        normalized_anchor_mode is not None
+        and getattr(run_options, "anchor_mode", None) != normalized_anchor_mode
+    ):
         run_options = replace(run_options, anchor_mode=normalized_anchor_mode)
     targets = _collect_ifc_paths(
         input_path,
@@ -645,7 +742,11 @@ def convert(
                     fallback_shared_site_base_point=DEFAULT_SHARED_BASE_POINT,
                 )
             except Exception as exc:
-                log.warning("Manifest resolution failed for %s: %s", path_name(target.source), exc)
+                log.warning(
+                    "Manifest resolution failed for %s: %s",
+                    path_name(target.source),
+                    exc,
+                )
         try:
             result = _process_single_ifc(
                 target.source,
@@ -660,6 +761,7 @@ def convert(
                 cancel_event=cancel_event,
                 base_name_override=base_name_override,
                 stage_path_override=stage_path_override,
+                geospatial_mode=geospatial_mode,
             )
             base_name_override = None
             stage_path_override = None
@@ -674,12 +776,16 @@ def convert(
             )
             continue
         if result is None:
-            log.warning("Conversion for %s produced no result; skipping.", target.source)
+            log.warning(
+                "Conversion for %s produced no result; skipping.", target.source
+            )
             continue
         results.append(result)
     return results
 
+
 # ------------- local & nucleus helpers -------------
+
 
 def _collect_ifc_paths(
     input_path: PathLike,
@@ -768,6 +874,7 @@ def _collect_ifc_paths_nucleus(
     log: logging.Logger,
 ) -> list[_IfcTarget]:
     """Collect IFC files from a Nucleus directory or file URI with robust handling."""
+
     def _single_file_target(file_uri: str) -> list[_IfcTarget]:
         if not _is_ifc_candidate(path_name(file_uri)):
             log.error("Nucleus path is not an IFC file: %s", file_uri)
@@ -786,11 +893,17 @@ def _collect_ifc_paths_nucleus(
     # Directory listing via io_utils (no new args!)
     log.info("Connecting to Nucleus directory %s", uri)
     try:
-        entries = list_directory(uri)  # <- io_utils.list_directory(path) returns List[ListEntry]
+        entries = list_directory(
+            uri
+        )  # <- io_utils.list_directory(path) returns List[ListEntry]
     except (RuntimeError, FileNotFoundError) as exc:
         # If listing fails but the uri is a file, try single-file fallback
         if _is_ifc_candidate(path_name(uri)):
-            log.warning("Directory listing failed (%s). Falling back to single-file target: %s", exc, uri)
+            log.warning(
+                "Directory listing failed (%s). Falling back to single-file target: %s",
+                exc,
+                uri,
+            )
             return _single_file_target(uri)
         log.error("Failed to list Nucleus directory %s: %s", uri, exc, exc_info=True)
         return []
@@ -819,7 +932,11 @@ def _collect_ifc_paths_nucleus(
             if stem in exclude:
                 log.info("Skipping excluded IFC %s", candidate)
                 continue
-            targets.append(_IfcTarget(source=candidate, manifest_key=_manifest_key_for_path(candidate)))
+            targets.append(
+                _IfcTarget(
+                    source=candidate, manifest_key=_manifest_key_for_path(candidate)
+                )
+            )
         log.info("Resolved %d IFC(s) by explicit name under %s", len(targets), uri)
         return sorted(targets, key=lambda t: path_name(t.source).lower())
 
@@ -830,7 +947,11 @@ def _collect_ifc_paths_nucleus(
         for attr in ("relative_path", "relativePath", "path", "uri"):
             p = getattr(e, attr, None)
             if isinstance(p, str) and p.strip():
-                return join_path(uri, p) if attr in ("relative_path", "relativePath") else p
+                return (
+                    join_path(uri, p)
+                    if attr in ("relative_path", "relativePath")
+                    else p
+                )
         # Some builds expose 'relative_path' inside 'info' or a tuple-like entry
         info = getattr(e, "info", None)
         if info and hasattr(info, "relative_path"):
@@ -852,20 +973,33 @@ def _collect_ifc_paths_nucleus(
             if stem in exclude:
                 log.info("Skipping excluded IFC %s", candidate)
                 continue
-            targets.append(_IfcTarget(source=candidate, manifest_key=_manifest_key_for_path(candidate)))
+            targets.append(
+                _IfcTarget(
+                    source=candidate, manifest_key=_manifest_key_for_path(candidate)
+                )
+            )
         except Exception as exc:
             bad += 1
-            log.debug("Skipping problematic listing entry due to: %s", exc, exc_info=True)
+            log.debug(
+                "Skipping problematic listing entry due to: %s", exc, exc_info=True
+            )
 
     # Sort for deterministic order
     targets.sort(key=lambda t: path_name(t.source).lower())
 
     if not targets:
-        log.warning("Nucleus listing returned 0 IFC files under %s (skipped=%d). "
-                    "Check permissions and folder path case.", uri, bad)
+        log.warning(
+            "Nucleus listing returned 0 IFC files under %s (skipped=%d). "
+            "Check permissions and folder path case.",
+            uri,
+            bad,
+        )
     else:
-        log.info("Discovered %d IFC file(s) under %s (skipped=%d)", len(targets), uri, bad)
+        log.info(
+            "Discovered %d IFC file(s) under %s (skipped=%d)", len(targets), uri, bad
+        )
     return targets
+
 
 def _ensure_ifc_name(name: str) -> str:
     """Strips and normalises an IFC file name, appending '.ifc' if necessary.
@@ -877,9 +1011,13 @@ def _ensure_ifc_name(name: str) -> str:
         A trimmed and normalised IFC file name (with '.ifc' appended if necessary).
     """
     trimmed = (name or "").strip()
-    if not trimmed: return trimmed
-    if not trimmed.lower().endswith(".ifc"): trimmed = f"{trimmed}.ifc"
+    if not trimmed:
+        return trimmed
+    if not trimmed.lower().endswith(".ifc"):
+        trimmed = f"{trimmed}.ifc"
     return trimmed
+
+
 def _is_ifc_candidate(name: str) -> bool:
     return (name or "").lower().endswith(".ifc")
 
@@ -894,12 +1032,16 @@ def _normalise_usd_format(fmt: str) -> str:
         return DEFAULT_USD_FORMAT
     return value
 
+
 def _manifest_key_for_path(path: PathLike) -> Path:
-    if isinstance(path, Path): return path.resolve()
+    if isinstance(path, Path):
+        return path.resolve()
     if is_omniverse_path(path):
-        uri = str(path); stripped = uri.split("://", 1)[-1]
+        uri = str(path)
+        stripped = uri.split("://", 1)[-1]
         return PurePosixPath(stripped)
     return Path(str(path)).resolve()
+
 
 # ------------- layout + checkpoint -------------
 def _build_output_layout(
@@ -909,7 +1051,6 @@ def _build_output_layout(
     *,
     stage_override: PathLike | None = None,
 ) -> _OutputLayout:
-    
     # Esnure output directory exists
     ensure_directory(output_root)
 
@@ -918,11 +1059,19 @@ def _build_output_layout(
     instances_dir = join_path(output_root, "instances")
     geometry2d_dir = join_path(output_root, "geometry2d")
     caches_dir = join_path(output_root, "caches")
-    for directory in (prototypes_dir, materials_dir, instances_dir, geometry2d_dir, caches_dir):
+    for directory in (
+        prototypes_dir,
+        materials_dir,
+        instances_dir,
+        geometry2d_dir,
+        caches_dir,
+    ):
         ensure_directory(directory)
     ext = _normalise_usd_format(usd_format)
     if ext == "auto":
-        raise ValueError("Auto USD format must be resolved before building the output layout.")
+        raise ValueError(
+            "Auto USD format must be resolved before building the output layout."
+        )
     if stage_override is not None:
         stage_path = Path(stage_override)
         if stage_path.suffix.lower().lstrip(".") != ext:
@@ -955,7 +1104,9 @@ def _update_sublayer_reference(
     try:
         existing = list(root_layer.subLayerPaths)
     except Exception as exc:
-        logger.debug("Unable to read subLayerPaths while updating %s layer: %s", label, exc)
+        logger.debug(
+            "Unable to read subLayerPaths while updating %s layer: %s", label, exc
+        )
         return False
     try:
         index = existing.index(old_reference)
@@ -1026,9 +1177,13 @@ def _estimate_auto_payload(caches: PrototypeCaches) -> _AutoFormatEstimate:
     """Aggregate lightweight metrics used for auto USD format heuristics."""
     prototype_mesh_bytes = 0
     for proto in caches.repmaps.values():
-        prototype_mesh_bytes += _estimate_mesh_payload_bytes(getattr(proto, "mesh", None))
+        prototype_mesh_bytes += _estimate_mesh_payload_bytes(
+            getattr(proto, "mesh", None)
+        )
     for proto in caches.hashes.values():
-        prototype_mesh_bytes += _estimate_mesh_payload_bytes(getattr(proto, "mesh", None))
+        prototype_mesh_bytes += _estimate_mesh_payload_bytes(
+            getattr(proto, "mesh", None)
+        )
     annotation_count = len(getattr(caches, "annotations", {}) or {})
     return _AutoFormatEstimate(
         mesh_bytes=prototype_mesh_bytes,
@@ -1183,12 +1338,17 @@ def _maybe_convert_layers_to_usdc(
             try:
                 stage_size = stage_path_obj.stat().st_size
             except OSError as exc:
-                logger.debug("Unable to stat stage layer at %s: %s", stage_path_obj, exc)
+                logger.debug(
+                    "Unable to stat stage layer at %s: %s", stage_path_obj, exc
+                )
             else:
                 if stage_size > threshold_bytes:
                     target_stage_path = stage_path_obj.with_suffix(".usdc")
                     try:
-                        root_layer.Export(_layer_identifier(target_stage_path), args={"format": "usdc"})
+                        root_layer.Export(
+                            _layer_identifier(target_stage_path),
+                            args={"format": "usdc"},
+                        )
                     except Exception as exc:
                         logger.warning(
                             "Failed to re-export stage %s as usdc: %s",
@@ -1204,7 +1364,9 @@ def _maybe_convert_layers_to_usdc(
                             size_mb,
                             target_stage_path,
                         )
-                        updated_layout = replace(updated_layout, stage=target_stage_path)
+                        updated_layout = replace(
+                            updated_layout, stage=target_stage_path
+                        )
                         paths_to_remove.append(stage_path_obj)
                         stage_converted = True
 
@@ -1232,12 +1394,20 @@ def _cleanup_paths(paths: Sequence[Path], logger: logging.Logger) -> None:
         except Exception as exc:
             logger.debug("Unable to remove temporary USD file %s: %s", path_obj, exc)
 
-def _make_checkpoint_metadata(revision: Optional[str], base_name: str) -> tuple[str, list[str]]:
-    note = revision or f"{base_name}"; tag_src = revision or base_name
-    tag_candidates = tag_src.replace(",", " ").split(); tags = [t.strip() for t in tag_candidates if t.strip()] or [base_name]
+
+def _make_checkpoint_metadata(
+    revision: Optional[str], base_name: str
+) -> tuple[str, list[str]]:
+    note = revision or f"{base_name}"
+    tag_src = revision or base_name
+    tag_candidates = tag_src.replace(",", " ").split()
+    tags = [t.strip() for t in tag_candidates if t.strip()] or [base_name]
     return note, tags
 
-def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: logging.Logger, label: str) -> None:
+
+def _checkpoint_path(
+    path: PathLike, note: str, tags: Sequence[str], logger: logging.Logger, label: str
+) -> None:
     try:
         did_checkpoint = create_checkpoint(path, note=note, tags=tags)
     except Exception as exc:
@@ -1245,6 +1415,7 @@ def _checkpoint_path(path: PathLike, note: str, tags: Sequence[str], logger: log
         return
     if did_checkpoint:
         logger.info("Checkpoint saved for %s (%s)", label, note)
+
 
 # ------------- core per-file -------------
 def _process_single_ifc(
@@ -1264,6 +1435,8 @@ def _process_single_ifc(
     default_master_stage: str = DEFAULT_MASTER_STAGE,
     base_name_override: Optional[str] = None,
     stage_path_override: PathLike | None = None,
+    geospatial_mode: str = "auto",
+    offline: bool = False,
 ) -> ConversionResult:
     import ifcopenshell  # Local import
 
@@ -1273,36 +1446,105 @@ def _process_single_ifc(
     checkpoint_note: Optional[str] = None
     checkpoint_tags: list[str] = []
     if checkpoint:
-        checkpoint_note, checkpoint_tags = _make_checkpoint_metadata(revision_note, base_name)
+        checkpoint_note, checkpoint_tags = _make_checkpoint_metadata(
+            revision_note, base_name
+        )
 
     def _execute(local_ifc: Path) -> ConversionResult:
         _ensure_not_cancelled(cancel_event)
         ifc = ifcopenshell.open(local_ifc.as_posix())
         _ensure_not_cancelled(cancel_event)
+        try:
+            from ifcopenshell.util.unit import calculate_unit_scale
 
-        # Determine anchoring offsets before prototype build so tessellation
-        # uses the correct model-offset (PBP for local, survey for site).
+            unit_scale = float(calculate_unit_scale(ifc)) or 1.0
+            if unit_scale <= 0:
+                unit_scale = 1.0
+            if abs(unit_scale - 1.0) > 1e-6:
+                logger.info("IFC unit scale: %s m/unit", unit_scale)
+            else:
+                logger.debug("IFC unit scale: %s m/unit", unit_scale)
+        except Exception:
+            pass
+        try:
+            contexts = ifc.by_type("IfcGeometricRepresentationContext") or []
+            for ctx in contexts:
+                ops = getattr(ctx, "HasCoordinateOperation", None) or []
+                for op in ops:
+                    if op is None or not hasattr(op, "is_a"):
+                        continue
+                    if op.is_a("IfcMapConversion"):
+                        logger.info(
+                            "IfcMapConversion: Scale=%s Scale2=%s Scale3=%s Eastings=%s Northings=%s Height=%s",
+                            getattr(op, "Scale", None),
+                            getattr(op, "Scale2", None),
+                            getattr(op, "Scale3", None),
+                            getattr(op, "Eastings", None),
+                            getattr(op, "Northings", None),
+                            getattr(op, "OrthogonalHeight", None),
+                        )
+                    elif op.is_a("IfcRigidOperation"):
+                        logger.info(
+                            "IfcRigidOperation: First=%s Second=%s Height=%s",
+                            getattr(op, "FirstCoordinate", None),
+                            getattr(op, "SecondCoordinate", None),
+                            getattr(op, "Height", None),
+                        )
+        except Exception:
+            pass
+
+        # Determine anchoring offsets before prototype build.
+        #
+        # All shifts are handled via IfcOpenShell model-offset (offset-type='negative').
         anchor_mode_norm = _normalize_anchor_mode(getattr(options, "anchor_mode", None))
-        effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
+        effective_base_point = (
+            plan.base_point if plan and plan.base_point else default_base_point
+        )
         shared_site_point = (
             plan.shared_site_base_point
             if plan and getattr(plan, "shared_site_base_point", None)
             else DEFAULT_SHARED_BASE_POINT
         )
-        offset_bp = None
-        if anchor_mode_norm == "local":
-            offset_bp = effective_base_point
-        elif anchor_mode_norm == "site":
-            offset_bp = shared_site_point or effective_base_point
-
         options_for_build = options
-        if offset_bp is not None:
-            offset_tuple = _bp_offset_vector(offset_bp)
+        model_offset_applied: tuple[float, float, float] | None = None
+
+        pbp_m = (
+            _bp_offset_vector(effective_base_point)
+            if effective_base_point is not None
+            else None
+        )
+        shared_site_m = (
+            _bp_offset_vector(shared_site_point)
+            if shared_site_point is not None
+            else None
+        )
+
+        # 3-mode deterministic contract:
+        #   local -> modelOffset = PBP
+        #   site  -> modelOffset = SharedSite
+        #   none  -> no modelOffset
+        decision = decide_offsets(
+            anchor_mode=anchor_mode_norm,
+            pbp_m=pbp_m,
+            shared_site_m=shared_site_m,
+        )
+
+        if decision.model_offset_m is not None:
             options_for_build = replace(
                 options,
-                model_offset=offset_tuple,
+                model_offset=decision.model_offset_m,
                 model_offset_type="negative",
             )
+            model_offset_applied = decision.model_offset_m
+
+        logger.info(
+            "Anchor mode=%s -> modelOffset=%s georef_origin=%s",
+            decision.anchor_mode,
+            tuple(round(v, 6) for v in decision.model_offset_m)
+            if decision.model_offset_m
+            else None,
+            decision.georef_origin,
+        )
 
         logger.info("Building prototypes for %s...", path_name(ifc_path))
         caches = build_prototypes(ifc, options_for_build, ifc_path=str(ifc_path))
@@ -1314,7 +1556,10 @@ def _process_single_ifc(
         )
         logger.info(
             "IFC %s → %d type prototypes, %d hashed prototypes, %d instances",
-            path_name(ifc_path), len(caches.repmaps), len(caches.hashes), len(caches.instances),
+            path_name(ifc_path),
+            len(caches.repmaps),
+            len(caches.hashes),
+            len(caches.instances),
         )
         authoring_format = _normalise_usd_format(usd_format)
         if authoring_format == "auto":
@@ -1330,16 +1575,31 @@ def _process_single_ifc(
             authoring_format,
             stage_override=stage_path_override,
         )
+        resolved_geospatial_mode = resolve_geospatial_mode(
+            geospatial_mode,
+            offline=offline,
+            output_path=layout.stage,
+        )
 
         # Create stage for file in process.
         stage = create_usd_stage(layout.stage)
-        proto_layer, proto_paths = author_prototype_layer(stage, caches, layout.prototypes, base_name, options)
+        proto_layer, proto_paths = author_prototype_layer(
+            stage, caches, layout.prototypes, base_name, options
+        )
         _ensure_not_cancelled(cancel_event)
         mat_layer, material_library = author_material_layer(
-            stage, caches, proto_paths, layer_path=layout.materials, base_name=base_name, proto_layer=proto_layer, options=options,
+            stage,
+            caches,
+            proto_paths,
+            layer_path=layout.materials,
+            base_name=base_name,
+            proto_layer=proto_layer,
+            options=options,
         )
 
-        _ensure_not_cancelled(cancel_event) # Ensure conversion process is not cancelled for the file
+        _ensure_not_cancelled(
+            cancel_event
+        )  # Ensure conversion process is not cancelled for the file
 
         # Author instance layer
         inst_layer = author_instance_layer(
@@ -1352,37 +1612,61 @@ def _process_single_ifc(
             options=options,
         )
 
-        _ensure_not_cancelled(cancel_event) # Ensure conversion process is not cancelled for the file
+        _ensure_not_cancelled(
+            cancel_event
+        )  # Ensure conversion process is not cancelled for the file
 
         # Author 2D Geometries
-        geometry2d_layer = author_geometry2d_layer(stage, caches, layout.geometry2d, base_name, options)
-        _ensure_not_cancelled(cancel_event) 
+        geometry2d_layer = author_geometry2d_layer(
+            stage, caches, layout.geometry2d, base_name, options
+        )
+        _ensure_not_cancelled(cancel_event)
 
         # Author instance layer
-        persist_instance_cache(layout.cache_dir, base_name, caches, proto_paths) # Save instnace cache to file 
+        persist_instance_cache(
+            layout.cache_dir, base_name, caches, proto_paths
+        )  # Save instnace cache to file
 
-        _ensure_not_cancelled(cancel_event) # Ensure conversion process is not cancelled for the file
+        _ensure_not_cancelled(
+            cancel_event
+        )  # Ensure conversion process is not cancelled for the file
 
         # Resolve Coordinate Systems and Basepoints from manifests and overrides.
-        effective_base_point = plan.base_point if plan and plan.base_point else default_base_point
+        effective_base_point = (
+            plan.base_point if plan and plan.base_point else default_base_point
+        )
 
         if effective_base_point is None:
             raise ValueError(
                 f"No base point configured for {path_name(ifc_path)}; provide a manifest entry or update defaults."
             )
-        projected_crs = plan.projected_crs if plan and plan.projected_crs else coordinate_system
+        projected_crs = (
+            plan.projected_crs if plan and plan.projected_crs else coordinate_system
+        )
         if not projected_crs:
             raise ValueError(
                 f"No projected CRS available for {path_name(ifc_path)}; supply --map-coordinate-system or manifest override."
             )
-        geodetic_crs = plan.geodetic_crs if plan and plan.geodetic_crs else default_geodetic_crs
+        geodetic_crs = (
+            plan.geodetic_crs if plan and plan.geodetic_crs else default_geodetic_crs
+        )
         lonlat_override = plan.lonlat if plan else None
 
         _ensure_not_cancelled(cancel_event)
         shared_site_point = (
-            plan.shared_site_base_point if plan and getattr(plan, "shared_site_base_point", None) else DEFAULT_SHARED_BASE_POINT
+            plan.shared_site_base_point
+            if plan and getattr(plan, "shared_site_base_point", None)
+            else DEFAULT_SHARED_BASE_POINT
         )
         anchor_mode = _normalize_anchor_mode(getattr(options, "anchor_mode", None))
+        # Georef base point must match what stage (0,0,0) represents.
+        # local -> PBP, site -> SharedSite, none -> only stamp if lonlat_override exists.
+        if anchor_mode == "site":
+            georef_base_point = shared_site_point
+        elif anchor_mode == "local":
+            georef_base_point = effective_base_point
+        else:
+            georef_base_point = None
 
         if anchor_mode is not None:
             apply_stage_anchor_transform(
@@ -1395,10 +1679,53 @@ def _process_single_ifc(
                 align_axes_to_map=True,
                 lonlat=lonlat_override,
             )
-        logger.info("Assigning world geolocation using %s → %s", projected_crs, geodetic_crs)
-        geodetic_result = assign_world_geolocation(
-            stage, base_point=effective_base_point, projected_crs=projected_crs, geodetic_crs=geodetic_crs, unit_hint=effective_base_point.unit, lonlat_override=lonlat_override,
+        logger.info(
+            "Assigning world geolocation using %s -> %s", projected_crs, geodetic_crs
         )
+        if georef_base_point is not None or lonlat_override is not None:
+            # If anchor_mode is none but lonlat_override exists, we still stamp geospatial metadata
+            # without claiming any projected origin. (Useful for "already correct" exports.)
+            geodetic_result = assign_world_geolocation(
+                stage,
+                base_point=georef_base_point or effective_base_point,
+                projected_crs=projected_crs,
+                geodetic_crs=geodetic_crs,
+                unit_hint=(georef_base_point.unit if georef_base_point else None),
+                lonlat_override=lonlat_override,
+                geospatial_mode=resolved_geospatial_mode,
+                offline=offline,
+                model_offset=model_offset_applied,
+                model_offset_type="negative" if model_offset_applied else None,
+                anchor_mode=anchor_mode,
+            )
+        else:
+            geodetic_result = None
+            logger.info(
+                "Anchor mode is none and no lonlat_override provided; skipping geospatial stamping."
+            )
+
+        # Stamp contract/debug metadata for later inspection in USD
+        _stamp_federation_debug(
+            stage,
+            anchor_mode=decision.anchor_mode,
+            pbp_m=pbp_m,
+            shared_site_m=shared_site_m,
+            model_offset_m=decision.model_offset_m,
+            georef_origin=decision.georef_origin,
+        )
+
+        if resolved_geospatial_mode == "omni":
+            try:
+                maybe_stream_omnigeospatial(
+                    stage,
+                    resolved_geospatial_mode,
+                    projected_crs=projected_crs,
+                    geodetic_crs=geodetic_crs,
+                    model_offset=model_offset_applied,
+                    model_offset_type="negative" if model_offset_applied else None,
+                )
+            except Exception as exc:
+                logger.debug("Skipping OmniGeospatial prep: %s", exc)
         stage.Save()
         proto_layer.Save()
         mat_layer.Save()
@@ -1408,7 +1735,11 @@ def _process_single_ifc(
             geometry2d_layer.Save()
 
         paths_to_cleanup: list[Path] = []
-        if authoring_format == "usda" and usd_auto_binary_threshold_mb and usd_auto_binary_threshold_mb > 0:
+        if (
+            authoring_format == "usda"
+            and usd_auto_binary_threshold_mb
+            and usd_auto_binary_threshold_mb > 0
+        ):
             layout, paths_to_cleanup = _maybe_convert_layers_to_usdc(
                 stage,
                 layout,
@@ -1423,12 +1754,42 @@ def _process_single_ifc(
 
         # Layer Checkpointing for Nucleus
         if checkpoint and checkpoint_note is not None:
-            _checkpoint_path(layout.stage, checkpoint_note, checkpoint_tags, logger, f"{base_name} stage")
-            _checkpoint_path(layout.prototypes, checkpoint_note, checkpoint_tags, logger, f"{base_name} prototypes layer")
-            _checkpoint_path(layout.materials, checkpoint_note, checkpoint_tags, logger, f"{base_name} materials layer")
-            _checkpoint_path(layout.instances, checkpoint_note, checkpoint_tags, logger, f"{base_name} instances layer")
+            _checkpoint_path(
+                layout.stage,
+                checkpoint_note,
+                checkpoint_tags,
+                logger,
+                f"{base_name} stage",
+            )
+            _checkpoint_path(
+                layout.prototypes,
+                checkpoint_note,
+                checkpoint_tags,
+                logger,
+                f"{base_name} prototypes layer",
+            )
+            _checkpoint_path(
+                layout.materials,
+                checkpoint_note,
+                checkpoint_tags,
+                logger,
+                f"{base_name} materials layer",
+            )
+            _checkpoint_path(
+                layout.instances,
+                checkpoint_note,
+                checkpoint_tags,
+                logger,
+                f"{base_name} instances layer",
+            )
             if geometry2d_layer:
-                _checkpoint_path(layout.geometry2d, checkpoint_note, checkpoint_tags, logger, f"{base_name} 2D geometry layer")
+                _checkpoint_path(
+                    layout.geometry2d,
+                    checkpoint_note,
+                    checkpoint_tags,
+                    logger,
+                    f"{base_name} 2D geometry layer",
+                )
 
         # Logging Outcomes
         logger.info("Wrote stage %s", str(layout.stage))
@@ -1437,7 +1798,8 @@ def _process_single_ifc(
             "prototypes_3d": len(caches.repmaps) + len(caches.hashes),
             "instances_3d": len(caches.instances),
             "curves_2d": len(getattr(caches, "annotations", {}) or {}),
-            "total_elements": len(caches.instances) + len(getattr(caches, "annotations", {}) or {}),
+            "total_elements": len(caches.instances)
+            + len(getattr(caches, "annotations", {}) or {}),
         }
         layers = {
             "prototype": str(layout.prototypes),
@@ -1464,8 +1826,8 @@ def _process_single_ifc(
                 except Exception as exc:
                     identifier = getattr(layer_handle, "identifier", "<anonymous>")
                     logger.debug("layer.Close() failed for %s: %s", identifier, exc)
-        
-        #Clean-Ups
+
+        # Clean-Ups
         _cleanup_paths(paths_to_cleanup, logger)
 
         _ensure_not_cancelled(cancel_event)
@@ -1478,11 +1840,12 @@ def _process_single_ifc(
             projected_crs=projected_crs,
             geodetic_crs=geodetic_crs,
             geodetic_coordinates=coordinates,
+            geospatial_mode=resolved_geospatial_mode,
             counts=counts,
             plan=plan,
             revision=revision_note,
         )
-    
+
     LOG.info("Opening IFC %s", ifc_path)
 
     # The actuall proceesing calling _execute
@@ -1551,18 +1914,26 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     options_override = OPTIONS
     if width_rules:
         options_override = replace(options_override, curve_width_rules=width_rules)
-    if cli_anchor_mode is not None and getattr(options_override, "anchor_mode", None) != cli_anchor_mode:
+    if (
+        cli_anchor_mode is not None
+        and getattr(options_override, "anchor_mode", None) != cli_anchor_mode
+    ):
         options_override = replace(options_override, anchor_mode=cli_anchor_mode)
     detail_scope_arg = getattr(args, "detail_scope", None)
     if getattr(args, "detail_mode", False):
-        LOG.info("Detail mode enabled: forwarding to OCC detail pipeline (iterator mesh for base geometry).")
+        LOG.info(
+            "Detail mode enabled: forwarding to OCC detail pipeline (iterator mesh for base geometry)."
+        )
         if not detail_scope_arg:
             detail_scope_arg = "all"
         if not getattr(options_override, "detail_mode", False):
             options_override = replace(options_override, detail_mode=True)
     if detail_scope_arg:
         if not getattr(args, "detail_mode", False):
-            print("Error: --detail-scope requires --detail-mode to be enabled.", file=sys.stderr)
+            print(
+                "Error: --detail-scope requires --detail-mode to be enabled.",
+                file=sys.stderr,
+            )
             shutdown_usd_context()
             raise SystemExit(2)
         LOG.info("Detail scope override: %s", detail_scope_arg)
@@ -1570,7 +1941,9 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     detail_objects_arg = getattr(args, "detail_objects", None)
     if detail_objects_arg:
         LOG.info("Detail objects override (mixed ids/guids): %s", detail_objects_arg)
-        options_override = replace(options_override, detail_objects=tuple(detail_objects_arg))
+        options_override = replace(
+            options_override, detail_objects=tuple(detail_objects_arg)
+        )
 
     if getattr(args, "enable_semantic_subcomponents", False):
         LOG.info("Semantic subcomponent splitting enabled.")
@@ -1584,7 +1957,14 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         norm_engine = "semantic"
     detail_engine_arg = norm_engine
     # Normalize deprecated force_engine into detail_engine for compatibility
-    if getattr(options_override, "detail_engine", getattr(options_override, "force_engine", "default")) != detail_engine_arg:
+    if (
+        getattr(
+            options_override,
+            "detail_engine",
+            getattr(options_override, "force_engine", "default"),
+        )
+        != detail_engine_arg
+    ):
         options_override = replace(options_override, detail_engine=detail_engine_arg)
 
     semantic_tokens_path = getattr(args, "semantic_tokens_path", None)
@@ -1597,9 +1977,15 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
                 LOG.info("Loaded semantic tokens from %s", st_path)
                 options_override = replace(options_override, semantic_tokens=st_payload)
             else:
-                LOG.warning("Semantic tokens file %s must contain a JSON object; ignoring.", st_path)
+                LOG.warning(
+                    "Semantic tokens file %s must contain a JSON object; ignoring.",
+                    st_path,
+                )
         except Exception as exc:
-            print(f"Error: Failed to load semantic tokens from {semantic_tokens_path}: {exc}", file=sys.stderr)
+            print(
+                f"Error: Failed to load semantic tokens from {semantic_tokens_path}: {exc}",
+                file=sys.stderr,
+            )
             shutdown_usd_context()
             raise SystemExit(2) from exc
     try:
@@ -1617,11 +2003,14 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             usd_format=args.usd_format,
             usd_auto_binary_threshold_mb=args.usd_auto_binary_threshold_mb,
             anchor_mode=cli_anchor_mode,
+            geospatial_mode=getattr(args, "geospatial_mode", "auto"),
         )
     finally:
         shutdown_usd_context()
     _print_summary(results)
     return results
+
+
 # ------------- summary -------------
 def _print_summary(results: Sequence[ConversionResult]) -> None:
     if not results:
@@ -1630,10 +2019,17 @@ def _print_summary(results: Sequence[ConversionResult]) -> None:
     print("\nSummary:")
     for result in results:
         counts = result.counts
-        master_stage = path_name(result.master_stage_path) if result.master_stage_path else "n/a"
+        master_stage = (
+            path_name(result.master_stage_path) if result.master_stage_path else "n/a"
+        )
         coords = result.geodetic_coordinates
         revision = result.revision or "n/a"
-        if coords and len(coords) >= 2 and coords[0] is not None and coords[1] is not None:
+        if (
+            coords
+            and len(coords) >= 2
+            and coords[0] is not None
+            and coords[1] is not None
+        ):
             alt_val = coords[2] if len(coords) > 2 and coords[2] is not None else 0.0
             coord_info = f", geo=({coords[0]:.5f}, {coords[1]:.5f}, {alt_val:.2f})"
         else:
