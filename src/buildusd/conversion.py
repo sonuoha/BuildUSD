@@ -8,6 +8,7 @@ import logging
 import tempfile
 import sys
 from dataclasses import dataclass, replace
+import math
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional, Sequence, Union
 
@@ -34,7 +35,14 @@ from .io_utils import (
     stat_entry,
 )
 from .occ_detail_bootstrap import bootstrap_occ
-from .process_ifc import ConversionOptions, CurveWidthRule, build_prototypes
+from .process_ifc import (
+    ConversionOptions,
+    CurveWidthRule,
+    MapConversionData,
+    build_prototypes,
+    extract_map_conversion,
+)
+from .resolve_frame import _ifc_length_to_meters, _placement_location_xyz
 from .process_usd import (
     apply_stage_anchor_transform,
     assign_world_geolocation,
@@ -104,6 +112,12 @@ _UNIT_FACTORS = {
     "decimeters": 0.1,
 }
 
+_PROJECTED_XY_THRESHOLD_M = 10000.0
+_MAP_ORIGIN_NONZERO_THRESHOLD_M = 1.0
+_ROTATION_IDENTITY_EPS = 1.0e-6
+_SCALE_MATCH_EPS = 1.0e-6
+_DOUBLE_GEOREF_WARN_THRESHOLD_M = 5000.0
+
 
 def _bp_offset_vector(bp: BasePointConfig) -> tuple[float, float, float]:
     """Return (easting, northing, height) in metres from a BasePointConfig."""
@@ -119,6 +133,280 @@ def _bp_offset_vector(bp: BasePointConfig) -> tuple[float, float, float]:
         )
     except Exception:
         return (0.0, 0.0, 0.0)
+
+
+def _ifc_projected_crs_present(ifc) -> bool:
+    try:
+        return bool(ifc.by_type("IfcProjectedCRS"))
+    except Exception:
+        return False
+
+
+def _ifc_projected_crs_label(ifc) -> Optional[str]:
+    try:
+        entries = ifc.by_type("IfcProjectedCRS") or []
+    except Exception:
+        return None
+    for crs in entries:
+        parts = []
+        for key in ("Name", "Description", "GeodeticDatum", "MapProjection"):
+            try:
+                value = getattr(crs, key, None)
+            except Exception:
+                value = None
+            if value:
+                parts.append(str(value))
+        if parts:
+            return " | ".join(parts)
+    return None
+
+
+def _ifc_site_placement_m(
+    ifc, unit_scale_m: float
+) -> Optional[tuple[float, float, float]]:
+    raw = _ifc_site_placement_raw(ifc)
+    if raw is None:
+        return None
+    return (
+        float(raw[0]) * unit_scale_m,
+        float(raw[1]) * unit_scale_m,
+        float(raw[2]) * unit_scale_m,
+    )
+
+
+def _ifc_site_placement_raw(
+    ifc,
+) -> Optional[tuple[float, float, float]]:
+    try:
+        sites = ifc.by_type("IfcSite") or []
+    except Exception:
+        return None
+    for site in sites:
+        place = getattr(site, "ObjectPlacement", None)
+        xyz = _placement_location_xyz(place)
+        if xyz is None:
+            continue
+        return (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+    return None
+
+
+def resolve_project_base_point_m(ifc) -> Optional[tuple[float, float, float]]:
+    # TODO: wire to exporter-specific metadata (IfcPropertySet, etc.)
+    _ = ifc
+    return None
+
+
+def resolve_survey_point_m(ifc) -> Optional[tuple[float, float, float]]:
+    # TODO: wire to exporter-specific metadata (IfcPropertySet, etc.)
+    _ = ifc
+    return None
+
+
+def _classify_authored_space(
+    ifc,
+    *,
+    unit_scale_m: float,
+    site_m: Optional[tuple[float, float, float]],
+    global_threshold_m: float = _PROJECTED_XY_THRESHOLD_M,
+    sample_limit: int = 200,
+) -> str:
+    if site_m is not None:
+        max_abs = max(abs(site_m[0]), abs(site_m[1]), abs(site_m[2]))
+        if max_abs >= global_threshold_m:
+            return "global"
+    max_abs = 0.0
+    count = 0
+    for typename in ("IfcProduct", "IfcElement", "IfcBuildingElement"):
+        try:
+            items = ifc.by_type(typename) or []
+        except Exception:
+            continue
+        if not items:
+            continue
+        for product in items:
+            if count >= sample_limit:
+                break
+            place = getattr(product, "ObjectPlacement", None)
+            xyz = _placement_location_xyz(place)
+            if xyz is None:
+                continue
+            max_abs = max(
+                max_abs,
+                abs(float(xyz[0]) * unit_scale_m),
+                abs(float(xyz[1]) * unit_scale_m),
+                abs(float(xyz[2]) * unit_scale_m),
+            )
+            count += 1
+        break
+    return "global" if max_abs >= global_threshold_m else "local"
+
+
+def _classify_georef_strategy(
+    *,
+    site_m: Optional[tuple[float, float, float]],
+    site_raw: Optional[tuple[float, float, float]],
+    map_conv: Optional[MapConversionData],
+    unit_scale_m: float,
+) -> tuple[str, dict]:
+    if unit_scale_m <= 0:
+        unit_scale_m = 1.0
+    notes: list[str] = []
+    strategy = "BAKED_PROJECTED"
+    info: dict[str, object] = {}
+
+    site_xy_mag = None
+    if site_m is not None:
+        site_xy_mag = max(abs(site_m[0]), abs(site_m[1]))
+    site_is_projected = (
+        site_xy_mag is not None and site_xy_mag > _PROJECTED_XY_THRESHOLD_M
+    )
+    site_is_local = site_xy_mag is not None and site_xy_mag <= _PROJECTED_XY_THRESHOLD_M
+
+    map_origin_mag = None
+    map_origin_projected = False
+    map_origin_nonzero = False
+    map_rot_identity = False
+    map_scale_identity = False
+    map_identity_like = False
+    rotation_deg = None
+    map_scale = None
+    consistency_distance = None
+
+    if map_conv is not None:
+        map_scale = float(getattr(map_conv, "scale", 1.0) or 1.0)
+        eastings = float(getattr(map_conv, "eastings", 0.0) or 0.0)
+        northings = float(getattr(map_conv, "northings", 0.0) or 0.0)
+        map_origin_mag = max(abs(eastings), abs(northings))
+        map_origin_projected = map_origin_mag > _PROJECTED_XY_THRESHOLD_M
+        map_origin_nonzero = map_origin_mag > _MAP_ORIGIN_NONZERO_THRESHOLD_M
+        ax, ay = map_conv.normalized_axes()
+        rotation_deg = map_conv.rotation_degrees()
+        map_rot_identity = (
+            abs(ax - 1.0) <= _ROTATION_IDENTITY_EPS
+            and abs(ay) <= _ROTATION_IDENTITY_EPS
+        )
+        map_scale_identity = (
+            abs(map_scale - 1.0) <= _SCALE_MATCH_EPS
+            or abs(map_scale - unit_scale_m) <= _SCALE_MATCH_EPS
+        )
+        map_identity_like = (
+            not map_origin_nonzero and map_rot_identity and map_scale_identity
+        )
+
+        if site_is_projected and map_origin_projected and site_m is not None:
+            if site_raw is None and unit_scale_m > 0:
+                site_raw = (
+                    site_m[0] / unit_scale_m,
+                    site_m[1] / unit_scale_m,
+                    site_m[2] / unit_scale_m,
+                )
+            if site_raw is not None and unit_scale_m > 0:
+                scale_eff = map_scale / unit_scale_m
+                pred_x = eastings + scale_eff * (ax * site_raw[0] - ay * site_raw[1])
+                pred_y = northings + scale_eff * (ay * site_raw[0] + ax * site_raw[1])
+                consistency_distance = math.hypot(
+                    pred_x - site_m[0], pred_y - site_m[1]
+                )
+                if consistency_distance > _DOUBLE_GEOREF_WARN_THRESHOLD_M:
+                    notes.append("double_georef_suspect")
+
+    if map_conv is None:
+        notes.append("mapconv_missing")
+        strategy = "BAKED_PROJECTED"
+    elif site_is_local and map_origin_projected:
+        strategy = "MAPCONV_ANCHORED"
+    else:
+        strategy = "BAKED_PROJECTED"
+
+    if map_identity_like:
+        notes.append("mapconv_identity_like")
+        strategy = "BAKED_PROJECTED"
+
+    if site_is_projected and map_origin_projected:
+        notes.append("both_projected_scale")
+        strategy = "BAKED_PROJECTED"
+
+    info.update(
+        {
+            "site_xy_mag_m": site_xy_mag,
+            "map_origin_mag_m": map_origin_mag,
+            "map_rotation_deg": rotation_deg,
+            "map_scale": map_scale,
+            "site_is_projected": site_is_projected,
+            "map_origin_projected": map_origin_projected,
+            "map_identity_like": map_identity_like,
+            "consistency_distance_m": consistency_distance,
+            "notes": notes,
+        }
+    )
+    return strategy, info
+
+
+def _mapconv_scale_factor(map_conv: MapConversionData, unit_scale_m: float) -> float:
+    scale = float(getattr(map_conv, "scale", 1.0) or 1.0)
+    if unit_scale_m <= 0:
+        unit_scale_m = 1.0
+    return scale / unit_scale_m
+
+
+def _mapconv_world_to_local_m(
+    map_conv: MapConversionData,
+    world_xyz_m: tuple[float, float, float],
+    *,
+    unit_scale_m: float,
+) -> Optional[tuple[float, float, float]]:
+    scale_eff = _mapconv_scale_factor(map_conv, unit_scale_m)
+    if abs(scale_eff) <= 1.0e-12:
+        return None
+    ax, ay = map_conv.normalized_axes()
+    d_e = float(world_xyz_m[0]) - float(getattr(map_conv, "eastings", 0.0) or 0.0)
+    d_n = float(world_xyz_m[1]) - float(getattr(map_conv, "northings", 0.0) or 0.0)
+    d_z = float(world_xyz_m[2]) - float(
+        getattr(map_conv, "orthogonal_height", 0.0) or 0.0
+    )
+    x_m = (ax * d_e + ay * d_n) / scale_eff
+    y_m = (-ay * d_e + ax * d_n) / scale_eff
+    z_m = d_z / scale_eff
+    return (x_m, y_m, z_m)
+
+
+def _mapconv_local_to_world_m(
+    map_conv: MapConversionData,
+    local_xyz_m: tuple[float, float, float],
+    *,
+    unit_scale_m: float,
+) -> Optional[tuple[float, float, float]]:
+    scale_eff = _mapconv_scale_factor(map_conv, unit_scale_m)
+    if abs(scale_eff) <= 1.0e-12:
+        return None
+    ax, ay = map_conv.normalized_axes()
+    x_m, y_m, z_m = (
+        float(local_xyz_m[0]),
+        float(local_xyz_m[1]),
+        float(local_xyz_m[2]),
+    )
+    easting = float(getattr(map_conv, "eastings", 0.0) or 0.0) + scale_eff * (
+        ax * x_m - ay * y_m
+    )
+    northing = float(getattr(map_conv, "northings", 0.0) or 0.0) + scale_eff * (
+        ay * x_m + ax * y_m
+    )
+    height = float(getattr(map_conv, "orthogonal_height", 0.0) or 0.0) + scale_eff * (
+        z_m
+    )
+    return (easting, northing, height)
+
+
+def _base_point_from_xyz_m(
+    xyz_m: tuple[float, float, float], projected_crs: Optional[str]
+) -> BasePointConfig:
+    return BasePointConfig(
+        easting=float(xyz_m[0]),
+        northing=float(xyz_m[1]),
+        height=float(xyz_m[2]),
+        unit="m",
+        epsg=projected_crs or "",
+    )
 
 
 def _stamp_federation_debug(
@@ -263,9 +551,9 @@ def _normalize_anchor_mode(value: Optional[str]) -> Optional[str]:
     normalized = value.strip().lower()
     alias_map: dict[str, Optional[str]] = {
         "local": "local",
-        "site": "site",
-        "basepoint": "local",
-        "shared_site": "site",
+        "basepoint": "basepoint",
+        "site": "basepoint",
+        "shared_site": "basepoint",
         "none": None,
         "": None,
     }
@@ -1454,18 +1742,11 @@ def _process_single_ifc(
         _ensure_not_cancelled(cancel_event)
         ifc = ifcopenshell.open(local_ifc.as_posix())
         _ensure_not_cancelled(cancel_event)
-        try:
-            from ifcopenshell.util.unit import calculate_unit_scale
-
-            unit_scale = float(calculate_unit_scale(ifc)) or 1.0
-            if unit_scale <= 0:
-                unit_scale = 1.0
-            if abs(unit_scale - 1.0) > 1e-6:
-                logger.info("IFC unit scale: %s m/unit", unit_scale)
-            else:
-                logger.debug("IFC unit scale: %s m/unit", unit_scale)
-        except Exception:
-            pass
+        unit_scale_m = _ifc_length_to_meters(ifc)
+        if abs(unit_scale_m - 1.0) > 1e-6:
+            logger.info("IFC unit scale: %s m/unit", unit_scale_m)
+        else:
+            logger.debug("IFC unit scale: %s m/unit", unit_scale_m)
         try:
             contexts = ifc.by_type("IfcGeometricRepresentationContext") or []
             for ctx in contexts:
@@ -1505,35 +1786,199 @@ def _process_single_ifc(
             if plan and getattr(plan, "shared_site_base_point", None)
             else DEFAULT_SHARED_BASE_POINT
         )
+        rotation_quat = (0.0, 0.0, 0.0, 1.0)
         options_for_build = options
         model_offset_applied: tuple[float, float, float] | None = None
 
-        pbp_m = (
+        map_conv = extract_map_conversion(ifc)
+        projected_crs_label = _ifc_projected_crs_label(ifc)
+        has_projected_crs = bool(projected_crs_label) or _ifc_projected_crs_present(ifc)
+
+        ifc_site_raw = _ifc_site_placement_raw(ifc)
+        ifc_site_authored_m = (
+            (
+                float(ifc_site_raw[0]) * unit_scale_m,
+                float(ifc_site_raw[1]) * unit_scale_m,
+                float(ifc_site_raw[2]) * unit_scale_m,
+            )
+            if ifc_site_raw is not None
+            else None
+        )
+        geom_space = _classify_authored_space(
+            ifc, unit_scale_m=unit_scale_m, site_m=ifc_site_authored_m
+        )
+        strategy, strategy_info = _classify_georef_strategy(
+            site_m=ifc_site_authored_m,
+            site_raw=ifc_site_raw,
+            map_conv=map_conv,
+            unit_scale_m=unit_scale_m,
+        )
+        map_conv_active = map_conv if strategy == "MAPCONV_ANCHORED" else None
+        rotation_applied = False
+        rotation_theta_deg = 0.0
+        if map_conv_active is not None:
+            ax, ay = map_conv_active.normalized_axes()
+            if (
+                abs(ax - 1.0) > _ROTATION_IDENTITY_EPS
+                or abs(ay) > _ROTATION_IDENTITY_EPS
+            ):
+                rotation_theta_deg = math.degrees(math.atan2(ay, ax))
+                half = math.radians(rotation_theta_deg) * 0.5
+                rotation_quat = (
+                    0.0,
+                    0.0,
+                    math.sin(half),
+                    math.cos(half),
+                )
+                rotation_applied = True
+        options_for_build = replace(options_for_build, model_rotation=rotation_quat)
+        strategy_notes = set(strategy_info.get("notes", []) or [])
+        if "both_projected_scale" in strategy_notes:
+            logger.warning(
+                "Double-georef risk for %s: site and map origin are projected-scale; strategy=%s consistency_distance=%s threshold=%s",
+                path_name(ifc_path),
+                strategy,
+                strategy_info.get("consistency_distance_m"),
+                _DOUBLE_GEOREF_WARN_THRESHOLD_M,
+            )
+        if "double_georef_suspect" in strategy_notes:
+            logger.warning(
+                "Double-georef suspect for %s: mapconv prediction deviates from site by %s m (threshold=%s); strategy=%s",
+                path_name(ifc_path),
+                strategy_info.get("consistency_distance_m"),
+                _DOUBLE_GEOREF_WARN_THRESHOLD_M,
+                strategy,
+            )
+        if "mapconv_identity_like" in strategy_notes:
+            logger.info(
+                "MapConversion is identity-like for %s; suppressing mapconv anchor.",
+                path_name(ifc_path),
+            )
+        if map_conv_active is not None and not has_projected_crs:
+            logger.info(
+                "IfcProjectedCRS is missing for %s; using heuristic MapConversion anchoring.",
+                path_name(ifc_path),
+            )
+        if map_conv is not None:
+            logger.info(
+                "Model rotation %s for %s: strategy=%s xa=%s xo=%s theta_deg=%s quat=%s",
+                "applied" if rotation_applied else "suppressed",
+                path_name(ifc_path),
+                strategy,
+                float(getattr(map_conv, "x_axis_abscissa", 1.0) or 1.0),
+                float(getattr(map_conv, "x_axis_ordinate", 0.0) or 0.0),
+                rotation_theta_deg,
+                rotation_quat,
+            )
+
+        ifc_site_world_m: tuple[float, float, float] | None = None
+        if ifc_site_authored_m is not None:
+            if geom_space == "global":
+                ifc_site_world_m = ifc_site_authored_m
+            elif map_conv_active is not None:
+                ifc_site_world_m = _mapconv_local_to_world_m(
+                    map_conv_active, ifc_site_authored_m, unit_scale_m=unit_scale_m
+                )
+
+        pbp_ifc_m = resolve_project_base_point_m(ifc)
+        sp_ifc_m = resolve_survey_point_m(ifc)
+
+        pbp_world_m = pbp_ifc_m or (
             _bp_offset_vector(effective_base_point)
             if effective_base_point is not None
             else None
         )
-        shared_site_m = (
+        shared_site_world_m = sp_ifc_m or (
             _bp_offset_vector(shared_site_point)
             if shared_site_point is not None
             else None
         )
 
-        # 3-mode deterministic contract:
-        #   local -> modelOffset = PBP
-        #   site  -> modelOffset = SharedSite
-        #   none  -> no modelOffset
+        if anchor_mode_norm == "local" and ifc_site_authored_m is None:
+            logger.warning(
+                "Anchor mode local requested but IfcSite placement was not found; modelOffset will be (0,0,0)."
+            )
+        if (
+            anchor_mode_norm == "basepoint"
+            and pbp_world_m is None
+            and shared_site_world_m is None
+        ):
+            logger.warning(
+                "Anchor mode basepoint requested but no PBP/SP was resolved; modelOffset will be (0,0,0)."
+            )
+        if (
+            anchor_mode_norm == "basepoint"
+            and geom_space == "local"
+            and map_conv_active is None
+            and (pbp_world_m is not None or shared_site_world_m is not None)
+        ):
+            logger.warning(
+                "Anchor mode basepoint requires IfcMapConversion for local geometry; modelOffset will be (0,0,0)."
+            )
+
+        pbp_offset_m: tuple[float, float, float] | None = None
+        if pbp_world_m is not None:
+            if geom_space == "global":
+                pbp_offset_m = pbp_world_m
+            elif map_conv_active is not None:
+                pbp_offset_m = _mapconv_world_to_local_m(
+                    map_conv_active, pbp_world_m, unit_scale_m=unit_scale_m
+                )
+
+        shared_site_offset_m: tuple[float, float, float] | None = None
+        if shared_site_world_m is not None:
+            if geom_space == "global":
+                shared_site_offset_m = shared_site_world_m
+            elif map_conv_active is not None:
+                shared_site_offset_m = _mapconv_world_to_local_m(
+                    map_conv_active, shared_site_world_m, unit_scale_m=unit_scale_m
+                )
+
         decision = decide_offsets(
             anchor_mode=anchor_mode_norm,
-            pbp_m=pbp_m,
-            shared_site_m=shared_site_m,
+            ifc_site_m=ifc_site_authored_m,
+            pbp_m=pbp_offset_m,
+            shared_site_m=shared_site_offset_m,
         )
 
-        if decision.model_offset_m is not None:
+        if anchor_mode_norm is not None:
+            logger.info(
+                "GeoAnchor %s unit_to_m=%s site_m=%s map_origin=%s rot_deg=%s scale=%s strategy=%s anchor_mode=%s modelOffset=%s",
+                path_name(ifc_path),
+                unit_scale_m,
+                ifc_site_authored_m,
+                (
+                    (
+                        float(getattr(map_conv, "eastings", 0.0) or 0.0),
+                        float(getattr(map_conv, "northings", 0.0) or 0.0),
+                        float(getattr(map_conv, "orthogonal_height", 0.0) or 0.0),
+                    )
+                    if map_conv is not None
+                    else None
+                ),
+                (map_conv.rotation_degrees() if map_conv is not None else None),
+                float(getattr(map_conv, "scale", 1.0) or 1.0)
+                if map_conv is not None
+                else None,
+                strategy,
+                anchor_mode_norm,
+                decision.model_offset_m,
+            )
+            logger.debug(
+                "GeoAnchor details: crs=%s has_projected_crs=%s geom_space=%s map_conv_active=%s info=%s",
+                projected_crs_label,
+                has_projected_crs,
+                geom_space,
+                "yes" if map_conv_active is not None else "no",
+                strategy_info,
+            )
+
+        if decision.model_offset_m is not None and decision.anchor_mode is not None:
             options_for_build = replace(
-                options,
+                options_for_build,
                 model_offset=decision.model_offset_m,
                 model_offset_type="negative",
+                model_rotation=rotation_quat,
             )
             model_offset_applied = decision.model_offset_m
 
@@ -1658,22 +2103,32 @@ def _process_single_ifc(
             if plan and getattr(plan, "shared_site_base_point", None)
             else DEFAULT_SHARED_BASE_POINT
         )
-        anchor_mode = _normalize_anchor_mode(getattr(options, "anchor_mode", None))
-        # Georef base point must match what stage (0,0,0) represents.
-        # local -> PBP, site -> SharedSite, none -> only stamp if lonlat_override exists.
-        if anchor_mode == "site":
-            georef_base_point = shared_site_point
-        elif anchor_mode == "local":
-            georef_base_point = effective_base_point
-        else:
-            georef_base_point = None
+        anchor_mode = decision.anchor_mode
+        pbp_base_point = (
+            _base_point_from_xyz_m(pbp_ifc_m, projected_crs)
+            if pbp_ifc_m is not None
+            else effective_base_point
+        )
+        shared_site_base_point = (
+            _base_point_from_xyz_m(sp_ifc_m, projected_crs)
+            if sp_ifc_m is not None
+            else shared_site_point
+        )
+        georef_base_point: BasePointConfig | None = None
+        if decision.georef_origin == "ifc_site" and ifc_site_world_m is not None:
+            georef_base_point = _base_point_from_xyz_m(ifc_site_world_m, projected_crs)
+        elif decision.georef_origin == "pbp":
+            georef_base_point = pbp_base_point
+        elif decision.georef_origin == "shared_site":
+            georef_base_point = shared_site_base_point
 
-        if anchor_mode is not None:
+        if anchor_mode is not None and georef_base_point is not None:
             apply_stage_anchor_transform(
                 stage,
                 caches,
-                base_point=effective_base_point,
-                shared_site_base_point=shared_site_point,
+                base_point=georef_base_point,
+                pbp_base_point=pbp_base_point,
+                shared_site_base_point=shared_site_base_point,
                 anchor_mode=anchor_mode,
                 projected_crs=projected_crs,
                 align_axes_to_map=True,
@@ -1682,12 +2137,15 @@ def _process_single_ifc(
         logger.info(
             "Assigning world geolocation using %s -> %s", projected_crs, geodetic_crs
         )
-        if georef_base_point is not None or lonlat_override is not None:
+        base_point_for_geo = georef_base_point or (
+            pbp_base_point if lonlat_override is not None else None
+        )
+        if base_point_for_geo is not None or lonlat_override is not None:
             # If anchor_mode is none but lonlat_override exists, we still stamp geospatial metadata
             # without claiming any projected origin. (Useful for "already correct" exports.)
             geodetic_result = assign_world_geolocation(
                 stage,
-                base_point=georef_base_point or effective_base_point,
+                base_point=base_point_for_geo or pbp_base_point,
                 projected_crs=projected_crs,
                 geodetic_crs=geodetic_crs,
                 unit_hint=(georef_base_point.unit if georef_base_point else None),
@@ -1701,15 +2159,15 @@ def _process_single_ifc(
         else:
             geodetic_result = None
             logger.info(
-                "Anchor mode is none and no lonlat_override provided; skipping geospatial stamping."
+                "No geospatial base point and no lonlat_override provided; skipping geospatial stamping."
             )
 
         # Stamp contract/debug metadata for later inspection in USD
         _stamp_federation_debug(
             stage,
             anchor_mode=decision.anchor_mode,
-            pbp_m=pbp_m,
-            shared_site_m=shared_site_m,
+            pbp_m=pbp_world_m,
+            shared_site_m=shared_site_world_m,
             model_offset_m=decision.model_offset_m,
             georef_origin=decision.georef_origin,
         )

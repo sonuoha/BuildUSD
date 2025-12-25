@@ -152,9 +152,9 @@ def parse_args(
     parser.add_argument(
         "--anchor-mode",
         dest="anchor_mode",
-        choices=("local", "site", "none"),
+        choices=("local", "basepoint", "none"),
         default="none",
-        help="Choose whether stages anchor to the file-local base point, shared site base point, or skip anchoring entirely.",
+        help="Choose whether stages anchor to the IFC site placement, base point (PBP/SP), or skip anchoring entirely.",
     )
     parser.add_argument(
         "--geospatial-mode",

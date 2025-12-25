@@ -26,7 +26,7 @@ from .conversion import (
 from .process_usd import apply_stage_anchor_transform
 
 PathLike = Union[str, Path]
-AnchorMode = Literal["local", "site"]
+AnchorMode = Literal["local", "basepoint"]
 AnchorModeSetting = Optional[AnchorMode]
 
 __all__ = [
@@ -60,10 +60,10 @@ def _normalize_anchor_mode(value: Optional[str]) -> Optional[AnchorMode]:
     if value is None:
         return None
     normalized = value.strip().lower()
-    if normalized in ("local", "basepoint"):
+    if normalized == "local":
         return "local"
-    if normalized in ("site", "shared_site"):
-        return "site"
+    if normalized in ("basepoint", "site", "shared_site"):
+        return "basepoint"
     if normalized in ("none", ""):
         return None
     logging.getLogger(__name__).debug(

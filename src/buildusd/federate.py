@@ -42,10 +42,10 @@ def _normalize_anchor_mode(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
     normalized = value.strip().lower()
-    if normalized in ("local", "basepoint"):
+    if normalized == "local":
         return "local"
-    if normalized in ("site", "shared_site"):
-        return "site"
+    if normalized in ("basepoint", "site", "shared_site"):
+        return "basepoint"
     if normalized in ("none", ""):
         return None
     LOG.debug("Unknown anchor_mode '%s'; defaulting to None", value)
@@ -298,9 +298,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--anchor-mode",
         dest="anchor_mode",
-        choices=("local", "site", "none"),
+        choices=("local", "basepoint", "none"),
         default="none",
-        help="Match federation alignment to stages anchored via the local base point, shared site base point, or skip anchoring (default: %(default)s).",
+        help="Match federation alignment to stages anchored via the IFC site placement, base point (PBP/SP), or skip anchoring (default: %(default)s).",
     )
     parser.add_argument(
         "--offline",

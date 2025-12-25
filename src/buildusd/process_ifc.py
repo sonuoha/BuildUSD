@@ -836,8 +836,9 @@ class GeometrySettingsManager:
             self._offset_signed = (-0.0, -0.0, -0.0)
         else:
             self._offset_signed = self._offset_raw
-        self._rotation_quat: Tuple[float, float, float, float] = tuple(
-            float(v) for v in base_settings.get("model-rotation", (0.0, 0.0, 0.0, 1.0))
+        self._rotation_quat: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+        self._set_model_rotation(
+            base_settings.get("model-rotation", (0.0, 0.0, 0.0, 1.0))
         )
 
         using_stub = False
@@ -892,6 +893,7 @@ class GeometrySettingsManager:
         # so the underlying settings carry the signed value.
         self._set_model_offset(base_settings.get("model-offset", (0.0, 0.0, 0.0)))
         self._apply_offset_to_settings()
+        self._apply_rotation_to_settings()
 
     # ---------------- properties ----------------
 
@@ -1007,7 +1009,24 @@ class GeometrySettingsManager:
                 quat = (float(xs[0]), float(xs[1]), float(xs[2]), float(xs[3]))
         else:
             quat = (0.0, 0.0, 0.0, 1.0)
-        self._rotation_quat = quat
+        length = math.sqrt(sum(v * v for v in quat)) or 1.0
+        self._rotation_quat = (
+            float(quat[0]) / length,
+            float(quat[1]) / length,
+            float(quat[2]) / length,
+            float(quat[3]) / length,
+        )
+
+    def _apply_rotation_to_settings(self) -> None:
+        """Push the resolved quaternion into all managed settings objects."""
+        for s in (self._default, self._occ, self._remesh):
+            try:
+                s.set("model-rotation", self._rotation_quat)
+            except Exception:
+                try:
+                    s.set("MODEL_ROTATION", self._rotation_quat)
+                except Exception:
+                    pass
 
     # ---------------- public API: set / get ----------------
 
@@ -1034,6 +1053,7 @@ class GeometrySettingsManager:
             value = self._set_model_offset(value)
         elif lk == "model-rotation":
             self._set_model_rotation(value)
+            value = self._rotation_quat
 
         if target is None:
             targets = (self._default, self._occ, self._remesh)
@@ -1389,7 +1409,7 @@ class ConversionOptions:
     enable_high_detail_remesh: bool = False
     manifest: Optional["ConversionManifest"] = None
     curve_width_rules: Tuple[CurveWidthRule, ...] = tuple()
-    anchor_mode: Optional[Literal["local", "site"]] = None
+    anchor_mode: Optional[Literal["local", "basepoint"]] = None
     # No extra policy knobs: anchoring is controlled solely by anchor_mode.
     detail_mode: bool = False
     detail_scope: Literal["all", "object"] = "all"
@@ -1403,6 +1423,7 @@ class ConversionOptions:
     # Optional overrides for geometry settings (fed from anchoring logic)
     model_offset: Optional[Tuple[float, float, float]] = None
     model_offset_type: Optional[str] = None
+    model_rotation: Optional[Tuple[float, float, float, float]] = None
 
 
 @dataclass(frozen=True)
@@ -1590,6 +1611,10 @@ class PrototypeBuildContext:
             base_geom_settings["offset-type"] = str(
                 getattr(options, "model_offset_type")
             )
+        if getattr(options, "model_rotation", None) is not None:
+            base_geom_settings["model-rotation"] = tuple(
+                getattr(options, "model_rotation")
+            )
         # Apply user-provided safe geometry overrides
         user_geom = getattr(options, "geom_overrides", {}) or {}
         if user_geom:
@@ -1608,6 +1633,11 @@ class PrototypeBuildContext:
             base_settings=base_geom_settings,
             remesh_overrides=_HIGH_DETAIL_OVERRIDES if user_high_detail else None,
             logger=log,
+        )
+        log.debug(
+            "Geometry settings: model-offset=%s model-rotation=%s",
+            settings_manager.get("model-offset"),
+            settings_manager.get("model-rotation"),
         )
         occ_settings = settings_manager.occ_settings
 

@@ -182,8 +182,8 @@ def compute_model_offset(
     Definitions:
       - pbp: site-local base point (per-file/project base point)
       - shared_site: federated/survey anchor point (shared across sites)
-      - anchor_mode: 'local' => stage origin represents PBP
-                     'site'  => stage origin represents shared_site
+      - anchor_mode: 'local'     => stage origin represents PBP
+                     'basepoint' => stage origin represents shared_site/PBP
 
     If geometry is GLOBAL (already in survey frame):
       model_offset = desired_anchor
@@ -193,7 +193,10 @@ def compute_model_offset(
       (so stage_pos = v - (A - P) = v + (P - A))
     """
     mode = (anchor_mode or "local").strip().lower()
-    desired_anchor = pbp if mode == "local" else shared_site
+    if mode == "local":
+        desired_anchor = pbp
+    else:
+        desired_anchor = pbp if pbp is not None else shared_site
 
     p_m = bp_to_m(pbp)
     a_m = bp_to_m(desired_anchor)

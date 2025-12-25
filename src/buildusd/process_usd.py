@@ -5346,8 +5346,9 @@ def apply_stage_anchor_transform(
     caches: PrototypeCaches,
     base_point: Optional[BasePointConfig] = None,
     *,
+    pbp_base_point: Optional[BasePointConfig] = None,
     shared_site_base_point: Optional[BasePointConfig] = None,
-    anchor_mode: Optional[Literal["local", "site", "basepoint", "shared_site"]] = None,
+    anchor_mode: Optional[Literal["local", "basepoint"]] = None,
     align_axes_to_map: bool = False,
     enable_geo_anchor: bool = True,  # kept for signature compatibility (unused)
     projected_crs: Optional[str] = None,
@@ -5375,9 +5376,9 @@ def apply_stage_anchor_transform(
 
     alias_map = {
         "local": "local",
-        "site": "site",
-        "basepoint": "local",
-        "shared_site": "site",
+        "basepoint": "basepoint",
+        "site": "basepoint",
+        "shared_site": "basepoint",
         "none": None,
     }
     mode_normalised = alias_map.get(mode_key)
@@ -5407,12 +5408,17 @@ def apply_stage_anchor_transform(
         if base_point
         else shared_site_resolved
     )
+    pbp_resolved = (
+        pbp_base_point.with_fallback(shared_site_resolved) if pbp_base_point else None
+    )
 
     effective_mode = mode_normalised
-    if effective_mode == "local" and base_point is None:
-        effective_mode = "site"
+    if effective_mode in ("local", "basepoint") and base_point is None:
+        effective_mode = "basepoint"
     anchor_bp = (
-        shared_site_resolved if effective_mode == "site" else base_point_resolved
+        base_point_resolved
+        if effective_mode in ("local", "basepoint")
+        else shared_site_resolved
     )
 
     anchor_easting_m, anchor_northing_m, anchor_height_m, anchor_unit = (
@@ -5421,12 +5427,17 @@ def apply_stage_anchor_transform(
     shared_easting_m, shared_northing_m, shared_height_m, shared_unit = (
         _base_point_components_in_meters(shared_site_resolved)
     )
-    (
-        model_bp_easting_m,
-        model_bp_northing_m,
-        model_bp_height_m,
-        model_bp_unit,
-    ) = _base_point_components_in_meters(base_point_resolved)
+    model_bp_easting_m = None
+    model_bp_northing_m = None
+    model_bp_height_m = None
+    model_bp_unit = None
+    if pbp_resolved is not None:
+        (
+            model_bp_easting_m,
+            model_bp_northing_m,
+            model_bp_height_m,
+            model_bp_unit,
+        ) = _base_point_components_in_meters(pbp_resolved)
 
     map_conv = getattr(caches, "map_conversion", None)
     translation_stage = Gf.Vec3d(0.0, 0.0, 0.0)
@@ -5464,14 +5475,12 @@ def apply_stage_anchor_transform(
         )
 
     # NOTE: anchor_matrix is no longer used to transform any prims; we keep only metadata.
-    base_geodetic = _derive_lonlat_from_base_point(base_point_resolved, projected_crs)
+    pbp_geodetic = (
+        _derive_lonlat_from_base_point(pbp_resolved, projected_crs)
+        if pbp_resolved
+        else None
+    )
     site_geodetic = _derive_lonlat_from_base_point(shared_site_resolved, projected_crs)
-    if lonlat is not None:
-        if effective_mode == "site":
-            site_geodetic = lonlat
-        else:
-            base_geodetic = lonlat
-    anchor_geodetic = site_geodetic if effective_mode == "site" else base_geodetic
 
     attr_values: List[Tuple[str, Any, Any]] = []
 
@@ -5497,28 +5506,23 @@ def apply_stage_anchor_transform(
     _append_attr(
         "ifc:stageAnchorBasePointUnit", Sdf.ValueTypeNames.String, anchor_unit or ""
     )
+    if model_bp_easting_m is not None:
+        _append_attr(
+            "ifc:pbpMeters",
+            Sdf.ValueTypeNames.Double3,
+            (
+                float(model_bp_easting_m),
+                float(model_bp_northing_m),
+                float(model_bp_height_m),
+            ),
+        )
+        _append_attr("ifc:pbpUnit", Sdf.ValueTypeNames.String, model_bp_unit or "")
     _append_attr(
-        "ifc:stageAnchorModelBasePointMeters",
-        Sdf.ValueTypeNames.Double3,
-        (
-            float(model_bp_easting_m),
-            float(model_bp_northing_m),
-            float(model_bp_height_m),
-        ),
-    )
-    _append_attr(
-        "ifc:stageAnchorModelBasePointUnit",
-        Sdf.ValueTypeNames.String,
-        model_bp_unit or "",
-    )
-    _append_attr(
-        "ifc:stageAnchorSharedSiteMeters",
+        "ifc:surveyPointMeters",
         Sdf.ValueTypeNames.Double3,
         (float(shared_easting_m), float(shared_northing_m), float(shared_height_m)),
     )
-    _append_attr(
-        "ifc:stageAnchorSharedSiteUnit", Sdf.ValueTypeNames.String, shared_unit or ""
-    )
+    _append_attr("ifc:surveyPointUnit", Sdf.ValueTypeNames.String, shared_unit or "")
     _append_attr(
         "ifc:stageAnchorProjectedCRS", Sdf.ValueTypeNames.String, projected_crs or ""
     )
@@ -5529,96 +5533,40 @@ def apply_stage_anchor_transform(
             float(getattr(map_conv, "scale", 1.0) or 1.0),
         )
 
-    if anchor_geodetic is not None:
-        _append_attr(
-            "ifc:longitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.longitude)
-        )
-        _append_attr(
-            "ifc:latitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.latitude)
-        )
-        if anchor_geodetic.height is not None:
-            _append_attr(
-                "ifc:ellipsoidalHeight",
-                Sdf.ValueTypeNames.Double,
-                float(anchor_geodetic.height),
-            )
-        _append_attr(
-            "CesiumLongitude",
-            Sdf.ValueTypeNames.Double,
-            float(anchor_geodetic.longitude),
-        )
-        _append_attr(
-            "CesiumLatitude", Sdf.ValueTypeNames.Double, float(anchor_geodetic.latitude)
-        )
-        if anchor_geodetic.height is not None:
-            _append_attr(
-                "CesiumHeight", Sdf.ValueTypeNames.Double, float(anchor_geodetic.height)
-            )
+    # Anchor geodetic is already represented via assign_world_geolocation metadata.
 
-    if base_geodetic is not None:
+    if pbp_geodetic is not None:
         _append_attr(
-            "ifc:stageAnchorModelLongitude",
+            "ifc:pbpLongitude",
             Sdf.ValueTypeNames.Double,
-            float(base_geodetic.longitude),
+            float(pbp_geodetic.longitude),
         )
         _append_attr(
-            "ifc:stageAnchorModelLatitude",
+            "ifc:pbpLatitude",
             Sdf.ValueTypeNames.Double,
-            float(base_geodetic.latitude),
+            float(pbp_geodetic.latitude),
         )
-        if base_geodetic.height is not None:
+        if pbp_geodetic.height is not None:
             _append_attr(
-                "ifc:stageAnchorModelEllipsoidalHeight",
+                "ifc:pbpEllipsoidalHeight",
                 Sdf.ValueTypeNames.Double,
-                float(base_geodetic.height),
-            )
-        _append_attr(
-            "CesiumModelLongitude",
-            Sdf.ValueTypeNames.Double,
-            float(base_geodetic.longitude),
-        )
-        _append_attr(
-            "CesiumModelLatitude",
-            Sdf.ValueTypeNames.Double,
-            float(base_geodetic.latitude),
-        )
-        if base_geodetic.height is not None:
-            _append_attr(
-                "CesiumModelHeight",
-                Sdf.ValueTypeNames.Double,
-                float(base_geodetic.height),
+                float(pbp_geodetic.height),
             )
 
     if site_geodetic is not None:
         _append_attr(
-            "ifc:stageAnchorSharedSiteLongitude",
+            "ifc:surveyPointLongitude",
             Sdf.ValueTypeNames.Double,
             float(site_geodetic.longitude),
         )
         _append_attr(
-            "ifc:stageAnchorSharedSiteLatitude",
+            "ifc:surveyPointLatitude",
             Sdf.ValueTypeNames.Double,
             float(site_geodetic.latitude),
         )
         if site_geodetic.height is not None:
             _append_attr(
-                "ifc:stageAnchorSharedSiteEllipsoidalHeight",
-                Sdf.ValueTypeNames.Double,
-                float(site_geodetic.height),
-            )
-        _append_attr(
-            "CesiumSharedSiteLongitude",
-            Sdf.ValueTypeNames.Double,
-            float(site_geodetic.longitude),
-        )
-        _append_attr(
-            "CesiumSharedSiteLatitude",
-            Sdf.ValueTypeNames.Double,
-            float(site_geodetic.latitude),
-        )
-        if site_geodetic.height is not None:
-            _append_attr(
-                "CesiumSharedSiteHeight",
+                "ifc:surveyPointEllipsoidalHeight",
                 Sdf.ValueTypeNames.Double,
                 float(site_geodetic.height),
             )
