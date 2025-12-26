@@ -2465,6 +2465,33 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         )
     finally:
         shutdown_usd_context()
+    if getattr(args, "federate", False):
+        manifest_path = getattr(args, "manifest_path", None)
+        if not manifest_path:
+            LOG.warning(
+                "--federate requested but no --manifest was supplied; skipping."
+            )
+        else:
+            try:
+                from .federation_orchestrator import (
+                    federate_stages as _federate_stages,
+                )
+
+                manifest = ConversionManifest.from_file(Path(manifest_path))
+                stage_paths = [
+                    result.stage_path for result in results if result.stage_path
+                ]
+                if stage_paths:
+                    _federate_stages(
+                        stage_paths,
+                        manifest=manifest,
+                        masters_root=args.output_dir or DEFAULT_OUTPUT_ROOT,
+                        map_coordinate_system=args.map_coordinate_system,
+                        anchor_mode=cli_anchor_mode,
+                        offline=args.offline,
+                    )
+            except Exception as exc:
+                LOG.warning("Federation failed: %s", exc)
     _print_summary(results)
     return results
 

@@ -5323,6 +5323,7 @@ def assign_world_geolocation(
                     )
                     geo_prim.SetCustomDataByKey("ifc:projectedCRS", projected_crs)
                     geo_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
+                    geo_prim.SetCustomDataByKey("ifc:anchorProjected", anchor_projected)
                     if anchor_mode:
                         geo_prim.SetCustomDataByKey("ifc:anchorMode", str(anchor_mode))
                     LOG.debug(

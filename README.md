@@ -87,7 +87,8 @@ Usage (CLI)
   - python -m buildusd --input C:\\path\\to\\dir --all --manifest src/buildusd/config/sample_manifest.yaml
 - Assemble masters after conversion:
   - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.json
-  - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.yaml --masters-root data/federated
+  - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.yaml --masters-root data/federated --rebuild
+  - python -m buildusd --input C:\\path\\to\\dir --all --manifest src/buildusd/config/sample_manifest.yaml --federate
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m buildusd --input omniverse://server/Projects/IFC --all
 - Detail routing examples:
@@ -114,8 +115,12 @@ Usage (CLI)
 Model offsets & anchoring
 - Stages stay in meters (metersPerUnit=1.0).
 - Iterator tessellation runs with use-world-coords=False; placements come from the iterator transform.
-- Per file we resolve a model offset from --anchor-mode: local -> Project/Base Point, site -> shared site point; converted to meters with basic unit scaling (m/mm/cm/dm).
+- Per file we resolve a model offset from --anchor-mode:
+  - local -> IfcSite.ObjectPlacement (meters)
+  - basepoint -> Project Base Point (PBP) if available, else Survey Point (SP), else no offset with a warning
+  - none -> no model-offset
 - The GeometrySettingsManager applies offset-type (default negative) to the raw offset and pushes the signed value into all ifcopenshell settings objects.
+- MapConversion grid rotation (when applicable) is applied via ifcopenshell model-rotation (quaternion), not USD XformOps.
 - Each IFC file gets its own resolved offset; offsets are not shared across files.
 
 Usage (VS Code)
@@ -157,7 +162,7 @@ Outputs
   - caches/<name>.json stores serialized instance metadata for later regrouping sessions.
 - Optional federated masters (run `python -m buildusd.federate --manifest ...` after conversion):
   - Creates master stage(s) defined in the manifest without overwriting per-file outputs.
-  - Each converted stage is referenced beneath `/World/<stage_name>` (inactive by default) so you can compose projects on demand.
+  - Each converted stage is referenced beneath `/World/<safe_name>` so you can compose projects on demand.
 
 Materials
 - IFC render precedence respected: geometry `IfcStyledItem` styles first, then material presentation (`IfcMaterialDefinitionRepresentation`), then shape aspects, then type. When no MDR is present, we also try `ifcopenshell.util.representation.get_material_style` for the associated material.
@@ -237,16 +242,13 @@ hierarchies:
 ```
 
 Units and Geospatial
-- Per-file stages author metersPerUnit as needed; WGS84 (lon/lat/height) are authored on /World as Double attributes:
-  - cesium:georeferenceOrigin:longitude, cesium:georeferenceOrigin:latitude, cesium:georeferenceOrigin:height
+- Per-file stages author WGS84 reference on /World and /World/Geospatial (OmniGeospatial referencePosition). Projected anchors are stored as `ifc:anchorProjected` customData.
 - Federated masters created via `buildusd.federate` are authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
 
 Geo Anchoring
-- Conversion and federation expose `--anchor-mode` controlling how /World is aligned. `local` anchors to the per-file base point, `site` aligns to the shared site base point, and `none` leaves /World unchanged (default).
-- The manifest can define `defaults.shared_site_base_point` and per-master/per-file overrides via `shared_site_base_point`. When `--anchor-mode site` is used, resolution falls back through file → master → defaults → repo fallback → (0,0,0).
-- If `local` anchoring is requested but a file lacks its own base point, the pipeline automatically falls back to `site` (never leaves /World unanchored unless `none` is specified).
-- Geodetic metadata (lon/lat/height) is derived from the chosen anchor (using `pyproj` when available) and written on the instance layer prim (not `/World`) alongside the traditional `ifc:` attributes; metersPerUnit remains 1.0.
-- Example invocations: `python -m buildusd --anchor-mode site ...` for conversion, `python -m buildusd --anchor-mode none ...` to leave stages unanchored, and `python -m buildusd.federate --anchor-mode site ...` to keep federated masters aligned in the same frame.
+- Conversion and federation expose `--anchor-mode` controlling how /World is aligned. `local` anchors to IfcSite placement, `basepoint` anchors to PBP/SP, and `none` leaves /World unchanged.
+- Geodetic metadata (lon/lat/height) is derived from the chosen anchor (using `pyproj` when available) and written on /World and /World/Geospatial alongside the `ifc:` attributes; metersPerUnit remains 1.0.
+- Example invocations: `python -m buildusd --anchor-mode basepoint ...` for conversion, `python -m buildusd --anchor-mode none ...` to leave stages unanchored, and `python -m buildusd.federate --anchor-mode basepoint ...` to keep federated masters aligned in the same frame.
 
 IFC Metadata as USD Attributes
 - IFC psets/qtos are authored as attributes (not customData) using:
@@ -255,18 +257,21 @@ IFC Metadata as USD Attributes
 - Types are inferred (Bool/Int/Double and arrays; fallback String).
 
 Federated Stage Behavior (via `buildusd.federate`)
-- Each converted USD stage is referenced as a payload under `/World/<file_stem>` in the manifest-selected master stage.
-- Payload prims are authored inactive (unloaded by default). Activate to load content.
+- Each converted USD stage is referenced as a payload under `/World/<safe_name>` in the manifest-selected master stage.
 - The payload targets the stage's default prim so additional `/World` nesting is avoided when possible.
+- The federation output is idempotent: re-running adds missing payloads; use `--rebuild` to recreate the master stage from scratch.
+- If `defaults.overall_master_name` is set, a top-level overall master is built by payloading the per-site master stages.
 
 Programmatic Use
 - `from buildusd import api` exposes structured helpers. `api.ConversionSettings` and `api.convert()` mirror the CLI; `api.FederationSettings` and `api.federate_stages()` do the same for master assembly; `api.apply_stage_anchor_transform()` anchors custom USD stages consistently.
 - `api.CONVERSION_DEFAULTS` / `api.FEDERATION_DEFAULTS` expose the packaged defaults, and `api.DEFAULT_CONVERSION_OPTIONS` offers a ready-to-clone baseline for geometry harvesting.
-- Anchor modes accept `"local"`, `"site"`, or `None`/`"none"`; the latter skips writing a transform on `/World`.
+- Anchor modes accept `"local"`, `"basepoint"`, or `None`/`"none"`; the latter skips writing a transform on `/World`.
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
 Manifest Schema
-- defaults: Global fallback for master name, projected/geodetic CRS, base point, and optional `file_revision` used for checkpoint notes/tags.
-- masters: Named federated stages with optional CRS/base point overrides and `file_revision`.
+- defaults: Global fallback for master name, projected/geodetic CRS, base point, shared site base point, and optional `file_revision` used for checkpoint notes/tags.
+  - `overall_master_name` (or `overall_master`) enables an overall master stage.
+  - `overall_base_point` / `overall_shared_site_base_point` set the overall federation origin.
+- masters: Named per-site federated stages with optional CRS/base point overrides and `file_revision`. The master `base_point` is used as the site federation origin; falls back to shared site base point if missing.
 - files: Match rules (name or glob pattern) that choose a master, override CRS/base point/lonlat, and provide a per-file `file_revision`.
 
 Notes

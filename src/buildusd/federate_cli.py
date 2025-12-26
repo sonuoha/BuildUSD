@@ -79,6 +79,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Initialise USD in standalone mode (no Kit). All inputs/outputs must be local.",
     )
+    parser.add_argument(
+        "--rebuild",
+        dest="rebuild",
+        action="store_true",
+        help="Rebuild federation from scratch instead of updating an existing master stage.",
+    )
     return parser.parse_args(argv)
 
 
@@ -111,10 +117,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     initialize_usd(offline=args.offline)
     try:
-        _apply_federation(
+        master_stage_paths = _apply_federation(
             tasks,
             masters_root=masters_root,
             parent_prim=args.parent_prim,
+            rebuild=args.rebuild,
+        )
+        from .federation_orchestrator import _apply_overall_master
+
+        _apply_overall_master(
+            master_stage_paths,
+            manifest=manifest,
+            masters_root=masters_root,
+            parent_prim=args.parent_prim,
+            fallback_projected_crs=args.map_coordinate_system,
+            fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
+            fallback_shared_site_base_point=DEFAULT_SHARED_BASE_POINT,
+            rebuild=args.rebuild,
         )
     finally:
         shutdown_usd_context()

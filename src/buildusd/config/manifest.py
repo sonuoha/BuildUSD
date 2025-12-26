@@ -119,6 +119,9 @@ class GeodeticCoordinate:
 class ManifestDefaults:
     master_id: Optional[str] = None
     master_name: Optional[str] = None
+    overall_master_name: Optional[str] = None
+    overall_base_point: Optional[BasePointConfig] = None
+    overall_shared_site_base_point: Optional[BasePointConfig] = None
     projected_crs: Optional[str] = None
     geodetic_crs: Optional[str] = None
     base_point: Optional[BasePointConfig] = None
@@ -213,6 +216,17 @@ class ConversionManifest:
         defaults = ManifestDefaults(
             master_id=defaults_data.get("master"),
             master_name=defaults_data.get("master_name"),
+            overall_master_name=(
+                defaults_data.get("overall_master_name")
+                or defaults_data.get("overall_master")
+            ),
+            overall_base_point=BasePointConfig.from_mapping(
+                defaults_data.get("overall_base_point")
+            ),
+            overall_shared_site_base_point=BasePointConfig.from_mapping(
+                defaults_data.get("overall_shared_site_base_point")
+                or defaults_data.get("overall_shared_site_base")
+            ),
             projected_crs=defaults_data.get("projected_crs"),
             geodetic_crs=defaults_data.get("geodetic_crs"),
             base_point=BasePointConfig.from_mapping(defaults_data.get("base_point")),

@@ -16,10 +16,11 @@ Example:
 from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .config.manifest import BasePointConfig
 from .geospatial import ensure_geospatial_root, _author_wgs84_reference_attrs_on_prim
+from .io_utils import is_omniverse_path
 from .pxr_utils import Gf, Sdf, Usd, UsdGeom
 from .process_usd import sanitize_name, _unit_factor
 
@@ -289,19 +290,61 @@ def extract_payload_anchor(stage: Usd.Stage) -> Optional[AnchorInfo]:
     return _extract_anchor_from_geospatial(stage)
 
 
-def _unique_names(items: Iterable[str]) -> list[str]:
-    seen: Dict[str, int] = {}
-    results: list[str] = []
-    for raw in items:
-        base = sanitize_name(raw, fallback="Payload")
-        count = seen.get(base, 0)
-        if count == 0:
-            name = base
-        else:
-            name = f"{base}_{count}"
-        seen[base] = count + 1
-        results.append(name)
-    return results
+def _unique_name(raw: str, existing: set[str]) -> str:
+    base = sanitize_name(raw, fallback="Payload")
+    if base not in existing:
+        return base
+    suffix = 1
+    while f"{base}_{suffix}" in existing:
+        suffix += 1
+    return f"{base}_{suffix}"
+
+
+def _normalize_payload_path(path: str) -> str:
+    text = str(path)
+    if is_omniverse_path(text):
+        return text.lower()
+    try:
+        return str(Path(text).resolve()).lower()
+    except Exception:
+        return text.lower()
+
+
+def _existing_payloads(stage: Usd.Stage, federation_path: Sdf.Path) -> Dict[str, str]:
+    existing: Dict[str, str] = {}
+    fed = stage.GetPrimAtPath(federation_path)
+    if not fed:
+        return existing
+    for child in fed.GetChildren():
+        payload_path = None
+        data = child.GetCustomData() or {}
+        if "ifc:federation:payloadPath" in data:
+            payload_path = data.get("ifc:federation:payloadPath")
+        if payload_path:
+            existing[_normalize_payload_path(payload_path)] = child.GetName()
+            continue
+        for sub in child.GetChildren():
+            if sub.HasAuthoredPayloads():
+                payload_path = sub.GetPayloads().GetAddedOrExplicitItems() or None
+                if payload_path:
+                    try:
+                        existing[_normalize_payload_path(payload_path[0].assetPath)] = (
+                            child.GetName()
+                        )
+                    except Exception:
+                        pass
+                break
+            if sub.HasAuthoredReferences():
+                ref_items = sub.GetReferences().GetAddedOrExplicitItems() or None
+                if ref_items:
+                    try:
+                        existing[_normalize_payload_path(ref_items[0].assetPath)] = (
+                            child.GetName()
+                        )
+                    except Exception:
+                        pass
+                break
+    return existing
 
 
 def build_federated_stage(
@@ -311,14 +354,33 @@ def build_federated_stage(
     federation_projected_crs: str,
     geodetic_crs: str = "EPSG:4326",
     *,
-    federation_name: str = "Federation",
     parent_prim_path: str = "/World",
     use_payloads: bool = True,
+    rebuild: bool = False,
 ) -> None:
     if not payload_paths:
         raise ValueError("No payload paths provided for federation.")
 
-    stage = Usd.Stage.CreateNew(out_stage_path)
+    stage: Optional[Usd.Stage] = None
+    opened_existing = False
+    if rebuild:
+        stage = Usd.Stage.CreateNew(out_stage_path)
+    elif is_omniverse_path(out_stage_path):
+        stage = Usd.Stage.Open(out_stage_path)
+        if stage:
+            opened_existing = True
+        else:
+            stage = Usd.Stage.CreateNew(out_stage_path)
+    else:
+        out_path = Path(out_stage_path)
+        if out_path.exists():
+            stage = Usd.Stage.Open(str(out_path))
+            opened_existing = True
+        else:
+            stage = Usd.Stage.CreateNew(str(out_path))
+    if stage is None:
+        raise RuntimeError(f"Failed to open or create stage: {out_stage_path}")
+
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
 
@@ -338,63 +400,148 @@ def build_federated_stage(
     origin_e = float(federation_origin.easting) * origin_factor
     origin_n = float(federation_origin.northing) * origin_factor
     origin_h = float(federation_origin.height) * origin_factor
-    wgs84 = _projected_to_wgs84(
-        origin_e,
-        origin_n,
-        origin_h,
-        federation_origin.epsg or federation_projected_crs,
-    )
-    if wgs84:
+    origin_epsg = federation_origin.epsg or federation_projected_crs
+
+    layer = stage.GetRootLayer()
+    layer_data = dict(getattr(layer, "customLayerData", {}) or {})
+    existing_origin = layer_data.get("federationOrigin") or {}
+    if not existing_origin:
+        existing_origin = world.GetCustomDataByKey("ifc:federationOrigin") or {}
+
+    if opened_existing and existing_origin:
+        try:
+            existing_unit = existing_origin.get("unit") or "m"
+            existing_factor = _unit_factor(existing_unit)
+            existing_e = float(existing_origin.get("easting")) * existing_factor
+            existing_n = float(existing_origin.get("northing")) * existing_factor
+            existing_h = float(existing_origin.get("height", 0.0)) * existing_factor
+            existing_epsg = existing_origin.get("epsg")
+            if (
+                abs(existing_e - origin_e) > 0.001
+                or abs(existing_n - origin_n) > 0.001
+                or abs(existing_h - origin_h) > 0.001
+                or (existing_epsg and existing_epsg != origin_epsg)
+            ):
+                LOG.warning(
+                    "Federation origin mismatch; keeping existing origin %s and ignoring input %s.",
+                    existing_origin,
+                    {
+                        "easting": origin_e,
+                        "northing": origin_n,
+                        "height": origin_h,
+                        "epsg": origin_epsg,
+                        "unit": "m",
+                    },
+                )
+            origin_e, origin_n, origin_h = existing_e, existing_n, existing_h
+            if existing_epsg:
+                origin_epsg = existing_epsg
+        except Exception:
+            pass
+    geo_prim = geo.GetPrim()
+    wgs84 = _projected_to_wgs84(origin_e, origin_n, origin_h, origin_epsg)
+    geo_attr = geo_prim.GetAttribute(_WGS84_REF_POS_ATTR)
+    if wgs84 and (geo_attr is None or not geo_attr.HasValue()):
         _author_wgs84_reference_attrs_on_prim(
-            geo.GetPrim(),
+            geo_prim,
             latitude=wgs84[0],
             longitude=wgs84[1],
             altitude_m=wgs84[2],
             tangent_plane="ENU",
             orientation_ypr=(0.0, 0.0, 0.0),
         )
-
     try:
-        world.SetCustomDataByKey("ifc:projectedCRS", federation_projected_crs)
-        world.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
-        world.SetCustomDataByKey(
-            "ifc:federationOrigin",
-            {
-                "easting": origin_e,
-                "northing": origin_n,
-                "height": origin_h,
-                "epsg": federation_projected_crs,
-                "unit": "m",
-            },
-        )
-    except Exception:
-        pass
-    try:
-        layer = stage.GetRootLayer()
-        data = dict(getattr(layer, "customLayerData", {}) or {})
-        data.update(
-            {
-                "projectedCRS": federation_projected_crs,
-                "geodeticCRS": geodetic_crs,
-                "federationOrigin": {
+        if not geo_prim.GetCustomDataByKey("ifc:anchorProjected"):
+            geo_prim.SetCustomDataByKey(
+                "ifc:anchorProjected",
+                {
                     "easting": origin_e,
                     "northing": origin_n,
                     "height": origin_h,
-                    "epsg": federation_projected_crs,
+                    "epsg": origin_epsg or federation_projected_crs,
                     "unit": "m",
                 },
+            )
+    except Exception:
+        pass
+
+    try:
+        world.SetCustomDataByKey(
+            "ifc:projectedCRS", origin_epsg or federation_projected_crs
+        )
+        world.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
+        if not (opened_existing and existing_origin):
+            world.SetCustomDataByKey(
+                "ifc:federationOrigin",
+                {
+                    "easting": origin_e,
+                    "northing": origin_n,
+                    "height": origin_h,
+                    "epsg": origin_epsg or federation_projected_crs,
+                    "unit": "m",
+                },
+            )
+        if not world.GetCustomDataByKey("ifc:anchorProjected"):
+            world.SetCustomDataByKey(
+                "ifc:anchorProjected",
+                {
+                    "easting": origin_e,
+                    "northing": origin_n,
+                    "height": origin_h,
+                    "epsg": origin_epsg or federation_projected_crs,
+                    "unit": "m",
+                },
+            )
+    except Exception:
+        pass
+    try:
+        data = dict(layer_data)
+        data.update(
+            {
+                "projectedCRS": origin_epsg or federation_projected_crs,
+                "geodeticCRS": geodetic_crs,
                 "federationVersion": 1,
             }
         )
+        if not (opened_existing and existing_origin):
+            data["federationOrigin"] = {
+                "easting": origin_e,
+                "northing": origin_n,
+                "height": origin_h,
+                "epsg": origin_epsg or federation_projected_crs,
+                "unit": "m",
+            }
+        if "anchorProjected" not in data:
+            data["anchorProjected"] = {
+                "easting": origin_e,
+                "northing": origin_n,
+                "height": origin_h,
+                "epsg": origin_epsg or federation_projected_crs,
+                "unit": "m",
+            }
         layer.customLayerData = data
     except Exception:
         pass
 
-    federation_path = parent_path.AppendChild(sanitize_name(federation_name))
-    federation_root = UsdGeom.Xform.Define(stage, federation_path)
+    existing_payload_map = _existing_payloads(stage, parent_path)
+    existing_names = {child.GetName() for child in world.GetChildren()}
+    seen_payloads: set[str] = set()
 
-    payload_names = _unique_names([Path(p).stem for p in payload_paths])
-    for payload_path, payload_name in zip(payload_paths, payload_names):
+    for payload_path in payload_paths:
+        normalized_payload = _normalize_payload_path(payload_path)
+        if normalized_payload in seen_payloads:
+            continue
+        seen_payloads.add(normalized_payload)
+        if normalized_payload in existing_payload_map:
+            LOG.info(
+                "Skipping %s: already federated as %s.",
+                payload_path,
+                existing_payload_map[normalized_payload],
+            )
+            continue
+
+        payload_name = _unique_name(Path(payload_path).stem, existing_names)
+        existing_names.add(payload_name)
         payload_stage = Usd.Stage.Open(str(payload_path))
         anchor = extract_payload_anchor(payload_stage)
         if not anchor or anchor.anchor_e is None or anchor.anchor_n is None:
@@ -402,20 +549,20 @@ def build_federated_stage(
             continue
 
         anchor_crs = anchor.projected_crs
-        if anchor_crs and anchor_crs != federation_projected_crs:
+        if anchor_crs and anchor_crs != (origin_epsg or federation_projected_crs):
             reproj = _reproject(
                 anchor.anchor_e,
                 anchor.anchor_n,
                 anchor.anchor_h or 0.0,
                 anchor_crs,
-                federation_projected_crs,
+                origin_epsg or federation_projected_crs,
             )
             if reproj is None:
                 LOG.warning(
                     "Skipping %s: unable to reproject %s -> %s.",
                     payload_path,
                     anchor_crs,
-                    federation_projected_crs,
+                    origin_epsg or federation_projected_crs,
                 )
                 continue
             anchor_e, anchor_n, anchor_h = reproj
@@ -440,7 +587,7 @@ def build_federated_stage(
             delta,
         )
 
-        wrapper_path = federation_path.AppendChild(payload_name)
+        wrapper_path = parent_path.AppendChild(payload_name)
         wrapper = UsdGeom.Xform.Define(stage, wrapper_path)
         wrapper_op = wrapper.AddTranslateOp()
         wrapper_op.Set(Gf.Vec3d(*delta))
@@ -486,18 +633,17 @@ def validate_federation(stage_path: str) -> bool:
     attr = geo.GetAttribute(_WGS84_REF_POS_ATTR)
     if not attr or not attr.HasValue():
         return False
-    fed = stage.GetPrimAtPath("/World/Federation")
-    if not fed:
-        return False
-    for child in fed.GetChildren():
-        xf = UsdGeom.Xformable(child)
-        if not xf.GetOrderedXformOps():
-            return False
+    for child in world.GetChildren():
+        if child.GetPath().pathString == "/World/Geospatial":
+            continue
         payload_child = None
         for sub in child.GetChildren():
             if sub.HasAuthoredPayloads() or sub.HasAuthoredReferences():
                 payload_child = sub
                 break
         if payload_child is None:
+            continue
+        xf = UsdGeom.Xformable(child)
+        if not xf.GetOrderedXformOps():
             return False
     return True

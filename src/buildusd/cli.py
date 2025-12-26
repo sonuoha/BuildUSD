@@ -157,6 +157,12 @@ def parse_args(
         help="Choose whether stages anchor to the IFC site placement, base point (PBP/SP), or skip anchoring entirely.",
     )
     parser.add_argument(
+        "--federate",
+        dest="federate",
+        action="store_true",
+        help="After conversion, assemble/refresh federated master stages from the converted outputs.",
+    )
+    parser.add_argument(
         "--geospatial-mode",
         dest="geospatial_mode",
         choices=("auto", "usd", "omni", "none"),
