@@ -5196,6 +5196,16 @@ def assign_world_geolocation(
 
     # Stamp metadata on the prim and root layer for portability (use only crate-friendly scalar types)
     try:
+        anchor_e, anchor_n, anchor_h, anchor_unit = _base_point_components_in_meters(
+            base_point
+        )
+        anchor_projected = {
+            "easting": float(anchor_e),
+            "northing": float(anchor_n),
+            "height": float(anchor_h),
+            "epsg": str(getattr(base_point, "epsg", None) or projected_crs or ""),
+            "unit": "m",
+        }
         world_prim.SetCustomDataByKey("ifc:geospatialMode", mode)
         world_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
         world_prim.SetCustomDataByKey("ifc:projectedCRS", projected_crs)
@@ -5207,6 +5217,7 @@ def assign_world_geolocation(
             "height": float(geo_coord.height) if geo_coord.height is not None else 0.0,
         }
         world_prim.SetCustomDataByKey("ifc:geodeticCoordinates", coords_payload)
+        world_prim.SetCustomDataByKey("ifc:anchorProjected", anchor_projected)
         if model_offset:
             world_prim.SetCustomDataByKey(
                 "ifc:modelOffset",
@@ -5268,6 +5279,7 @@ def assign_world_geolocation(
                 "geodeticCRS": geodetic_crs,
                 "projectedCRS": projected_crs,
                 "geodeticCoordinates": coords_payload,
+                "anchorProjected": anchor_projected,
             }
         )
         if anchor_mode:

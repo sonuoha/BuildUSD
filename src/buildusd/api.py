@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional, Sequence, Union
 
 from .config.manifest import BasePointConfig, ConversionManifest
-from .federate import (
+from .federation_orchestrator import (
     DEFAULT_BASE_POINT,
     DEFAULT_GEODETIC_CRS,
     DEFAULT_MASTER_STAGE,

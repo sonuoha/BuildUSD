@@ -22,7 +22,8 @@ from .api import (
     DEFAULT_CONVERSION_OPTIONS,
 )
 from .config.manifest import ConversionManifest
-from .federate import FederationTask
+from .federation_orchestrator import FederationTask
+from .federation_builder import AnchorInfo, build_federated_stage, validate_federation
 from .main import ConversionCancelledError, ConversionOptions, ConversionResult
 from .process_ifc import CurveWidthRule
 
@@ -46,4 +47,7 @@ __all__ = [
     "CurveWidthRule",
     "ConversionCancelledError",
     "FederationTask",
+    "AnchorInfo",
+    "build_federated_stage",
+    "validate_federation",
 ]

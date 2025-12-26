@@ -12,7 +12,7 @@ from .conversion import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_SHARED_BASE_POINT,
 )
-from .federate import (
+from .federation_orchestrator import (
     _apply_federation,
     _candidate_stage_files,
     _load_manifest,
