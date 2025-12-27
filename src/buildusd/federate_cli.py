@@ -74,6 +74,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Match federation alignment to stages anchored via the IFC site placement, base point (PBP/SP), or skip anchoring (default: %(default)s).",
     )
     parser.add_argument(
+        "--frame",
+        dest="frame",
+        choices=("projected", "geodetic"),
+        default="projected",
+        help="Federation frame for delta computation: projected or geodetic (default: %(default)s).",
+    )
+    parser.add_argument(
         "--offline",
         dest="offline",
         action="store_true",
@@ -122,6 +129,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             masters_root=masters_root,
             parent_prim=args.parent_prim,
             rebuild=args.rebuild,
+            frame=args.frame,
         )
         from .federation_orchestrator import _apply_overall_master
 
@@ -134,6 +142,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
             fallback_shared_site_base_point=DEFAULT_SHARED_BASE_POINT,
             rebuild=args.rebuild,
+            frame=args.frame,
         )
     finally:
         shutdown_usd_context()

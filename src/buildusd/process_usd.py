@@ -5217,7 +5217,6 @@ def assign_world_geolocation(
             "height": float(geo_coord.height) if geo_coord.height is not None else 0.0,
         }
         world_prim.SetCustomDataByKey("ifc:geodeticCoordinates", coords_payload)
-        world_prim.SetCustomDataByKey("ifc:anchorProjected", anchor_projected)
         if model_offset:
             world_prim.SetCustomDataByKey(
                 "ifc:modelOffset",

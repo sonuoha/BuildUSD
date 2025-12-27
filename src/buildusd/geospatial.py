@@ -21,6 +21,69 @@ _OMNI_WGS84_REF_ORIENT_ATTR = (
 )
 
 
+def geodetic_to_ecef(lat: float, lon: float, h: float) -> Tuple[float, float, float]:
+    """
+    Convert Geodetic (lat, lon, height) to ECEF (x, y, z).
+    Uses WGS84 ellipsoid.
+    """
+    import math
+
+    a = 6378137.0
+    f = 1 / 298.257223563
+    e2 = 1 - (1 - f) * (1 - f)
+
+    rad_lat = math.radians(lat)
+    rad_lon = math.radians(lon)
+
+    sin_lat = math.sin(rad_lat)
+    cos_lat = math.cos(rad_lat)
+    sin_lon = math.sin(rad_lon)
+    cos_lon = math.cos(rad_lon)
+
+    N = a / math.sqrt(1 - e2 * sin_lat * sin_lat)
+
+    X = (N + h) * cos_lat * cos_lon
+    Y = (N + h) * cos_lat * sin_lon
+    Z = (N * (1 - e2) + h) * sin_lat
+
+    return (X, Y, Z)
+
+
+def ecef_to_enu(
+    x: float,
+    y: float,
+    z: float,
+    lat0: float,
+    lon0: float,
+    h0: float,
+) -> Tuple[float, float, float]:
+    """
+    Convert ECEF target (x, y, z) to ENU relative to origin (lat0, lon0, h0).
+    """
+    import math
+
+    x0, y0, z0 = geodetic_to_ecef(lat0, lon0, h0)
+
+    dx = x - x0
+    dy = y - y0
+    dz = z - z0
+
+    rad_lat0 = math.radians(lat0)
+    rad_lon0 = math.radians(lon0)
+
+    sin_lat = math.sin(rad_lat0)
+    cos_lat = math.cos(rad_lat0)
+    sin_lon = math.sin(rad_lon0)
+    cos_lon = math.cos(rad_lon0)
+
+    # ENU transformation matrix
+    e = -sin_lon * dx + cos_lon * dy
+    n = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
+    u = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
+
+    return (e, n, u)
+
+
 def ensure_geospatial_root(stage, path: str = "/World/Geospatial"):
     """Ensure an Xform prim exists at `path` and return the UsdGeom.Xform."""
     try:

@@ -163,6 +163,13 @@ def parse_args(
         help="After conversion, assemble/refresh federated master stages from the converted outputs.",
     )
     parser.add_argument(
+        "--frame",
+        dest="frame",
+        choices=("projected", "geodetic"),
+        default="projected",
+        help="Federation frame for --federate (default: %(default)s).",
+    )
+    parser.add_argument(
         "--geospatial-mode",
         dest="geospatial_mode",
         choices=("auto", "usd", "omni", "none"),

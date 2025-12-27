@@ -67,6 +67,16 @@ def _normalize_anchor_mode(value: Optional[str]) -> Optional[str]:
     return None
 
 
+def _normalize_frame(value: Optional[str]) -> str:
+    if value is None:
+        return "projected"
+    normalized = value.strip().lower()
+    if normalized in ("projected", "geodetic"):
+        return normalized
+    LOG.debug("Unknown frame '%s'; defaulting to projected", value)
+    return "projected"
+
+
 def _normalise_stage_root(path: str | None) -> Path:
     if not path:
         return (ROOT / "data" / "output").resolve()
@@ -188,6 +198,7 @@ def _apply_federation(
     masters_root: Path,
     parent_prim: str,
     rebuild: bool,
+    frame: Optional[str],
 ) -> list[str]:
     grouped: dict[str, list[FederationTask]] = {}
     for task in tasks:
@@ -238,6 +249,7 @@ def _apply_federation(
             parent_prim_path=parent_prim or "/World",
             use_payloads=True,
             rebuild=rebuild,
+            frame=_normalize_frame(frame),
         )
         built_master_paths.append(str(master_stage_path))
     return built_master_paths
@@ -271,6 +283,7 @@ def _apply_overall_master(
     fallback_geodetic_crs: str,
     fallback_shared_site_base_point: BasePointConfig,
     rebuild: bool,
+    frame: Optional[str],
 ) -> None:
     overall_name = _resolve_overall_master_name(manifest)
     if not overall_name:
@@ -320,6 +333,7 @@ def _apply_overall_master(
         parent_prim_path=parent_prim or "/World",
         use_payloads=True,
         rebuild=rebuild,
+        frame=_normalize_frame(frame),
     )
 
 
@@ -335,6 +349,7 @@ def federate_stages(
     fallback_master_stage: str = DEFAULT_MASTER_STAGE,
     fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
     anchor_mode: Optional[str] = None,
+    frame: Optional[str] = None,
     offline: bool = False,
     rebuild: bool = False,
 ) -> Sequence[FederationTask]:
@@ -380,6 +395,7 @@ def federate_stages(
             masters_root=masters_root_path,
             parent_prim=parent_prim,
             rebuild=rebuild,
+            frame=frame,
         )
         _apply_overall_master(
             master_stage_paths,
@@ -390,6 +406,7 @@ def federate_stages(
             fallback_geodetic_crs=fallback_geodetic_crs,
             fallback_shared_site_base_point=fallback_shared_site_base_point,
             rebuild=rebuild,
+            frame=frame,
         )
     finally:
         shutdown_usd_context()

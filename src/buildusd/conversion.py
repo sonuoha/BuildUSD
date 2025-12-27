@@ -2488,6 +2488,7 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
                         masters_root=args.output_dir or DEFAULT_OUTPUT_ROOT,
                         map_coordinate_system=args.map_coordinate_system,
                         anchor_mode=cli_anchor_mode,
+                        frame=getattr(args, "frame", "projected"),
                         offline=args.offline,
                     )
             except Exception as exc:

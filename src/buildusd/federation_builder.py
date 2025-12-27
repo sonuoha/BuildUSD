@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .config.manifest import BasePointConfig
-from .geospatial import ensure_geospatial_root, _author_wgs84_reference_attrs_on_prim
+from .geospatial import (
+    ensure_geospatial_root,
+    _author_wgs84_reference_attrs_on_prim,
+    geodetic_to_ecef,
+    ecef_to_enu,
+)
 from .io_utils import is_omniverse_path
 from .pxr_utils import Gf, Sdf, Usd, UsdGeom
 from .process_usd import sanitize_name, _unit_factor
@@ -257,6 +262,20 @@ def _extract_anchor_from_geospatial(stage: Usd.Stage) -> Optional[AnchorInfo]:
     geo = stage.GetPrimAtPath("/World/Geospatial")
     if not geo:
         return None
+    data = dict(geo.GetCustomData() or {})
+    anchor_payload = _coerce_anchor_dict(data.get("ifc:anchorProjected"))
+    if anchor_payload:
+        anchor = _anchor_from_dict(anchor_payload)
+        if anchor:
+            projected = data.get("ifc:projectedCRS")
+            return AnchorInfo(
+                projected_crs=anchor_payload.get("epsg") or projected,
+                anchor_e=anchor[0],
+                anchor_n=anchor[1],
+                anchor_h=anchor[2],
+                anchor_mode=None,
+                source="geospatial.anchorProjected",
+            )
     attr = geo.GetAttribute(_WGS84_REF_POS_ATTR)
     if not attr or not attr.HasValue():
         return None
@@ -310,6 +329,76 @@ def _normalize_payload_path(path: str) -> str:
         return text.lower()
 
 
+def _normalize_frame(value: Optional[str]) -> str:
+    if value is None:
+        return "projected"
+    text = str(value).strip().lower()
+    if text in ("projected", "geodetic"):
+        return text
+    LOG.debug("Unknown federation frame '%s'; defaulting to projected.", value)
+    return "projected"
+
+
+def _is_wgs84_crs(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    text = str(value).strip().lower()
+    if "wgs84" in text:
+        return True
+    return "epsg" in text and "4326" in text
+
+
+def _origin_wgs84_from_geospatial(geo_prim) -> Optional[Tuple[float, float, float]]:
+    if not geo_prim:
+        return None
+    attr = geo_prim.GetAttribute(_WGS84_REF_POS_ATTR)
+    if not attr or not attr.HasValue():
+        return None
+    vec = _coerce_vec3(attr.Get())
+    if vec is None:
+        return None
+    return (float(vec[0]), float(vec[1]), float(vec[2]))
+
+
+def _projected_origin_to_wgs84(
+    origin_e: float,
+    origin_n: float,
+    origin_h: float,
+    origin_epsg: Optional[str],
+) -> Optional[Tuple[float, float, float]]:
+    if _is_wgs84_crs(origin_epsg):
+        return (float(origin_n), float(origin_e), float(origin_h))
+    if not origin_epsg:
+        return None
+    return _projected_to_wgs84(origin_e, origin_n, origin_h, origin_epsg)
+
+
+def _anchor_to_wgs84(
+    anchor: AnchorInfo,
+    *,
+    fallback_crs: Optional[str],
+) -> Optional[Tuple[float, float, float]]:
+    if anchor.anchor_e is None or anchor.anchor_n is None:
+        return None
+    anchor_h = float(anchor.anchor_h or 0.0)
+    anchor_crs = anchor.projected_crs or fallback_crs
+    if _is_wgs84_crs(anchor_crs):
+        return (float(anchor.anchor_n), float(anchor.anchor_e), anchor_h)
+    if not anchor_crs or not _HAVE_PYPROJ:
+        return None
+    reproj = _reproject(
+        float(anchor.anchor_e),
+        float(anchor.anchor_n),
+        anchor_h,
+        anchor_crs,
+        "EPSG:4326",
+    )
+    if reproj is None:
+        return None
+    lon, lat, height = reproj
+    return (float(lat), float(lon), float(height))
+
+
 def _existing_payloads(stage: Usd.Stage, federation_path: Sdf.Path) -> Dict[str, str]:
     existing: Dict[str, str] = {}
     fed = stage.GetPrimAtPath(federation_path)
@@ -357,10 +446,12 @@ def build_federated_stage(
     parent_prim_path: str = "/World",
     use_payloads: bool = True,
     rebuild: bool = False,
+    frame: str = "projected",
 ) -> None:
     if not payload_paths:
         raise ValueError("No payload paths provided for federation.")
 
+    frame_mode = _normalize_frame(frame)
     stage: Optional[Usd.Stage] = None
     opened_existing = False
     if rebuild:
@@ -439,14 +530,18 @@ def build_federated_stage(
         except Exception:
             pass
     geo_prim = geo.GetPrim()
-    wgs84 = _projected_to_wgs84(origin_e, origin_n, origin_h, origin_epsg)
     geo_attr = geo_prim.GetAttribute(_WGS84_REF_POS_ATTR)
-    if wgs84 and (geo_attr is None or not geo_attr.HasValue()):
+    origin_wgs84 = _origin_wgs84_from_geospatial(geo_prim)
+    if origin_wgs84 is None:
+        origin_wgs84 = _projected_origin_to_wgs84(
+            origin_e, origin_n, origin_h, origin_epsg
+        )
+    if origin_wgs84 and (geo_attr is None or not geo_attr.HasValue()):
         _author_wgs84_reference_attrs_on_prim(
             geo_prim,
-            latitude=wgs84[0],
-            longitude=wgs84[1],
-            altitude_m=wgs84[2],
+            latitude=origin_wgs84[0],
+            longitude=origin_wgs84[1],
+            altitude_m=origin_wgs84[2],
             tangent_plane="ENU",
             orientation_ypr=(0.0, 0.0, 0.0),
         )
@@ -462,6 +557,12 @@ def build_federated_stage(
                     "unit": "m",
                 },
             )
+        if not geo_prim.GetCustomDataByKey("ifc:projectedCRS"):
+            geo_prim.SetCustomDataByKey(
+                "ifc:projectedCRS", origin_epsg or federation_projected_crs
+            )
+        if not geo_prim.GetCustomDataByKey("ifc:geodeticCRS"):
+            geo_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
     except Exception:
         pass
 
@@ -481,17 +582,7 @@ def build_federated_stage(
                     "unit": "m",
                 },
             )
-        if not world.GetCustomDataByKey("ifc:anchorProjected"):
-            world.SetCustomDataByKey(
-                "ifc:anchorProjected",
-                {
-                    "easting": origin_e,
-                    "northing": origin_n,
-                    "height": origin_h,
-                    "epsg": origin_epsg or federation_projected_crs,
-                    "unit": "m",
-                },
-            )
+        # anchorProjected is stamped on /World/Geospatial for Kit inspection.
     except Exception:
         pass
     try:
@@ -523,6 +614,13 @@ def build_federated_stage(
     except Exception:
         pass
 
+    use_geodetic_frame = frame_mode == "geodetic" and origin_wgs84 is not None
+    if frame_mode == "geodetic" and origin_wgs84 is None:
+        LOG.warning(
+            "Geodetic federation requested but origin WGS84 could not be resolved; "
+            "falling back to projected deltas."
+        )
+
     existing_payload_map = _existing_payloads(stage, parent_path)
     existing_names = {child.GetName() for child in world.GetChildren()}
     seen_payloads: set[str] = set()
@@ -548,44 +646,73 @@ def build_federated_stage(
             LOG.warning("Skipping %s: no anchor metadata found.", payload_path)
             continue
 
+        anchor_e = float(anchor.anchor_e)
+        anchor_n = float(anchor.anchor_n)
+        anchor_h = float(anchor.anchor_h or 0.0)
         anchor_crs = anchor.projected_crs
-        if anchor_crs and anchor_crs != (origin_epsg or federation_projected_crs):
-            reproj = _reproject(
-                anchor.anchor_e,
-                anchor.anchor_n,
-                anchor.anchor_h or 0.0,
-                anchor_crs,
-                origin_epsg or federation_projected_crs,
+
+        if use_geodetic_frame:
+            anchor_wgs84 = _anchor_to_wgs84(
+                anchor, fallback_crs=origin_epsg or federation_projected_crs
             )
-            if reproj is None:
+            if anchor_wgs84 is None or origin_wgs84 is None:
                 LOG.warning(
-                    "Skipping %s: unable to reproject %s -> %s.",
+                    "Skipping %s: unable to resolve WGS84 anchor for geodetic frame.",
                     payload_path,
+                )
+                continue
+            target_ecef = geodetic_to_ecef(
+                anchor_wgs84[0], anchor_wgs84[1], anchor_wgs84[2]
+            )
+            delta = ecef_to_enu(
+                target_ecef[0],
+                target_ecef[1],
+                target_ecef[2],
+                origin_wgs84[0],
+                origin_wgs84[1],
+                origin_wgs84[2],
+            )
+            LOG.info(
+                "Federate %s: frame=geodetic anchor_wgs84=%s source=%s delta=%s",
+                payload_path,
+                anchor_wgs84,
+                anchor.source,
+                delta,
+            )
+        else:
+            if anchor_crs and anchor_crs != (origin_epsg or federation_projected_crs):
+                reproj = _reproject(
+                    anchor.anchor_e,
+                    anchor.anchor_n,
+                    anchor.anchor_h or 0.0,
                     anchor_crs,
                     origin_epsg or federation_projected_crs,
                 )
+                if reproj is None:
+                    LOG.warning(
+                        "Skipping %s: unable to reproject %s -> %s.",
+                        payload_path,
+                        anchor_crs,
+                        origin_epsg or federation_projected_crs,
+                    )
+                    continue
+                anchor_e, anchor_n, anchor_h = reproj
+            elif anchor_crs is None:
+                LOG.warning(
+                    "Skipping %s: anchor CRS missing and no WGS84 fallback.",
+                    payload_path,
+                )
                 continue
-            anchor_e, anchor_n, anchor_h = reproj
-        elif anchor_crs is None:
-            LOG.warning(
-                "Skipping %s: anchor CRS missing and no WGS84 fallback.",
-                payload_path,
-            )
-            continue
-        else:
-            anchor_e = anchor.anchor_e
-            anchor_n = anchor.anchor_n
-            anchor_h = anchor.anchor_h or 0.0
 
-        delta = (anchor_e - origin_e, anchor_n - origin_n, anchor_h - origin_h)
-        LOG.info(
-            "Federate %s: anchor=%s (%s) source=%s delta=%s",
-            payload_path,
-            (anchor_e, anchor_n, anchor_h),
-            anchor_crs or anchor.projected_crs,
-            anchor.source,
-            delta,
-        )
+            delta = (anchor_e - origin_e, anchor_n - origin_n, anchor_h - origin_h)
+            LOG.info(
+                "Federate %s: frame=projected anchor=%s (%s) source=%s delta=%s",
+                payload_path,
+                (anchor_e, anchor_n, anchor_h),
+                anchor_crs or anchor.projected_crs,
+                anchor.source,
+                delta,
+            )
 
         wrapper_path = parent_path.AppendChild(payload_name)
         wrapper = UsdGeom.Xform.Define(stage, wrapper_path)

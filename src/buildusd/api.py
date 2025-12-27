@@ -28,10 +28,12 @@ from .process_usd import apply_stage_anchor_transform
 PathLike = Union[str, Path]
 AnchorMode = Literal["local", "basepoint"]
 AnchorModeSetting = Optional[AnchorMode]
+FederationFrame = Literal["projected", "geodetic"]
 
 __all__ = [
     "AnchorMode",
     "AnchorModeSetting",
+    "FederationFrame",
     "ConversionDefaults",
     "ConversionSettings",
     "FederationDefaults",
@@ -187,6 +189,7 @@ class FederationDefaults:
     fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS
     parent_prim: str = "/World"
     anchor_mode: AnchorModeSetting = None
+    frame: FederationFrame = "projected"
     offline: bool = False
 
 
@@ -212,6 +215,7 @@ class FederationSettings:
     fallback_master_stage: str = DEFAULT_MASTER_STAGE
     fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS
     anchor_mode: AnchorModeSetting = FEDERATION_DEFAULTS.anchor_mode
+    frame: FederationFrame = FEDERATION_DEFAULTS.frame
     offline: bool = FEDERATION_DEFAULTS.offline
 
     def ensure_masters_root(self) -> PathLike:
@@ -270,5 +274,6 @@ def federate_stages(settings: FederationSettings) -> Sequence[FederationTask]:
         fallback_master_stage=settings.fallback_master_stage,
         fallback_geodetic_crs=settings.fallback_geodetic_crs,
         anchor_mode=_normalize_anchor_mode(settings.anchor_mode),
+        frame=settings.frame,
         offline=settings.offline,
     )
