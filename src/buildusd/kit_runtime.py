@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Iterable, Sequence
 
 _KIT_APP = None
@@ -8,12 +9,47 @@ _ENABLED_EXTENSIONS: set[str] = set()
 
 _BASE_ARGS: list[str] = ["--no-window"]
 _DEFAULT_EXTENSIONS: tuple[str, ...] = ("omni.client", "omni.usd")
+_DEFAULT_EXT_FOLDERS: tuple[str, ...] = (r"C:\Users\samue\_dev\kit-sdk-106\exts",)
+_CESIUM_EXT_ENV = "BUILDUSD_CESIUM_EXT_FOLDERS"
+_CESIUM_DEFAULT_FOLDERS = (
+    r"C:\Users\samue\OneDrive\Documents\Kit\shared\exts",
+    r"C:\Users\samue\OneDrive\Documents\Kit\shared\exts\cesium.omniverse",
+    r"C:\Users\samue\OneDrive\Documents\Kit\shared\exts\cesium.usd.plugins",
+)
+os.environ.setdefault(_CESIUM_EXT_ENV, os.pathsep.join(_CESIUM_DEFAULT_FOLDERS))
 
 
 def _normalize_extensions(extensions: Iterable[str] | None) -> Sequence[str]:
     if not extensions:
         return _DEFAULT_EXTENSIONS
     return tuple(dict.fromkeys([ext for ext in extensions if ext]))
+
+
+def _collect_ext_folders() -> list[str]:
+    folders: list[str] = []
+    env_paths = os.environ.get("BUILDUSD_KIT_EXT_FOLDERS") or ""
+    for raw in env_paths.split(os.pathsep):
+        path = raw.strip()
+        if path:
+            folders.append(path)
+    cesium_paths = os.environ.get(_CESIUM_EXT_ENV) or ""
+    for raw in cesium_paths.split(os.pathsep):
+        path = raw.strip()
+        if path:
+            folders.append(path)
+            # If a specific extension folder is provided, also add its parent.
+            parent = os.path.dirname(path)
+            if parent:
+                folders.append(parent)
+    for default in _DEFAULT_EXT_FOLDERS:
+        if default:
+            folders.append(default)
+    unique: list[str] = []
+    for path in folders:
+        norm = os.path.normpath(path)
+        if norm not in unique and os.path.isdir(norm):
+            unique.append(norm)
+    return unique
 
 
 def _get_running_kit_app():
@@ -67,6 +103,8 @@ def ensure_kit(extensions: Iterable[str] | None = None):
             if ext and ext not in _ENABLED_EXTENSIONS:
                 args.extend(["--enable", ext])
                 _ENABLED_EXTENSIONS.add(ext)
+        for folder in _collect_ext_folders():
+            args.extend(["--ext-folder", folder])
         _KIT_APP.startup(args)
     return _KIT_APP
 

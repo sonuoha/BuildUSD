@@ -412,27 +412,25 @@ def _existing_payloads(stage: Usd.Stage, federation_path: Sdf.Path) -> Dict[str,
         if payload_path:
             existing[_normalize_payload_path(payload_path)] = child.GetName()
             continue
-        for sub in child.GetChildren():
-            if sub.HasAuthoredPayloads():
-                payload_path = sub.GetPayloads().GetAddedOrExplicitItems() or None
-                if payload_path:
-                    try:
-                        existing[_normalize_payload_path(payload_path[0].assetPath)] = (
-                            child.GetName()
-                        )
-                    except Exception:
-                        pass
-                break
-            if sub.HasAuthoredReferences():
-                ref_items = sub.GetReferences().GetAddedOrExplicitItems() or None
-                if ref_items:
-                    try:
-                        existing[_normalize_payload_path(ref_items[0].assetPath)] = (
-                            child.GetName()
-                        )
-                    except Exception:
-                        pass
-                break
+        if child.HasAuthoredPayloads():
+            payload_items = child.GetPayloads().GetAddedOrExplicitItems() or None
+            if payload_items:
+                try:
+                    existing[_normalize_payload_path(payload_items[0].assetPath)] = (
+                        child.GetName()
+                    )
+                except Exception:
+                    pass
+            continue
+        if child.HasAuthoredReferences():
+            ref_items = child.GetReferences().GetAddedOrExplicitItems() or None
+            if ref_items:
+                try:
+                    existing[_normalize_payload_path(ref_items[0].assetPath)] = (
+                        child.GetName()
+                    )
+                except Exception:
+                    pass
     return existing
 
 
@@ -614,12 +612,21 @@ def build_federated_stage(
     except Exception:
         pass
 
-    use_geodetic_frame = frame_mode == "geodetic" and origin_wgs84 is not None
-    if frame_mode == "geodetic" and origin_wgs84 is None:
-        LOG.warning(
-            "Geodetic federation requested but origin WGS84 could not be resolved; "
-            "falling back to projected deltas."
-        )
+    if frame_mode == "geodetic":
+        if not _HAVE_PYPROJ:
+            raise ImportError(
+                "Geodetic federation requires 'pyproj' to be installed. "
+                "Please install it via 'pip install pyproj'."
+            )
+        if origin_wgs84 is None:
+            raise ValueError(
+                "Geodetic federation requested but origin WGS84 reference position "
+                "could not be resolved. Ensure the master stage has "
+                "'omni:geospatial:wgs84:reference:referencePosition' metadata or "
+                "that the configured origin EPSG can be reprojected to WGS84."
+            )
+
+    use_geodetic_frame = frame_mode == "geodetic"
 
     existing_payload_map = _existing_payloads(stage, parent_path)
     existing_names = {child.GetName() for child in world.GetChildren()}
@@ -714,30 +721,28 @@ def build_federated_stage(
                 delta,
             )
 
-        wrapper_path = parent_path.AppendChild(payload_name)
-        wrapper = UsdGeom.Xform.Define(stage, wrapper_path)
-        wrapper_op = wrapper.AddTranslateOp()
-        wrapper_op.Set(Gf.Vec3d(*delta))
+        payload_prim_path = parent_path.AppendChild(payload_name)
+        payload_xf = UsdGeom.Xform.Define(stage, payload_prim_path)
+        payload_op = payload_xf.AddTranslateOp()
+        payload_op.Set(Gf.Vec3d(*delta))
         try:
-            wrapper.GetPrim().SetCustomDataByKey(
+            payload_xf.GetPrim().SetCustomDataByKey(
                 "ifc:federation:payloadPath", str(payload_path)
             )
-            wrapper.GetPrim().SetCustomDataByKey(
+            payload_xf.GetPrim().SetCustomDataByKey(
                 "ifc:federation:delta",
                 {"x": delta[0], "y": delta[1], "z": delta[2]},
             )
-            wrapper.GetPrim().SetCustomDataByKey(
+            payload_xf.GetPrim().SetCustomDataByKey(
                 "ifc:federation:anchor",
                 {"easting": anchor_e, "northing": anchor_n, "height": anchor_h},
             )
-            wrapper.GetPrim().SetCustomDataByKey(
+            payload_xf.GetPrim().SetCustomDataByKey(
                 "ifc:federation:projectedCRS", federation_projected_crs
             )
         except Exception:
             pass
-
-        payload_prim_path = wrapper_path.AppendChild(f"{payload_name}_Payload")
-        payload_prim = stage.DefinePrim(payload_prim_path, "Xform")
+        payload_prim = payload_xf.GetPrim()
         if use_payloads:
             payload_prim.GetPayloads().AddPayload(str(payload_path))
         else:

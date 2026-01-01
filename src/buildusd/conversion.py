@@ -2063,7 +2063,7 @@ def _process_single_ifc(
 
         # Author 2D Geometries
         geometry2d_layer = author_geometry2d_layer(
-            stage, caches, layout.geometry2d, base_name, options
+            stage, caches, layout.geometry2d, base_name, options_for_build
         )
         _ensure_not_cancelled(cancel_event)
 

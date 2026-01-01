@@ -15,6 +15,7 @@ import fnmatch
 import hashlib
 import json
 import re
+import math
 import logging
 import os
 import weakref
@@ -44,6 +45,7 @@ from .geospatial import (
     ensure_geospatial_root,
     _geospatial_root_paths,
     _author_wgs84_reference_attrs_on_prim,
+    signed_model_offset,
 )
 from .process_ifc import (
     ConversionOptions,
@@ -4861,6 +4863,70 @@ def author_geometry2d_layer(
         )
         stage_meters_per_unit = float(UsdGeom.GetStageMetersPerUnit(stage) or 1.0)
 
+        def _coerce_rotation_quat(value: Any) -> Tuple[float, float, float, float]:
+            try:
+                xs = list(value)
+            except Exception:
+                return (0.0, 0.0, 0.0, 1.0)
+            if len(xs) == 4:
+                angle = float(xs[3])
+                if abs(angle) > 2.0 * math.pi:
+                    ax, ay, az = float(xs[0]), float(xs[1]), float(xs[2])
+                    length = math.sqrt(ax * ax + ay * ay + az * az) or 1.0
+                    ax /= length
+                    ay /= length
+                    az /= length
+                    half = math.radians(angle) * 0.5
+                    s = math.sin(half)
+                    c = math.cos(half)
+                    quat = (ax * s, ay * s, az * s, c)
+                else:
+                    quat = (
+                        float(xs[0]),
+                        float(xs[1]),
+                        float(xs[2]),
+                        float(xs[3]),
+                    )
+            else:
+                quat = (0.0, 0.0, 0.0, 1.0)
+            length = math.sqrt(sum(v * v for v in quat)) or 1.0
+            return (
+                float(quat[0]) / length,
+                float(quat[1]) / length,
+                float(quat[2]) / length,
+                float(quat[3]) / length,
+            )
+
+        def _quat_to_mat3(quat: Tuple[float, float, float, float]) -> np.ndarray:
+            x, y, z, w = quat
+            xx, yy, zz = x * x, y * y, z * z
+            xy, xz, yz = x * y, x * z, y * z
+            wx, wy, wz = w * x, w * y, w * z
+            return np.array(
+                [
+                    [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+                    [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+                    [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+                ],
+                dtype=float,
+            )
+
+        model_offset = signed_model_offset(
+            getattr(options, "model_offset", None),
+            getattr(options, "model_offset_type", None),
+        )
+        offset_x, offset_y, offset_z = (
+            float(model_offset[0]),
+            float(model_offset[1]),
+            float(model_offset[2]),
+        )
+        has_offset = (
+            abs(offset_x) > 1e-12 or abs(offset_y) > 1e-12 or abs(offset_z) > 1e-12
+        )
+        rotation_quat = _coerce_rotation_quat(getattr(options, "model_rotation", None))
+        rotation_mat = _quat_to_mat3(rotation_quat)
+        has_rotation = not np.allclose(rotation_mat, np.eye(3), atol=1e-12)
+
         def _pattern_match(pattern: str, candidates: Iterable[str]) -> bool:
             pattern_norm = pattern.strip().lower()
             if not pattern_norm:
@@ -4985,28 +5051,81 @@ def author_geometry2d_layer(
 
             if len(curve.points) < 2:
                 continue
-
-            basis = UsdGeom.BasisCurves.Define(stage, curve_path)
-            basis.CreateTypeAttr(UsdGeom.Tokens.linear)
-            basis.CreateBasisAttr(UsdGeom.Tokens.linear)
-            basis.CreateWrapAttr(UsdGeom.Tokens.open)
+            # ---- NEW: if curve.points carries NURBS metadata, author a true NurbsCurves ----
+            nurbs_meta = getattr(curve.points, "nurbs", None)
+            use_nurbs = isinstance(nurbs_meta, dict)
+            if use_nurbs:
+                degree = int(nurbs_meta.get("degree") or 0)
+                knots = nurbs_meta.get("knots") or []
+                weights = nurbs_meta.get("weights")
+                # Basic validity checks: NURBS knot vector length should be nCtrl + degree + 1
+                nctrl = len(curve.points)
+                if degree < 1 or nctrl < (degree + 1):
+                    use_nurbs = False
+                else:
+                    expected = nctrl + degree + 1
+                    if not isinstance(knots, (list, tuple)) or len(knots) != expected:
+                        use_nurbs = False
+                    if weights is not None and (
+                        not isinstance(weights, (list, tuple)) or len(weights) != nctrl
+                    ):
+                        use_nurbs = False
 
             counts = Vt.IntArray([len(curve.points)])
-            basis.CreateCurveVertexCountsAttr(counts)
 
             pt_array = Vt.Vec3fArray(len(curve.points))
             min_bounds = [float("inf"), float("inf"), float("inf")]
             max_bounds = [float("-inf"), float("-inf"), float("-inf")]
             for idx, (x, y, z) in enumerate(curve.points):
                 px, py, pz = float(x), float(y), float(z)
-                pt_array[idx] = (px, py, pz)
-                min_bounds[0] = min(min_bounds[0], px)
-                min_bounds[1] = min(min_bounds[1], py)
-                min_bounds[2] = min(min_bounds[2], pz)
-                max_bounds[0] = max(max_bounds[0], px)
-                max_bounds[1] = max(max_bounds[1], py)
-                max_bounds[2] = max(max_bounds[2], pz)
-            basis.CreatePointsAttr(pt_array)
+                if has_rotation:
+                    rx = (
+                        rotation_mat[0, 0] * px
+                        + rotation_mat[0, 1] * py
+                        + rotation_mat[0, 2] * pz
+                    )
+                    ry = (
+                        rotation_mat[1, 0] * px
+                        + rotation_mat[1, 1] * py
+                        + rotation_mat[1, 2] * pz
+                    )
+                    rz = (
+                        rotation_mat[2, 0] * px
+                        + rotation_mat[2, 1] * py
+                        + rotation_mat[2, 2] * pz
+                    )
+                else:
+                    rx, ry, rz = px, py, pz
+                if has_offset:
+                    rx += offset_x
+                    ry += offset_y
+                    rz += offset_z
+                pt_array[idx] = (rx, ry, rz)
+                min_bounds[0] = min(min_bounds[0], rx)
+                min_bounds[1] = min(min_bounds[1], ry)
+                min_bounds[2] = min(min_bounds[2], rz)
+                max_bounds[0] = max(max_bounds[0], rx)
+                max_bounds[1] = max(max_bounds[1], ry)
+                max_bounds[2] = max(max_bounds[2], rz)
+            if use_nurbs:
+                nurbs = UsdGeom.NurbsCurves.Define(stage, curve_path)
+                nurbs.CreateCurveVertexCountsAttr(counts)
+                nurbs.CreatePointsAttr(pt_array)
+
+                # USD NurbsCurves uses "order" = degree + 1
+                nurbs.CreateOrderAttr(Vt.IntArray([int(degree + 1)]))
+                nurbs.CreateKnotsAttr(Vt.DoubleArray([float(k) for k in knots]))
+                if weights is not None:
+                    nurbs.CreateWeightsAttr(Vt.DoubleArray([float(w) for w in weights]))
+                prim = nurbs.GetPrim()
+            else:
+                basis = UsdGeom.BasisCurves.Define(stage, curve_path)
+                basis.CreateTypeAttr(UsdGeom.Tokens.linear)
+                basis.CreateBasisAttr(UsdGeom.Tokens.linear)
+                basis.CreateWrapAttr(UsdGeom.Tokens.open)
+                basis.CreateCurveVertexCountsAttr(counts)
+                basis.CreatePointsAttr(pt_array)
+                prim = basis.GetPrim()
 
             width_value = _resolved_curve_width(curve)
             if width_value is not None:
@@ -5014,10 +5133,27 @@ def author_geometry2d_layer(
                 widths = Vt.FloatArray(curve_count)
                 for idx in range(curve_count):
                     widths[idx] = float(width_value)
-                basis.CreateWidthsAttr(widths)
-                basis.SetWidthsInterpolation(UsdGeom.Tokens.uniform)
+                # Both BasisCurves and NurbsCurves support widths.
+                try:
+                    prim.GetAttribute("widths") or prim.CreateAttribute(
+                        "widths", Sdf.ValueTypeNames.FloatArray
+                    )
+                    prim.GetAttribute("widths").Set(widths)
+                    # Prefer uniform interpolation (matches your previous behavior)
+                    try:
+                        if use_nurbs:
+                            UsdGeom.NurbsCurves(prim).SetWidthsInterpolation(
+                                UsdGeom.Tokens.uniform
+                            )
+                        else:
+                            UsdGeom.BasisCurves(prim).SetWidthsInterpolation(
+                                UsdGeom.Tokens.uniform
+                            )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
-            prim = basis.GetPrim()
             try:
                 extent_vals = None
                 if all(v != float("inf") for v in min_bounds) and all(
@@ -5027,7 +5163,12 @@ def author_geometry2d_layer(
                 if extent_vals is None:
                     try:
                         computed = UsdGeom.Boundable.ComputeExtentFromPlugins(
-                            basis, Usd.TimeCode.Default()
+                            (
+                                UsdGeom.NurbsCurves(prim)
+                                if use_nurbs
+                                else UsdGeom.BasisCurves(prim)
+                            ),
+                            Usd.TimeCode.Default(),
                         )
                         if computed:
                             extent_vals = [
@@ -5040,7 +5181,14 @@ def author_geometry2d_layer(
                     extent = Vt.Vec3fArray(2)
                     extent[0] = extent_vals[0]
                     extent[1] = extent_vals[1]
-                    basis.CreateExtentAttr(extent)
+                    # Both schemas support extent on the prim
+                    try:
+                        prim.GetAttribute("extent") or prim.CreateAttribute(
+                            "extent", Sdf.ValueTypeNames.Float3Array
+                        )
+                        prim.GetAttribute("extent").Set(extent)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             try:

@@ -45,6 +45,7 @@ tests/*
 .idea/
 
 # Debugging files
+/debug
 *debug*.py
 *debug*
 _debug_bbox.py
@@ -92,3 +93,9 @@ conda
 # Ignore
 scripts/
 scripts/*
+
+#media files
+media/media/*
+media/**/*
+media/*/*
+*.mp4

@@ -2554,6 +2554,100 @@ def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
     """Traverse curve/curve-set items and gather 3D points."""
     if item is None:
         return []
+
+    # ---- NEW: keep exact spline data when IFC stores it as a B-spline/NURBS ----
+    # We return a list-like object so existing callers (len(), iterate, extend) keep working,
+    # but we attach a .nurbs dict that the USD authoring layer can detect.
+    class _CurvePointList(list):
+        pass
+
+    def _expand_knot_vector(knots, multiplicities):
+        """Expand IFC knots+mults into a full knot vector."""
+        if knots is None:
+            return None
+        try:
+            k = [float(v) for v in (knots or [])]
+        except Exception:
+            return None
+        if not k:
+            return None
+        if multiplicities is None:
+            # Some exports already provide the expanded knot vector.
+            return k
+        try:
+            m = [int(v) for v in (multiplicities or [])]
+        except Exception:
+            return None
+        if len(m) != len(k):
+            return None
+        out = []
+        for kv, mv in zip(k, m):
+            out.extend([kv] * max(0, mv))
+        return out or None
+
+    def _bspline_to_points_with_nurbs(curve):
+        """
+        Return control points with attached NURBS metadata (degree/knots/weights) if available.
+        Supports IfcBSplineCurveWithKnots and IfcRationalBSplineCurveWithKnots (common for alignments).
+        """
+        if curve is None or not hasattr(curve, "is_a"):
+            return None
+        if not (
+            curve.is_a("IfcBSplineCurveWithKnots")
+            or curve.is_a("IfcRationalBSplineCurveWithKnots")
+        ):
+            return None
+
+        # Degree
+        try:
+            degree = int(getattr(curve, "Degree", None))
+        except Exception:
+            degree = None
+        if degree is None or degree < 1:
+            return None
+
+        # Control points
+        cps = getattr(curve, "ControlPointsList", None) or getattr(
+            curve, "ControlPoints", None
+        )
+        if not cps:
+            return None
+        ctrl_pts = []
+        for p in cps:
+            try:
+                ctrl_pts.append(_cartesian_point_to_tuple(p))
+            except Exception:
+                continue
+        if len(ctrl_pts) < (degree + 1):
+            return None
+
+        # Knots + multiplicities -> expanded knot vector
+        knots = getattr(curve, "Knots", None)
+        mults = getattr(curve, "Multiplicities", None)
+        knot_vector = _expand_knot_vector(knots, mults)
+        # If we don't have knots, we can still pass control points, but it won't be an "exact" NURBS.
+        if not knot_vector:
+            return None
+
+        # Weights (rational)
+        weights_data = getattr(curve, "WeightsData", None)
+        weights = None
+        if weights_data:
+            try:
+                weights = [float(w) for w in (weights_data or [])]
+            except Exception:
+                weights = None
+            if weights and len(weights) != len(ctrl_pts):
+                weights = None
+
+        out = _CurvePointList(ctrl_pts)
+        out.nurbs = {
+            "degree": degree,
+            "knots": knot_vector,
+            "weights": weights,  # may be None for non-rational
+        }
+        return out
+
     if hasattr(item, "is_a") and item.is_a("IfcPolyline"):
         pts: List[Tuple[float, float, float]] = []
         for p in getattr(item, "Points", []) or []:
@@ -2562,6 +2656,15 @@ def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
             except Exception:
                 continue
         return pts
+
+    # NEW: exact B-spline/NURBS path
+    if hasattr(item, "is_a") and (
+        item.is_a("IfcBSplineCurveWithKnots")
+        or item.is_a("IfcRationalBSplineCurveWithKnots")
+    ):
+        nurbs_pts = _bspline_to_points_with_nurbs(item)
+        if nurbs_pts is not None:
+            return nurbs_pts
     if hasattr(item, "is_a") and item.is_a("IfcCompositeCurve"):
         pts: List[Tuple[float, float, float]] = []
         for segment in getattr(item, "Segments", []) or []:
@@ -2569,6 +2672,7 @@ def _extract_curve_points(item) -> List[Tuple[float, float, float]]:
             pts.extend(_extract_curve_points(parent))
         return pts
     if hasattr(item, "is_a") and item.is_a("IfcTrimmedCurve"):
+        # Preserve NURBS metadata if the basis curve is a B-spline with knots
         return _extract_curve_points(getattr(item, "BasisCurve", None))
     if hasattr(item, "is_a") and item.is_a("IfcGeometricSet"):
         pts: List[Tuple[float, float, float]] = []

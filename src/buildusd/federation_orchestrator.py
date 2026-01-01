@@ -29,7 +29,12 @@ from .conversion import (
     ROOT,
 )
 from .federation_builder import build_federated_stage
+from .federation.geodetic_federation import (
+    federate_sites_geodetic,
+    validate_geodetic_federation_stage,
+)
 from .usd_context import initialize_usd, shutdown_usd_context
+from .pxr_utils import Usd, UsdGeom
 
 LOG = logging.getLogger(__name__)
 
@@ -75,6 +80,92 @@ def _normalize_frame(value: Optional[str]) -> str:
         return normalized
     LOG.debug("Unknown frame '%s'; defaulting to projected", value)
     return "projected"
+
+
+def _geodetic_tuple(value: Optional[object]) -> Optional[tuple[float, float, float]]:
+    if value is None:
+        return None
+    try:
+        lon = float(getattr(value, "longitude"))
+        lat = float(getattr(value, "latitude"))
+        height = getattr(value, "height", None)
+        h = float(height) if height is not None else 0.0
+        return (lat, lon, h)
+    except Exception:
+        return None
+
+
+def _resolve_wgs84_origin(
+    plan: ResolvedFilePlan,
+) -> Optional[tuple[float, float, float]]:
+    if plan.master and plan.master.lonlat is not None:
+        origin = _geodetic_tuple(plan.master.lonlat)
+        if origin:
+            return origin
+    if plan.lonlat is not None:
+        origin = _geodetic_tuple(plan.lonlat)
+        if origin:
+            return origin
+    return None
+
+
+def _resolve_overall_wgs84_origin(
+    manifest: ConversionManifest,
+) -> Optional[tuple[float, float, float]]:
+    defaults = manifest.defaults
+    if defaults.master_id:
+        master = manifest.masters.get(defaults.master_id)
+        if master and master.lonlat:
+            origin = _geodetic_tuple(master.lonlat)
+            if origin:
+                return origin
+    if defaults.master_name:
+        for master in manifest.masters.values():
+            if master.name == defaults.master_name and master.lonlat:
+                origin = _geodetic_tuple(master.lonlat)
+                if origin:
+                    return origin
+    return None
+
+
+def _build_geodetic_federated_stage(
+    *,
+    out_stage_path: str,
+    payload_paths: Sequence[str],
+    origin_wgs84: Optional[tuple[float, float, float]],
+    rebuild: bool,
+    use_payloads: bool,
+) -> None:
+    if rebuild:
+        stage = Usd.Stage.CreateNew(out_stage_path)
+    else:
+        stage = Usd.Stage.Open(out_stage_path)
+        if stage is None:
+            stage = Usd.Stage.CreateNew(out_stage_path)
+    if stage is None:
+        raise RuntimeError(f"Failed to open or create stage: {out_stage_path}")
+
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+    sites = [
+        {"name": path_stem(path), "layer_path": str(path)} for path in payload_paths
+    ]
+    federate_sites_geodetic(
+        stage,
+        sites,
+        federation_origin_wgs84=origin_wgs84,
+        use_payloads=use_payloads,
+    )
+    if not validate_geodetic_federation_stage(stage):
+        LOG.warning(
+            "Geodetic federation validation failed for %s.", path_name(out_stage_path)
+        )
+
+    world = stage.GetPrimAtPath("/World")
+    if world:
+        stage.SetDefaultPrim(world)
+    stage.GetRootLayer().Save()
 
 
 def _normalise_stage_root(path: str | None) -> Path:
@@ -169,8 +260,12 @@ def _plan_federation(
     anchor_mode: Optional[str],
 ) -> list[FederationTask]:
     tasks: list[FederationTask] = []
+    skip_names = _collect_master_stage_names(manifest, fallback_master_name)
     resolved_anchor_mode = _normalize_anchor_mode(anchor_mode)
     for stage_path in stage_paths:
+        if stage_path.name.lower() in skip_names:
+            LOG.info("Skipping master stage input %s.", path_name(stage_path))
+            continue
         try:
             plan = _resolve_plan_for_stage(
                 manifest,
@@ -190,6 +285,28 @@ def _plan_federation(
             )
         )
     return tasks
+
+
+def _collect_master_stage_names(
+    manifest: ConversionManifest, fallback_master_name: str
+) -> set[str]:
+    names: set[str] = set()
+    for master in manifest.masters.values():
+        names.add(_force_usdc_filename(master.resolved_name()).lower())
+    if manifest.defaults.master_name:
+        names.add(_force_usdc_filename(manifest.defaults.master_name).lower())
+    if manifest.defaults.master_id:
+        master = manifest.masters.get(manifest.defaults.master_id)
+        if master:
+            names.add(_force_usdc_filename(master.resolved_name()).lower())
+        else:
+            names.add(_force_usdc_filename(manifest.defaults.master_id).lower())
+    if fallback_master_name:
+        names.add(_force_usdc_filename(fallback_master_name).lower())
+    overall = _resolve_overall_master_name(manifest)
+    if overall:
+        names.add(str(Path(overall).name).lower())
+    return names
 
 
 def _apply_federation(
@@ -240,17 +357,26 @@ def _apply_federation(
             path_name(master_stage_path),
             len(payload_paths),
         )
-        build_federated_stage(
-            payload_paths=payload_paths,
-            out_stage_path=str(master_stage_path),
-            federation_origin=federation_origin,
-            federation_projected_crs=federation_projected_crs,
-            geodetic_crs=geodetic_crs,
-            parent_prim_path=parent_prim or "/World",
-            use_payloads=True,
-            rebuild=rebuild,
-            frame=_normalize_frame(frame),
-        )
+        if _normalize_frame(frame) == "geodetic":
+            _build_geodetic_federated_stage(
+                out_stage_path=str(master_stage_path),
+                payload_paths=payload_paths,
+                origin_wgs84=_resolve_wgs84_origin(first_plan),
+                rebuild=rebuild,
+                use_payloads=True,
+            )
+        else:
+            build_federated_stage(
+                payload_paths=payload_paths,
+                out_stage_path=str(master_stage_path),
+                federation_origin=federation_origin,
+                federation_projected_crs=federation_projected_crs,
+                geodetic_crs=geodetic_crs,
+                parent_prim_path=parent_prim or "/World",
+                use_payloads=True,
+                rebuild=rebuild,
+                frame=_normalize_frame(frame),
+            )
         built_master_paths.append(str(master_stage_path))
     return built_master_paths
 
@@ -324,17 +450,26 @@ def _apply_overall_master(
         path_name(overall_stage_path),
         len(payload_paths),
     )
-    build_federated_stage(
-        payload_paths=payload_paths,
-        out_stage_path=str(overall_stage_path),
-        federation_origin=overall_origin,
-        federation_projected_crs=projected_crs,
-        geodetic_crs=geodetic_crs,
-        parent_prim_path=parent_prim or "/World",
-        use_payloads=True,
-        rebuild=rebuild,
-        frame=_normalize_frame(frame),
-    )
+    if _normalize_frame(frame) == "geodetic":
+        _build_geodetic_federated_stage(
+            out_stage_path=str(overall_stage_path),
+            payload_paths=payload_paths,
+            origin_wgs84=_resolve_overall_wgs84_origin(manifest),
+            rebuild=rebuild,
+            use_payloads=True,
+        )
+    else:
+        build_federated_stage(
+            payload_paths=payload_paths,
+            out_stage_path=str(overall_stage_path),
+            federation_origin=overall_origin,
+            federation_projected_crs=projected_crs,
+            geodetic_crs=geodetic_crs,
+            parent_prim_path=parent_prim or "/World",
+            use_payloads=True,
+            rebuild=rebuild,
+            frame=_normalize_frame(frame),
+        )
 
 
 def federate_stages(
