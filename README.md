@@ -2,7 +2,7 @@ IFC → USD Converter (Federated)
 
 Overview
 - Converts IFC files to USD with prototypes, materials, and instances.
-- Adds WGS84 geolocation attributes to /World.
+- Optionally adds WGS84 geolocation attributes to /World (when anchoring or lon/lat overrides are supplied and geospatial mode is enabled).
 - Provides a separate federation CLI (`python -m buildusd.federate`) that assembles per-file stages into project master files without touching conversion outputs.
 - Authors IFC properties/quantities as USD attributes under a BIMData namespace.
 
@@ -89,6 +89,8 @@ Usage (CLI)
   - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.json
   - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.yaml --masters-root data/federated --rebuild
   - python -m buildusd --input C:\\path\\to\\dir --all --manifest src/buildusd/config/sample_manifest.yaml --federate
+- Federation CLI options (`python -m buildusd.federate`):
+  - `--stage-root`, `--stage`, `--masters-root`, `--manifest`, `--parent-prim`, `--map-coordinate-system`, `--anchor-mode`, `--frame`, `--offline`, `--rebuild`
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m buildusd --input omniverse://server/Projects/IFC --all
 - Detail routing examples:
@@ -99,26 +101,92 @@ Usage (CLI)
   - python -m buildusd --detail-mode --detail-engine occ --detail-scope object --detail-objects 1265  # OCC-only detail for targeted objects
 - CLI detail flags (defaults/behavior):
   - `--detail-mode`: off by default; enables the detail pipeline.
-  - `--detail-scope`: required when detail-mode is on; `all` (default when omitted) or `object` (requires `--detail-objects`).
+  - `--detail-scope`: optional; defaults to `all` when omitted. Use `object` with `--detail-objects`.
   - `--detail-objects`: space-separated STEP ids and/or GUIDs; used only when scope=object.
   - `--detail-engine`: `default` (semantic first, OCC fallback), `occ|opencascade` (OCC only), `semantic|ifc-subcomponents|ifc-parts` (semantic only).
 - Update meters-per-unit metadata on an existing USD stage/layer (no IFC conversion):
   - python -m buildusd --set-stage-unit "omniverse://server/Projects/file.usdc" --stage-unit-value 0.001
 - Update up-axis metadata on an existing USD stage/layer (no IFC conversion):
   - python -m buildusd --set-stage-up-axis "omniverse://server/Projects/file.usdc" --stage-up-axis Z
-- Annotation curve widths:
-  - python -m buildusd --input C:\\path\\to\\dir --annotation-width-default 15mm
-  - python -m buildusd --input C:\\path\\to\\dir --annotation-width-rule width=0.02,layer=Survey*,curve=*Centerline*
-  - python -m buildusd --input C:\\path\\to\\dir --annotation-width-config src/buildusd/config/sample_annotation_widths.json
-  - python -m buildusd --input C:\\path\\to\\dir --annotation-width-config src/buildusd/config/sample_annotation_widths.yaml
+- 2D annotation extraction (off by default):
+  - python -m buildusd --input C:\\path\\to\\dir --include-2d
+- Annotation curve widths (use with --include-2d):
+  - python -m buildusd --input C:\\path\\to\\dir --include-2d --annotation-width-default 15mm
+  - python -m buildusd --input C:\\path\\to\\dir --include-2d --annotation-width-rule width=0.02,layer=Survey*,curve=*Centerline*
+  - python -m buildusd --input C:\\path\\to\\dir --include-2d --annotation-width-config src/buildusd/config/sample_annotation_widths.json
+  - python -m buildusd --input C:\\path\\to\\dir --include-2d --annotation-width-config src/buildusd/config/sample_annotation_widths.yaml
+
+CLI call signatures
+```bash
+python -m buildusd [--input PATH] [--output PATH] [options]
+python -m buildusd.federate --stage-root PATH --manifest MANIFEST [options]
+```
+
+CLI options (summary)
+- Input/output: `--input`, `--output`, `--ifc-names`, `--exclude`, `--all`, `--manifest`
+- Execution: `--offline`, `--checkpoint`, `--usd-format`, `--usd-auto-binary-threshold-mb`, `--map-coordinate-system`, `--geospatial-mode`
+- 2D: `--include-2d`, `--annotation-width-default`, `--annotation-width-rule`, `--annotation-width-config`
+- Anchoring/federation: `--anchor-mode`, `--federate`, `--frame` (federation only)
+- Detail: `--detail-mode`, `--detail-scope`, `--detail-objects`, `--detail-engine`, `--enable-semantic-subcomponents`, `--semantic-tokens`
+- Utilities: `--set-stage-unit`, `--stage-unit-value`, `--set-stage-up-axis`, `--stage-up-axis`
+
+CLI reference (full)
+```text
+python -m buildusd
+  --map-coordinate-system, --map-epsg   EPSG code or CRS string for map eastings/northings
+  --input PATH                          IFC file or directory (default: repo root)
+  --output PATH                         Output directory for USD artifacts
+  --manifest PATH                       Manifest (YAML/JSON) for base points and masters
+  --ifc-names NAMES...                  Specific IFC files to process in a directory
+  --exclude NAMES...                    IFC file names to skip
+  --all                                 Process all .ifc files in the input directory
+  --checkpoint                          Create Nucleus checkpoints (omniverse:// only)
+  --offline                             Force standalone USD (no Kit); local paths only
+  --set-stage-unit PATH                 Update metersPerUnit on an existing layer/stage
+  --stage-unit-value FLOAT              metersPerUnit value for --set-stage-unit
+  --set-stage-up-axis PATH              Update upAxis on an existing layer/stage
+  --stage-up-axis {X|Y|Z}               upAxis value for --set-stage-up-axis
+  --annotation-width-default VALUE      Default annotation width (e.g. 15mm)
+  --annotation-width-rule SPEC          Width override rule (repeatable)
+  --annotation-width-config PATH        Width config file (repeatable)
+  --include-2d                          Enable 2D annotation extraction
+  --anchor-mode {local|basepoint|none}  Anchor mode for model offsets
+  --federate                            Run federation after conversion
+  --frame {projected|geodetic}          Federation frame (used with --federate)
+  --geospatial-mode {auto|usd|omni|none} Geospatial metadata mode
+  --usd-format {usdc|usda|usd|auto}     Output USD format
+  --usd-auto-binary-threshold-mb FLOAT  Re-export as usdc above this size (MB)
+  --detail-mode                         Enable detail pipeline
+  --detail-scope {all|object}           Scope for detail meshes (default: all)
+  --detail-objects STEP_OR_GUID...      Targets for object-scoped detail
+  --detail-engine {default|occ|opencascade|semantic|ifc-subcomponents|ifc-parts}
+                                       Detail engine routing
+  --enable-semantic-subcomponents       Enable semantic subcomponent splitting
+  --semantic-tokens PATH                JSON file of semantic tokens
+```
+
+```text
+python -m buildusd.federate
+  --stage-root PATH                     Root directory containing converted stages
+  --stage PATHS...                      Specific stage files to federate
+  --masters-root PATH                   Output directory for federated masters
+  --manifest PATH                       Manifest describing federation targets
+  --parent-prim PATH                    Parent prim for payloads (default: /World)
+  --map-coordinate-system EPSG          Fallback CRS when manifest omits projected_crs
+  --anchor-mode {local|basepoint|none}  Match anchoring used by converted stages
+  --frame {projected|geodetic}          Federation frame for delta computation
+  --offline                             Standalone USD mode (no Kit)
+  --rebuild                             Rebuild masters from scratch
+```
 
 Model offsets & anchoring
 - Stages stay in meters (metersPerUnit=1.0).
 - Iterator tessellation runs with use-world-coords=False; placements come from the iterator transform.
-- Per file we resolve a model offset from --anchor-mode:
+- Per file we resolve a model offset when --anchor-mode is set:
   - local -> IfcSite.ObjectPlacement (meters)
-  - basepoint -> Project Base Point (PBP) if available, else Survey Point (SP), else no offset with a warning
-  - none -> no model-offset
+  - basepoint -> Project Base Point (PBP) if available, else Survey Point (SP), else (0,0,0) with a warning
+  - none -> no model-offset (geospatial metadata only if a lon/lat override is supplied)
+- Offsets are baked into geometry via ifcopenshell model-offset; no USD XformOps are authored for anchoring.
 - The GeometrySettingsManager applies offset-type (default negative) to the raw offset and pushes the signed value into all ifcopenshell settings objects.
 - MapConversion grid rotation (when applicable) is applied via ifcopenshell model-rotation (quaternion), not USD XformOps.
 - Each IFC file gets its own resolved offset; offsets are not shared across files.
@@ -132,6 +200,8 @@ Usage (Python)
 - results = convert("path/to/file.ifc", output_dir="data/output")  # returns List[ConversionResult]
 - convert("omniverse://server/Projects/file.ifc", output_dir="omniverse://server/USD/output")
 - convert("path/to/file.ifc", output_dir="data/output", checkpoint=True)  # omniverse:// required for checkpoints
+- from buildusd import ConversionOptions
+- convert("path/to/file.ifc", output_dir="data/output", options=ConversionOptions(include_2d=True))
 - from buildusd.api import set_stage_unit
 - set_stage_unit("omniverse://server/Projects/file.usdc", meters_per_unit=0.001)
 - from buildusd.api import set_stage_up_axis
@@ -146,6 +216,8 @@ ConversionOptions examples (programmatic)
   - `options = ConversionOptions(detail_mode=True, detail_scope="all", detail_engine="semantic")`
 - Geometry overrides (safe subset only):
   - `options = ConversionOptions(detail_mode=True, detail_scope="all", geom_overrides={"mesher-linear-deflection": 0.5, "mesher-angular-deflection": 5})`
+- Include 2D annotation extraction (default is off):
+  - `options = ConversionOptions(include_2d=True)`
 
 Manifest schema
 - Sample manifests live in `src/buildusd/config/sample_manifest.{json,yaml}`. Keep the same structure (masters, base points, CRS). Add a jsonschema alongside your manifests if you want automated validation (e.g., `manifest.schema.json`) and validate with `buildusd validate-manifest` when available.
@@ -156,7 +228,7 @@ Outputs
   - prototypes/<name>_prototypes.usda
   - materials/<name>_materials.usda
   - instances/<name>_instances.usda
-  - geometry2d/<name>_geometry2d.usda (when present; captured 2D alignment/annotation curves)
+  - geometry2d/<name>_geometry2d.usda (when present; captured 2D alignment/annotation curves; requires --include-2d or include_2d=True)
     - /World/<file>_Instances preserves the IFC spatial hierarchy (Project/Site/Storey/Class).
     - Optional grouping variants (see src/buildusd/process_usd.py:author_instance_grouping_variant) can reorganize instances on demand without losing the canonical hierarchy.
   - caches/<name>.json stores serialized instance metadata for later regrouping sessions.
@@ -182,7 +254,7 @@ Geometry overrides (advanced)
 - Anchoring/model offsets remain controlled by the converter; overrides are merged on top of the defaults where safe.
 Detail / remesh
 - `enable_high_detail_remesh` defaults to False; the iterator mesh is the base geometry. `--detail-mode` runs the detail pipeline without remeshing unless explicitly enabled.
-- Detail scope is required when detail-mode is on: `all` (default when omitted) or `object` (paired with `--detail-objects`).
+- Detail scope is optional; it defaults to `all` when omitted. Use `object` with `--detail-objects`.
 - OCC detail meshes author under `/World/__PrototypesDetail` (and instance overrides when scoped); the base iterator tessellation remains the primary geometry path.
 - Detail engine routing:
   - `--detail-engine default` (default) tries IFC subcomponents first, then falls back to OCC.
@@ -192,6 +264,7 @@ Detail / remesh
   - Env caps: `OCC_DETAIL_FACE_CAP` skips OCC detail when face count exceeds the cap; `OCC_CANONICAL_MAP_FACE_CAP` skips canonical map building when faces exceed the cap or the mesh is single-material with no item ids.
 
 Annotation Curve Width Overrides
+- 2D curve widths are only evaluated when 2D extraction is enabled (`--include-2d` or API option).
 - Control the `UsdGeom.BasisCurves` widths authored in geometry2d layers via `--annotation-width-default`, repeated `--annotation-width-rule`, or config files supplied with `--annotation-width-config`.
 - Widths accept numeric values in stage units (`0.015`) or include a unit suffix (`12mm`, `1.5cm`, `0.01m`). A separate `unit` key is also accepted in configuration mappings.
 - Rule filters support `layer` (matches the IFC stem used for the geometry2d layer), `curve` (annotation name), `hierarchy` (any label or `/`-joined path in the spatial hierarchy), and `step_id`. Glob-style (`fnmatch`) patterns are applied case-insensitively.
@@ -242,13 +315,13 @@ hierarchies:
 ```
 
 Units and Geospatial
-- Per-file stages author WGS84 reference on /World and /World/Geospatial (OmniGeospatial referencePosition). Projected anchors are stored as `ifc:anchorProjected` customData.
+- Per-file stages author WGS84 reference on /World and /World/Geospatial (OmniGeospatial referencePosition) when anchoring or lon/lat overrides are supplied and geospatial mode is enabled. Projected anchors are stored as `ifc:anchorProjected` customData when available.
 - Federated masters created via `buildusd.federate` are authored with metersPerUnit=1.0 (meters). Payloads are not rescaled; a log line indicates alignment or mismatch.
 
 Geo Anchoring
-- Conversion and federation expose `--anchor-mode` controlling how /World is aligned. `local` anchors to IfcSite placement, `basepoint` anchors to PBP/SP, and `none` leaves /World unchanged.
+- Conversion and federation expose `--anchor-mode` to control model offsets and anchor metadata. `local` uses IfcSite placement, `basepoint` uses PBP/SP, and `none` skips model offsets (geospatial metadata only if a lon/lat override is supplied).
 - Geodetic metadata (lon/lat/height) is derived from the chosen anchor (using `pyproj` when available) and written on /World and /World/Geospatial alongside the `ifc:` attributes; metersPerUnit remains 1.0.
-- Example invocations: `python -m buildusd --anchor-mode basepoint ...` for conversion, `python -m buildusd --anchor-mode none ...` to leave stages unanchored, and `python -m buildusd.federate --anchor-mode basepoint ...` to keep federated masters aligned in the same frame.
+- Example invocations: `python -m buildusd --anchor-mode basepoint ...` for conversion, `python -m buildusd --anchor-mode none ...` to skip model offsets, and `python -m buildusd.federate --anchor-mode basepoint ...` to keep federated masters aligned in the same frame.
 
 IFC Metadata as USD Attributes
 - IFC psets/qtos are authored as attributes (not customData) using:
@@ -261,12 +334,35 @@ Federated Stage Behavior (via `buildusd.federate`)
 - The payload targets the stage's default prim so additional `/World` nesting is avoided when possible.
 - The federation output is idempotent: re-running adds missing payloads; use `--rebuild` to recreate the master stage from scratch.
 - If `defaults.overall_master_name` is set, a top-level overall master is built by payloading the per-site master stages.
+- Running `python -m buildusd --federate` after conversion uses the same routing logic as `buildusd.federate` and respects `--anchor-mode`/`--frame` for alignment.
 
 Programmatic Use
 - `from buildusd import api` exposes structured helpers. `api.ConversionSettings` and `api.convert()` mirror the CLI; `api.FederationSettings` and `api.federate_stages()` do the same for master assembly; `api.apply_stage_anchor_transform()` anchors custom USD stages consistently.
 - `api.CONVERSION_DEFAULTS` / `api.FEDERATION_DEFAULTS` expose the packaged defaults, and `api.DEFAULT_CONVERSION_OPTIONS` offers a ready-to-clone baseline for geometry harvesting.
-- Anchor modes accept `"local"`, `"basepoint"`, or `None`/`"none"`; the latter skips writing a transform on `/World`.
+- Anchor modes accept `"local"`, `"basepoint"`, or `None`/`"none"`; `none` skips model offsets and only stamps geospatial metadata when a lon/lat override is supplied.
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
+- Use `ConversionSettings(include_2d=True)` or `ConversionOptions(include_2d=True)` to opt into 2D annotation extraction.
+
+```python
+from buildusd import api
+
+settings = api.ConversionSettings(
+    input_path="path/to/file.ifc",
+    output_dir="data/output",
+    include_2d=True,
+    manifest_path="src/buildusd/config/sample_manifest.yaml",
+)
+results = api.convert(settings)
+
+federation_settings = api.FederationSettings(
+    stage_paths=[r.stage_path for r in results if r.stage_path],
+    masters_root="data/federated",
+    manifest_path="src/buildusd/config/sample_manifest.yaml",
+    anchor_mode="basepoint",
+    frame="projected",
+)
+api.federate_stages(federation_settings)
+```
 Manifest Schema
 - defaults: Global fallback for master name, projected/geodetic CRS, base point, shared site base point, and optional `file_revision` used for checkpoint notes/tags.
   - `overall_master_name` (or `overall_master`) enables an overall master stage.
@@ -280,7 +376,7 @@ Notes
   - src/buildusd/config/sample_manifest.json (JSON with `_comment` helper fields)
   - src/buildusd/config/sample_manifest.yaml (YAML with inline comments)
   Copy one of them locally (e.g. to src/buildusd/config/manifest.yaml) when preparing project-specific settings. The real manifest remains untracked by design and can be loaded from local paths or omniverse:// URIs.
-- 2D annotation contexts (e.g. alignment strings in IfcAnnotation) are preserved. If the ifcopenshell geometry iterator rejects an annotation context, the pipeline emits a warning and falls back to manual curve extraction so the data still lands in the 2D geometry layer.
+- 2D annotation contexts (e.g. alignment strings in IfcAnnotation) are preserved only when 2D extraction is enabled. If the ifcopenshell geometry iterator rejects an annotation context, the pipeline emits a warning and falls back to manual curve extraction so the data still lands in the 2D geometry layer.
 
 
 Troubleshooting
