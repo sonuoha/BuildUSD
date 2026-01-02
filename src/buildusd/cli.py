@@ -150,6 +150,12 @@ def parse_args(
         help="Path to a JSON or YAML file defining annotation curve width rules (may be provided multiple times).",
     )
     parser.add_argument(
+        "--include-2d",
+        dest="include_2d",
+        action="store_true",
+        help="Include 2D annotation geometry in the conversion output (default: off).",
+    )
+    parser.add_argument(
         "--anchor-mode",
         dest="anchor_mode",
         choices=("local", "basepoint", "none"),

@@ -4792,6 +4792,8 @@ def author_geometry2d_layer(
     options: ConversionOptions,
 ) -> Optional[Sdf.Layer]:
     """Author 2D annotation curves as BasisCurves under the instance root hierarchy."""
+    if not getattr(options, "include_2d", False):
+        return None
     if not getattr(caches, "annotations", None):
         return None
 

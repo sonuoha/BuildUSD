@@ -1409,6 +1409,7 @@ class ConversionOptions:
     enable_high_detail_remesh: bool = False
     manifest: Optional["ConversionManifest"] = None
     curve_width_rules: Tuple[CurveWidthRule, ...] = tuple()
+    include_2d: bool = False
     anchor_mode: Optional[Literal["local", "basepoint"]] = None
     # No extra policy knobs: anchoring is controlled solely by anchor_mode.
     detail_mode: bool = False
@@ -1688,16 +1689,18 @@ class PrototypeBuildContext:
             settings_fp_high = settings_fp_base
             settings_fp_brep = settings_fp_base
 
-        annotation_hooks = AnnotationHooks(
-            entity_on_hidden_layer=_entity_on_hidden_layer,
-            collect_spatial_hierarchy=_collect_spatial_hierarchy,
-            entity_label=_entity_label,
-            object_placement_to_np=_object_placement_to_np,
-            context_to_np=_context_to_np,
-            mapping_item_transform=_mapping_item_transform,
-            extract_curve_points=_extract_curve_points,
-            transform_points=_transform_points,
-        )
+        annotation_hooks = None
+        if getattr(options, "include_2d", False):
+            annotation_hooks = AnnotationHooks(
+                entity_on_hidden_layer=_entity_on_hidden_layer,
+                collect_spatial_hierarchy=_collect_spatial_hierarchy,
+                entity_label=_entity_label,
+                object_placement_to_np=_object_placement_to_np,
+                context_to_np=_context_to_np,
+                mapping_item_transform=_mapping_item_transform,
+                extract_curve_points=_extract_curve_points,
+                transform_points=_transform_points,
+            )
 
         object_scope_settings = None
         if detail_scope == "object":
@@ -6641,6 +6644,11 @@ def build_prototypes(
     iterator = ifcopenshell.geom.iterator(settings, ifc_file, threads)
 
     if not iterator.initialize():
+        annotations: Dict[int, AnnotationCurve] = {}
+        if annotation_hooks is not None:
+            annotations = extract_annotation_curves(
+                ifc_file, hierarchy_cache, annotation_hooks
+            )
         # Fallback: still return caches for downstream authoring (empty)
         return PrototypeCaches(
             repmaps=repmaps,
@@ -6648,9 +6656,7 @@ def build_prototypes(
             hashes=hashes,
             step_keys=step_keys,
             instances=instances,
-            annotations=extract_annotation_curves(
-                ifc_file, hierarchy_cache, annotation_hooks
-            ),
+            annotations=annotations,
             map_conversion=map_conversion,
         )
 
@@ -7971,6 +7977,11 @@ def build_prototypes(
         if not iterator.next():
             break
 
+    annotations: Dict[int, AnnotationCurve] = {}
+    if annotation_hooks is not None:
+        annotations = extract_annotation_curves(
+            ifc_file, hierarchy_cache, annotation_hooks
+        )
     return PrototypeCaches(
         # Add the it break here
         repmaps=repmaps,
@@ -7978,8 +7989,6 @@ def build_prototypes(
         hashes=hashes,
         step_keys=step_keys,
         instances=instances,
-        annotations=extract_annotation_curves(
-            ifc_file, hierarchy_cache, annotation_hooks
-        ),
+        annotations=annotations,
         map_conversion=map_conversion,
     )

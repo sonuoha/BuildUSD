@@ -2372,6 +2372,8 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     options_override = OPTIONS
     if width_rules:
         options_override = replace(options_override, curve_width_rules=width_rules)
+    if getattr(args, "include_2d", False):
+        options_override = replace(options_override, include_2d=True)
     if (
         cli_anchor_mode is not None
         and getattr(options_override, "anchor_mode", None) != cli_anchor_mode

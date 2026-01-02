@@ -111,6 +111,7 @@ class ConversionSettings:
     offline: bool = CONVERSION_DEFAULTS.offline
     anchor_mode: AnchorModeSetting = CONVERSION_DEFAULTS.anchor_mode
     geospatial_mode: str = CONVERSION_DEFAULTS.geospatial_mode
+    include_2d: bool = False
     logger: Optional[logging.Logger] = None
     geom_overrides: dict[str, Any] = field(default_factory=dict)
 
@@ -131,6 +132,10 @@ def convert(
         merged_geom = dict(getattr(effective_options, "geom_overrides", {}) or {})
         merged_geom.update(settings.geom_overrides)
         effective_options = replace(effective_options, geom_overrides=merged_geom)
+    if getattr(settings, "include_2d", False) and not getattr(
+        effective_options, "include_2d", False
+    ):
+        effective_options = replace(effective_options, include_2d=True)
     normalized_anchor_mode = _normalize_anchor_mode(settings.anchor_mode)
 
     return _convert(
