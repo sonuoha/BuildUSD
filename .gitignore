@@ -14,7 +14,7 @@ wheels/
 src/dev/*.py
 src/dev/__pycache__/*.pyc
 src/dev/__pycache__/*.pyo
-src/ifc_converter/config/manifest.yaml
+src/buildusd/config/manifest.yaml
 
 # Ignore heavy BIM sample files
 /output/*.usd*

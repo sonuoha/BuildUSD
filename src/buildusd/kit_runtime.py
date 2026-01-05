@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from typing import Iterable, Sequence
 
 _KIT_APP = None
 _KIT_APP_OWNED = False
 _ENABLED_EXTENSIONS: set[str] = set()
+_KIT_THREAD = None
+_KIT_THREAD_STOP = None
 
 _BASE_ARGS: list[str] = ["--no-window"]
 _DEFAULT_EXTENSIONS: tuple[str, ...] = ("omni.client", "omni.usd")
@@ -52,6 +56,40 @@ def _collect_ext_folders() -> list[str]:
     return unique
 
 
+def _start_kit_loop() -> None:
+    global _KIT_THREAD, _KIT_THREAD_STOP
+    if os.environ.get("BUILDUSD_KIT_DISABLE_LOOP", "").strip():
+        return
+    if _KIT_THREAD is not None and _KIT_THREAD.is_alive():
+        return
+    if _KIT_APP is None:
+        return
+    _KIT_THREAD_STOP = threading.Event()
+
+    def _run() -> None:
+        app = _KIT_APP
+        if app is None:
+            return
+        update = getattr(app, "update", None)
+        is_running = getattr(app, "is_running", None)
+        if not callable(update):
+            return
+        while not _KIT_THREAD_STOP.is_set():
+            try:
+                if callable(is_running) and not is_running():
+                    break
+            except Exception:
+                break
+            try:
+                update()
+            except Exception:
+                break
+            time.sleep(0.01)
+
+    _KIT_THREAD = threading.Thread(target=_run, name="buildusd_kit_loop", daemon=True)
+    _KIT_THREAD.start()
+
+
 def _get_running_kit_app():
     """Return an already-running Kit app if executing inside Kit."""
     try:
@@ -77,6 +115,17 @@ def ensure_kit(extensions: Iterable[str] | None = None):
 
     required = _normalize_extensions(extensions)
 
+    if _KIT_APP is not None:
+        is_running = getattr(_KIT_APP, "is_running", None)
+        if callable(is_running):
+            try:
+                if not is_running():
+                    _KIT_APP = None
+                    _KIT_APP_OWNED = False
+                    _ENABLED_EXTENSIONS.clear()
+            except Exception:
+                pass
+
     if _KIT_APP is None:
         # Detect whether we're already inside a Kit runtime (e.g., extension template).
         existing = _get_running_kit_app()
@@ -96,6 +145,13 @@ def ensure_kit(extensions: Iterable[str] | None = None):
         _KIT_APP = KitApp()
         _KIT_APP_OWNED = True
         args: list[str] = list(_BASE_ARGS)
+        quit_after = os.environ.get("BUILDUSD_KIT_QUIT_AFTER")
+        if quit_after is None:
+            args.append("--/app/quitAfter=-1")
+        else:
+            value = quit_after.strip()
+            if value:
+                args.append(f"--/app/quitAfter={value}")
         all_exts = _normalize_extensions(
             tuple(dict.fromkeys(list(required) + list(_DEFAULT_EXTENSIONS)))
         )
@@ -106,15 +162,23 @@ def ensure_kit(extensions: Iterable[str] | None = None):
         for folder in _collect_ext_folders():
             args.extend(["--ext-folder", folder])
         _KIT_APP.startup(args)
+    _start_kit_loop()
     return _KIT_APP
 
 
 def shutdown_kit():
     """Shutdown the shared Kit application if it was started via ensure_kit."""
 
-    global _KIT_APP, _KIT_APP_OWNED, _ENABLED_EXTENSIONS
+    global _KIT_APP, _KIT_APP_OWNED, _ENABLED_EXTENSIONS, _KIT_THREAD, _KIT_THREAD_STOP
     if _KIT_APP is None:
         return
+
+    if _KIT_THREAD_STOP is not None:
+        _KIT_THREAD_STOP.set()
+    if _KIT_THREAD is not None:
+        _KIT_THREAD.join(timeout=2)
+    _KIT_THREAD = None
+    _KIT_THREAD_STOP = None
 
     if _KIT_APP_OWNED:
         try:

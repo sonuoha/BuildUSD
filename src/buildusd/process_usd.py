@@ -2778,6 +2778,54 @@ class MaterialLibrary:
     signature_to_path: Dict[Tuple[Any, ...], Sdf.Path]
 
 
+def _use_prototype_material_bindings(options: ConversionOptions) -> bool:
+    if not getattr(options, "enable_instancing", False):
+        return False
+    return not bool(getattr(options, "enable_instance_material_overrides", False))
+
+
+def _ensure_proxy_material(
+    stage: Usd.Stage, proto_path: Sdf.Path, library_path: Sdf.Path
+) -> Sdf.Path:
+    materials_root = proto_path.AppendChild("Materials")
+    if not stage.GetPrimAtPath(materials_root):
+        UsdGeom.Scope.Define(stage, materials_root)
+    proxy_path = materials_root.AppendChild(library_path.name)
+    proxy = UsdShade.Material.Define(stage, proxy_path)
+    proxy_prim = proxy.GetPrim()
+    if proxy_prim:
+        spec = proxy_prim.GetSpecializes()
+        if not spec:
+            return proxy_path
+        existing: Optional[List[Sdf.Path]] = None
+        for method_name in (
+            "GetPrimPaths",
+            "GetTargets",
+            "GetExplicitItems",
+            "GetSpecializes",
+        ):
+            if not hasattr(spec, method_name):
+                continue
+            try:
+                existing = list(getattr(spec, method_name)())
+            except Exception:
+                existing = None
+            break
+        if existing is not None and library_path in existing:
+            return proxy_path
+        try:
+            spec.AddSpecialize(library_path)
+        except Exception:
+            try:
+                if existing is None:
+                    spec.SetSpecializes([library_path])
+                else:
+                    spec.SetSpecializes(existing + [library_path])
+            except Exception:
+                pass
+    return proxy_path
+
+
 # ---------- helpers used by binding ----------
 _MATERIAL_NAME_CACHE: "weakref.WeakKeyDictionary[Usd.Stage, Dict[str, Sdf.Path]]" = (
     weakref.WeakKeyDictionary()
@@ -3173,8 +3221,6 @@ def _bind_materials_on_prototype_mesh(
             continue
 
         style_groups = getattr(proto, "style_face_groups", None) or {}
-        if not style_groups:
-            continue
 
         numeric_materials: Dict[int, Sdf.Path] = {}
         proto_label = (
@@ -3182,6 +3228,18 @@ def _bind_materials_on_prototype_mesh(
             or getattr(proto, "name", None)
             or "Prototype"
         )
+        proxy_cache: Dict[Sdf.Path, Sdf.Path] = {}
+
+        def _proxy_path(material_path: Optional[Sdf.Path]) -> Optional[Sdf.Path]:
+            if material_path is None:
+                return None
+            cached = proxy_cache.get(material_path)
+            if cached is not None:
+                return cached
+            proxy = _ensure_proxy_material(stage, mesh_root, material_path)
+            proxy_cache[material_path] = proxy
+            return proxy
+
         for idx, mat in enumerate(getattr(proto, "materials", None) or []):
             props = _extract_material_properties(
                 mat, prototype_label=proto_label, index=idx
@@ -3204,7 +3262,9 @@ def _bind_materials_on_prototype_mesh(
                 mat_path,
             )
             if mat_path:
-                numeric_materials[idx] = mat_path
+                proxy_path = _proxy_path(mat_path)
+                if proxy_path is not None:
+                    numeric_materials[idx] = proxy_path
 
         material_ids_attr = mesh_prim.GetAttribute("ifc:materialIds")
         material_ids_seq: List[int] = []
@@ -3238,12 +3298,15 @@ def _bind_materials_on_prototype_mesh(
             material_path = library.signature_to_path.get(signature)
             if material_path is None:
                 continue
+            proxy_path = _proxy_path(material_path)
+            if proxy_path is None:
+                continue
 
             subset_token = _subset_token_for_material(token)
             if style_material_path is None:
-                style_material_path = material_path
+                style_material_path = proxy_path
             style_tokens.add(subset_token)
-            style_token_to_material[subset_token] = material_path
+            style_token_to_material[subset_token] = proxy_path
 
             if material_ids_seq:
                 for face_index in faces:
@@ -3255,21 +3318,22 @@ def _bind_materials_on_prototype_mesh(
                         material_id = int(material_ids_seq[face_int])
                         existing = material_id_to_style_path.get(material_id)
                         if existing is None:
-                            material_id_to_style_path[material_id] = material_path
+                            material_id_to_style_path[material_id] = proxy_path
                         elif (
-                            existing != material_path
+                            existing != proxy_path
                             and material_id not in material_conflicts_reported
                         ):
                             LOG.debug(
                                 "Material ID %d already mapped to %s; skipping alternate style %s for prototype %s",
                                 material_id,
                                 existing,
-                                material_path,
+                                proxy_path,
                                 mesh_root,
                             )
                             material_conflicts_reported.add(material_id)
 
         cluster_binding: Dict[str, Sdf.Path] = {}
+        subset_bound = False
         for subset_token, material_path in style_token_to_material.items():
             cluster_binding[subset_token] = material_path
             subset_path = mesh_path.AppendChild(subset_token)
@@ -3284,6 +3348,10 @@ def _bind_materials_on_prototype_mesh(
             api = _material_binding_api(subset_prim)
             if api:
                 api.Bind(material)
+                subset_prim.CreateAttribute(
+                    "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+                ).Set(str(material_path))
+                subset_bound = True
             LOG.debug("Bound style subset %s -> %s", subset_path, material_path)
 
         try:
@@ -3315,6 +3383,12 @@ def _bind_materials_on_prototype_mesh(
                             api = _material_binding_api(subset.GetPrim())
                             if api:
                                 api.Bind(material)
+                                subset.GetPrim().CreateAttribute(
+                                    "ifc:materialPrim",
+                                    Sdf.ValueTypeNames.String,
+                                    custom=True,
+                                ).Set(str(mat_path))
+                                subset_bound = True
                             style_tokens.add(name)
                             LOG.debug(
                                 "Bound clustered style subset %s -> %s",
@@ -3331,6 +3405,10 @@ def _bind_materials_on_prototype_mesh(
                     api = _material_binding_api(subset.GetPrim())
                     if api:
                         api.Bind(material)
+                        subset.GetPrim().CreateAttribute(
+                            "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+                        ).Set(str(mat_path))
+                        subset_bound = True
                     style_tokens.add(name)
                     LOG.debug(
                         "Bound clustered style subset %s -> %s",
@@ -3362,6 +3440,10 @@ def _bind_materials_on_prototype_mesh(
             api = _material_binding_api(subset.GetPrim())
             if api:
                 api.Bind(material)
+                subset.GetPrim().CreateAttribute(
+                    "ifc:materialPrim", Sdf.ValueTypeNames.String, custom=True
+                ).Set(str(material_path))
+                subset_bound = True
             LOG.debug(
                 "Bound numeric subset %s -> %s (%s)",
                 subset.GetPath(),
@@ -3377,6 +3459,26 @@ def _bind_materials_on_prototype_mesh(
                     )
             except Exception:
                 pass
+
+        if not subset_bound:
+            primary_path = style_material_path
+            if primary_path is None and numeric_materials:
+                primary_path = numeric_materials.get(
+                    sorted(numeric_materials.keys())[0]
+                )
+            if primary_path is None and style_token_to_material:
+                primary_path = next(iter(style_token_to_material.values()))
+            if primary_path:
+                material = UsdShade.Material.Get(stage, primary_path)
+                if material:
+                    api = _material_binding_api(mesh_prim)
+                    if api:
+                        api.Bind(material)
+                        mesh_prim.CreateAttribute(
+                            "ifc:materialPrim",
+                            Sdf.ValueTypeNames.String,
+                            custom=True,
+                        ).Set(str(primary_path))
 
         imageable = UsdGeom.Imageable(mesh_prim)
         try:
@@ -4242,8 +4344,15 @@ def author_material_layer(
                 )
 
     library = MaterialLibrary(signature_to_path)
-    # Do not bind materials on /World/__Prototypes. We want all style/material
-    # opinions authored per-instance so the same prototype can appear with different looks.
+    if _use_prototype_material_bindings(options):
+        with Usd.EditContext(stage, proto_layer):
+            _bind_materials_on_prototype_mesh(
+                stage,
+                proto_paths,
+                caches,
+                library,
+            )
+    # Do not bind materials on /World/__Prototypes when instance overrides are enabled.
     return material_layer, library
 
 
@@ -4301,6 +4410,19 @@ def author_instance_layer(
         or getattr(options, "enable_high_detail_remesh", False)
     )
     stage_meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
+
+    def _allow_instance_material_overrides(
+        *, has_prototype: bool, proto_has_detail: bool
+    ) -> bool:
+        if not has_prototype:
+            return True
+        if not getattr(options, "enable_instancing", False):
+            return True
+        if getattr(options, "enable_instance_material_overrides", False):
+            return True
+        if proto_has_detail:
+            return True
+        return False
 
     def _unique_child_name(parent_path: Sdf.Path, base: str) -> str:
         used = name_counters[parent_path]
@@ -4542,6 +4664,9 @@ def author_instance_layer(
             proto_has_detail = bool(
                 proto_detail_mesh and getattr(proto_detail_mesh, "faces", None)
             )
+            allow_instance_overrides = _allow_instance_material_overrides(
+                has_prototype=True, proto_has_detail=proto_has_detail
+            )
 
             ref_path = inst_path.AppendChild("Prototype")
             ref_prim = stage.DefinePrim(ref_path, "Xform")
@@ -4573,7 +4698,11 @@ def author_instance_layer(
                 face_count_for_inst = len(counts_val)
             except Exception:
                 face_count_for_inst = 0
-            if face_count_for_inst > 0 and (style_groups or material_ids):
+            if (
+                allow_instance_overrides
+                and face_count_for_inst > 0
+                and (style_groups or material_ids)
+            ):
                 _ensure_material_subsets(
                     mesh_geom,
                     material_ids if material_ids else [],
@@ -4582,7 +4711,7 @@ def author_instance_layer(
                     materials=list(getattr(record, "materials", []) or []),
                 )
 
-            if resolved_materials:
+            if resolved_materials and allow_instance_overrides:
                 # Bind on the *instance* override path, not on the prototype.
                 # This makes per-instance style/material changes stick.
                 instance_mesh_path = None if proto_has_detail else mesh_child_path
@@ -4593,7 +4722,7 @@ def author_instance_layer(
                     style_groups=style_groups,
                     mesh_path=instance_mesh_path,
                 )
-            if resolved_color is not None:
+            if resolved_color is not None and allow_instance_overrides:
                 _apply_display_color_to_prim(inst_prim, resolved_color)
                 try:
                     mesh_child_override.CreateAttribute(
@@ -5123,8 +5252,8 @@ def author_geometry2d_layer(
             else:
                 basis = UsdGeom.BasisCurves.Define(stage, curve_path)
                 basis.CreateTypeAttr(UsdGeom.Tokens.linear)
-                basis.CreateBasisAttr(UsdGeom.Tokens.linear)
-                basis.CreateWrapAttr(UsdGeom.Tokens.open)
+                # Basis is only valid for cubic curves; for linear use nonperiodic wrap.
+                basis.CreateWrapAttr(UsdGeom.Tokens.nonperiodic)
                 basis.CreateCurveVertexCountsAttr(counts)
                 basis.CreatePointsAttr(pt_array)
                 prim = basis.GetPrim()

@@ -1416,6 +1416,7 @@ class ConversionOptions:
     detail_scope: Literal["all", "object"] = "all"
     detail_objects: Tuple[Union[int, str], ...] = tuple()
     enable_instance_material_variants: bool = True
+    enable_instance_material_overrides: bool = False
     enable_semantic_subcomponents: bool = False
     semantic_tokens: Dict[str, List[str]] = field(default_factory=dict)
     detail_engine: Literal["default", "occ", "semantic"] = "default"
