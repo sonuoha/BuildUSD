@@ -529,6 +529,8 @@ def _build_object_scope_detail_mesh(
         logger=log,
         material_resolver=material_resolver,
         reference_shape=reference_shape,
+        model_offset=getattr(ctx.options, "model_offset", None),
+        model_offset_type=getattr(ctx.options, "model_offset_type", None),
         canonical_map=canonical_map,
         face_style_groups=face_style_groups,
     )
@@ -1573,6 +1575,10 @@ class PrototypeBuildContext:
             text = str(value).strip().upper()
             if text:
                 detail_object_guids.add(text)
+
+        # If explicit objects are provided, force object-scope detail.
+        if detail_object_ids or detail_object_guids:
+            detail_scope = "object"
 
         # Legacy explicit id / guid fields (kept for compatibility)
         for value in getattr(options, "detail_object_ids", tuple()) or tuple():
@@ -7260,6 +7266,8 @@ def build_prototypes(
                     logger=log,
                     material_resolver=detail_material_resolver,
                     reference_shape=shape,
+                    model_offset=getattr(options, "model_offset", None),
+                    model_offset_type=getattr(options, "model_offset_type", None),
                     canonical_map=canonical_map,
                 )
                 if detail_mesh_data is None:
@@ -7864,6 +7872,8 @@ def build_prototypes(
                         logger=log,
                         material_resolver=detail_material_resolver,
                         reference_shape=shape,
+                        model_offset=getattr(options, "model_offset", None),
+                        model_offset_type=getattr(options, "model_offset_type", None),
                         canonical_map=canonical_map,
                     )
                     if detail_mesh_data is None:

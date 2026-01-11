@@ -1326,6 +1326,8 @@ def build_detail_mesh_payload(
     detail_level: Literal["subshape"] | str = "subshape",
     material_resolver: Optional[Callable[[Any], Any]] = None,
     reference_shape: Optional[Any] = None,
+    model_offset: Optional[Tuple[float, float, float]] = None,
+    model_offset_type: Optional[str] = None,
     unit_scale: float = 1.0,
     canonical_map: Optional[Dict[int, Any]] = None,
     face_style_groups: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -1433,7 +1435,13 @@ def build_detail_mesh_payload(
             try:
                 from .process_ifc import resolve_absolute_matrix
 
-                abs_mat = resolve_absolute_matrix(candidate, product)
+                abs_mat = resolve_absolute_matrix(
+                    candidate,
+                    product,
+                    model_offset=model_offset,
+                    model_offset_type=model_offset_type,
+                    logger=logref,
+                )
             except Exception:
                 abs_mat = None
             abs_inv = try_inv_4x4(abs_mat)

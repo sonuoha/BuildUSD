@@ -2401,6 +2401,8 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     detail_objects_arg = getattr(args, "detail_objects", None)
     if detail_objects_arg:
         LOG.info("Detail objects override (mixed ids/guids): %s", detail_objects_arg)
+        if not detail_scope_arg:
+            detail_scope_arg = "object"
         options_override = replace(
             options_override, detail_objects=tuple(detail_objects_arg)
         )
