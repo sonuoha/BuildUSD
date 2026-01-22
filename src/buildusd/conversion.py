@@ -2358,16 +2358,33 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         LOG.info("Loaded %d annotation width rule(s).", len(width_rules))
         for idx, rule in enumerate(width_rules, start=1):
             LOG.debug("Annotation width rule %d: %s", idx, rule)
+    raw_engine_arg = getattr(args, "detail_engine", "default") or "default"
+    norm_engine = raw_engine_arg.lower()
+    if norm_engine == "opencascade":
+        norm_engine = "occ"
+    elif norm_engine in ("ifc-subcomponents", "ifc-parts"):
+        norm_engine = "semantic"
+    LOG.info("Detail engine requested: %s (normalized=%s)", raw_engine_arg, norm_engine)
+
     detail_requested = _detail_features_requested(args)
-    if detail_requested:
+    if detail_requested and norm_engine in ("occ", "default"):
         LOG.info("Detail pipeline requested; verifying OCC runtime...")
         try:
             bootstrap_occ()
         except ImportError as exc:
-            print(f"Error: OCC detail runtime unavailable: {exc}", file=sys.stderr)
-            shutdown_usd_context()
-            raise SystemExit(2) from exc
-        LOG.info("OCC detail runtime ready.")
+            if norm_engine == "occ":
+                LOG.warning(
+                    "OCC detail runtime unavailable; falling back to semantic splitting. (%s)",
+                    exc,
+                )
+                norm_engine = "semantic"
+            else:
+                LOG.warning(
+                    "OCC detail runtime unavailable; continuing without OCC fallback. (%s)",
+                    exc,
+                )
+        else:
+            LOG.info("OCC detail runtime ready.")
     cli_anchor_mode = _normalize_anchor_mode(getattr(args, "anchor_mode", None))
     options_override = OPTIONS
     if width_rules:
@@ -2403,20 +2420,25 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         LOG.info("Detail objects override (mixed ids/guids): %s", detail_objects_arg)
         if not detail_scope_arg:
             detail_scope_arg = "object"
+            options_override = replace(options_override, detail_scope=detail_scope_arg)
+        if not getattr(options_override, "detail_mode", False):
+            LOG.info("Detail objects provided; enabling detail mode automatically.")
+            options_override = replace(options_override, detail_mode=True)
         options_override = replace(
             options_override, detail_objects=tuple(detail_objects_arg)
         )
 
     if getattr(args, "enable_semantic_subcomponents", False):
-        LOG.info("Semantic subcomponent splitting enabled.")
-        options_override = replace(options_override, enable_semantic_subcomponents=True)
+        if norm_engine == "occ":
+            LOG.info(
+                "Semantic subcomponent splitting requested but detail engine OCC selected; ignoring."
+            )
+        else:
+            LOG.info("Semantic subcomponent splitting enabled.")
+            options_override = replace(
+                options_override, enable_semantic_subcomponents=True
+            )
 
-    raw_engine_arg = getattr(args, "detail_engine", "default") or "default"
-    norm_engine = raw_engine_arg.lower()
-    if norm_engine == "opencascade":
-        norm_engine = "occ"
-    elif norm_engine in ("ifc-subcomponents", "ifc-parts"):
-        norm_engine = "semantic"
     detail_engine_arg = norm_engine
     # Normalize deprecated force_engine into detail_engine for compatibility
     if (

@@ -22,6 +22,7 @@ from .occ_detail_bootstrap import (
 log = logging.getLogger(__name__)
 
 _OCC_READY = False
+_OCC_UNAVAILABLE_WARNED = False
 
 # NOTE: This module only produces meshes in the local IFC coordinate frame.
 # World/local normalization is handled upstream (process_ifc) via pre/post
@@ -1334,7 +1335,17 @@ def build_detail_mesh_payload(
 ) -> Optional[OCCDetailMesh]:
     """Construct OCC face meshes for detail-mode geometry."""
     logref = logger or log
-    if settings is None or not is_available():
+    occ_available = is_available()
+    if settings is None or not occ_available:
+        if logref and not occ_available:
+            global _OCC_UNAVAILABLE_WARNED
+            if not _OCC_UNAVAILABLE_WARNED:
+                reason = _occ_last_failure() or "unknown reason"
+                logref.warning(
+                    "OCC detail runtime unavailable; skipping OCC detail meshes. (%s)",
+                    reason,
+                )
+                _OCC_UNAVAILABLE_WARNED = True
         return None
     if shape_obj is None and product is None:
         return None

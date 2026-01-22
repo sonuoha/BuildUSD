@@ -99,11 +99,13 @@ Usage (CLI)
   - python -m buildusd --detail-mode --detail-engine semantic  # IFC subcomponents only (no OCC fallback) for all products
   - python -m buildusd --detail-mode --detail-scope object --detail-objects 1265 ubd7n32hksiop  # detail only specific STEP ids / GUIDs
   - python -m buildusd --detail-mode --detail-engine occ --detail-scope object --detail-objects 1265  # OCC-only detail for targeted objects
+  - PowerShell note: GUIDs with `$` must be quoted or escaped, e.g. `--detail-objects '0jNViHeUb9$QjXG30GXDQy'` or ``--detail-objects 0jNViHeUb9`$QjXG30GXDQy``.
 - CLI detail flags (defaults/behavior):
   - `--detail-mode`: off by default; enables the detail pipeline.
   - `--detail-scope`: optional; defaults to `all` when omitted. Use `object` with `--detail-objects`.
-  - `--detail-objects`: space-separated STEP ids and/or GUIDs; used only when scope=object.
-  - `--detail-engine`: `default` (semantic first, OCC fallback), `occ|opencascade` (OCC only), `semantic|ifc-subcomponents|ifc-parts` (semantic only).
+  - `--detail-objects`: space-separated STEP ids and/or GUIDs; implies `--detail-mode` and `--detail-scope object` when supplied.
+  - `--detail-engine`: `default` (semantic first, OCC fallback), `occ|opencascade` (OCC only), `semantic|ifc-subcomponents|ifc-parts` (semantic only). If OCC is unavailable, the engine falls back to semantic with a warning.
+  - Shell quoting: in PowerShell, `$` expands variables; wrap GUIDs in single quotes or escape `$` with a backtick.
 - Update meters-per-unit metadata on an existing USD stage/layer (no IFC conversion):
   - python -m buildusd --set-stage-unit "omniverse://server/Projects/file.usdc" --stage-unit-value 0.001
 - Update up-axis metadata on an existing USD stage/layer (no IFC conversion):
@@ -260,7 +262,8 @@ Detail / remesh
   - `--detail-engine default` (default) tries IFC subcomponents first, then falls back to OCC.
   - `--detail-engine occ|opencascade` skips subcomponents and goes straight to OCC.
   - `--detail-engine semantic|ifc-subcomponents|ifc-parts` runs IFC subcomponent splitting only (no OCC fallback).
-  - `--detail-objects` accepts mixed STEP ids and GUIDs when `--detail-scope object` is used (e.g. `--detail-objects 1265 ubd7n32hksiop`).
+  - `--detail-objects` accepts mixed STEP ids and GUIDs when `--detail-scope object` is used (e.g. `--detail-objects 1265 ubd7n32hksiop`). Supplying `--detail-objects` auto-enables `--detail-mode` and forces `--detail-scope object`.
+  - PowerShell quoting: use single quotes or escape `$` in GUIDs (e.g. `'0jNViHeUb9$QjXG30GXDQy'` or ``0jNViHeUb9`$QjXG30GXDQy``).
   - Env caps: `OCC_DETAIL_FACE_CAP` skips OCC detail when face count exceeds the cap; `OCC_CANONICAL_MAP_FACE_CAP` skips canonical map building when faces exceed the cap or the mesh is single-material with no item ids.
 
 Annotation Curve Width Overrides

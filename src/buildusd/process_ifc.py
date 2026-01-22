@@ -743,6 +743,7 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 _OCC_WARNING_EMITTED = False
+_DETAIL_ENGINE_UNAVAILABLE_WARNED = False
 
 # ---------------------------------
 # Thread count helper
@@ -771,9 +772,48 @@ def _resolve_threads(env_var="IFC_GEOM_THREADS", minimum=1):
 
 threads = _resolve_threads()
 
+
 # ---------------------------------
 # Small utilities
 # ---------------------------------
+def _normalize_detail_engine(raw: Optional[str]) -> str:
+    if raw is None:
+        return "default"
+    engine = str(raw).strip().lower()
+    if not engine:
+        return "default"
+    if engine == "opencascade":
+        return "occ"
+    if engine in ("ifc-subcomponents", "ifc-parts"):
+        return "semantic"
+    if engine not in ("default", "occ", "semantic"):
+        return "default"
+    return engine
+
+
+def _effective_detail_engine(options: "ConversionOptions") -> str:
+    raw = getattr(options, "detail_engine", None)
+    if raw is None:
+        raw = getattr(options, "force_engine", None)
+    engine = _normalize_detail_engine(raw)
+    if engine == "occ" and not occ_detail.is_available():
+        global _DETAIL_ENGINE_UNAVAILABLE_WARNED
+        if not _DETAIL_ENGINE_UNAVAILABLE_WARNED:
+            reason = ""
+            try:
+                reason = occ_detail.why_unavailable()
+            except Exception:
+                reason = ""
+            log.warning(
+                "Detail engine OCC requested but OCC runtime unavailable; "
+                "falling back to semantic splitting.%s",
+                f" ({reason})" if reason else "",
+            )
+            _DETAIL_ENGINE_UNAVAILABLE_WARNED = True
+        return "semantic"
+    return engine
+
+
 _BASE_GEOM_SETTINGS: Dict[str, Any] = {
     "use-world-coords": False,
     "weld-vertices": True,
@@ -1548,17 +1588,14 @@ class PrototypeBuildContext:
             log.info("Detail scope '%s' invalid; defaulting to 'all'.", detail_scope)
             detail_scope = "all"
 
+        force_engine = _effective_detail_engine(options)
+        options.detail_engine = force_engine
+        force_occ = force_engine == "occ"
+        force_semantic_only = force_engine == "semantic"
+
         explicit_semantic = bool(
             getattr(options, "enable_semantic_subcomponents", False)
         )
-
-        # Any detail_mode implies semantics + detail
-        if detail_mode:
-            explicit_semantic = True
-
-        options.enable_semantic_subcomponents = explicit_semantic
-        options.detail_scope = detail_scope
-        options.detail_mode = detail_mode
 
         # Decode explicit object ids / guids
         # Resolve mixed detail object tokens (STEP ids or GUIDs)
@@ -1576,9 +1613,12 @@ class PrototypeBuildContext:
             if text:
                 detail_object_guids.add(text)
 
-        # If explicit objects are provided, force object-scope detail.
+        # If explicit objects are provided, force object-scope detail and enable detail mode.
         if detail_object_ids or detail_object_guids:
             detail_scope = "object"
+            if not detail_mode:
+                log.info("Detail objects provided; enabling detail mode.")
+                detail_mode = True
 
         # Legacy explicit id / guid fields (kept for compatibility)
         for value in getattr(options, "detail_object_ids", tuple()) or tuple():
@@ -1591,16 +1631,26 @@ class PrototypeBuildContext:
             if text:
                 detail_object_guids.add(text)
 
+        prev_explicit_semantic = explicit_semantic
+        if force_occ:
+            explicit_semantic = False
+        else:
+            # Detail mode defaults to semantic splitting unless OCC is forced.
+            if detail_mode:
+                explicit_semantic = True
+            if force_semantic_only:
+                explicit_semantic = True
+        if prev_explicit_semantic and not explicit_semantic:
+            log.info(
+                "Detail engine OCC selected; disabling semantic subcomponent splitting."
+            )
+
+        options.enable_semantic_subcomponents = explicit_semantic
+        options.detail_scope = detail_scope
+        options.detail_mode = detail_mode
+
         detail_mode_requested = detail_mode
         user_high_detail = bool(getattr(options, "enable_high_detail_remesh", False))
-        force_engine = (
-            getattr(
-                options, "detail_engine", getattr(options, "force_engine", "default")
-            )
-            or "default"
-        )
-        force_occ = force_engine == "occ"
-        force_semantic_only = force_engine == "semantic"
 
         if force_occ:
             if detail_scope == "object":
@@ -1610,6 +1660,17 @@ class PrototypeBuildContext:
             else:
                 log.info("Detail engine OCC: applying OCC pipeline to ALL products.")
                 detail_scope = "all"
+        occ_available = (
+            occ_detail.is_available() if force_engine != "semantic" else False
+        )
+        log.info(
+            "Detail engine resolved: engine=%s occ_available=%s detail_mode=%s detail_scope=%s semantic=%s",
+            force_engine,
+            occ_available,
+            detail_mode,
+            detail_scope,
+            explicit_semantic,
+        )
 
         # Instantiate our unified settings manager
         base_geom_settings = dict(_BASE_GEOM_SETTINGS)
@@ -1665,7 +1726,11 @@ class PrototypeBuildContext:
             )
 
         if detail_mode:
-            if detail_scope == "object":
+            if force_occ:
+                log.info(
+                    "Detail engine OCC: semantic splitting disabled; OCC detail will follow detail scope."
+                )
+            elif detail_scope == "object":
                 log.info(
                     "Detail scope 'object': iterator + semantic subcomponents run first; "
                     "OCC detail will be attempted only for selected objects where needed."
@@ -6671,6 +6736,7 @@ def build_prototypes(
 
     start_time = time.perf_counter()
     processed_count = 0
+    detail_match_count = 0
     non_unit_scale_warns = 0
     max_scale_warns = 5
 
@@ -6830,6 +6896,8 @@ def build_prototypes(
                 return None
 
         detail_object_match = ctx.wants_detail_for_product(product_id_int, guid_for_log)
+        if detail_object_match:
+            detail_match_count += 1
         detail_mesh = (
             detail_mesh_cache.get(product_id_int)
             if product_id_int is not None
@@ -7664,6 +7732,11 @@ def build_prototypes(
         )
         if force_occ and detail_requested:
             should_attempt_semantic = False
+        if force_occ and should_attempt_semantic:
+            log.warning(
+                "Detail engine OCC selected but semantic splitting still enabled; forcing it off."
+            )
+            should_attempt_semantic = False
 
         if product_id_int in (461286, 577409, 573013):
             log.info(
@@ -7877,8 +7950,9 @@ def build_prototypes(
                         canonical_map=canonical_map,
                     )
                     if detail_mesh_data is None:
-                        log.debug(
-                            "Detail mode (post-semantic): OCC mesh unavailable for %s guid=%s step=%s name=%s",
+                        log_fn = log.warning if force_occ else log.debug
+                        log_fn(
+                            "Detail engine OCC: mesh unavailable for %s guid=%s step=%s name=%s",
                             product_class_upper or product_class or "<unknown>",
                             getattr(product, "GlobalId", None),
                             step_id,
@@ -7988,6 +8062,17 @@ def build_prototypes(
         if not iterator.next():
             break
 
+    if (
+        ctx.detail_scope == "object"
+        and (ctx.detail_object_ids or ctx.detail_object_guids)
+        and detail_match_count == 0
+    ):
+        log.warning(
+            "Detail scope object requested but no products matched the supplied ids/guids "
+            "(ids=%d guids=%d). Verify the identifiers; in PowerShell, wrap GUIDs with '$' in single quotes.",
+            len(ctx.detail_object_ids),
+            len(ctx.detail_object_guids),
+        )
     annotations: Dict[int, AnnotationCurve] = {}
     if annotation_hooks is not None:
         annotations = extract_annotation_curves(
