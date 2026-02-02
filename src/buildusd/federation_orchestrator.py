@@ -376,6 +376,7 @@ def _apply_federation(
                 use_payloads=True,
                 rebuild=rebuild,
                 frame=_normalize_frame(frame),
+                anchor_mode=group[0].anchor_mode,
             )
         built_master_paths.append(str(master_stage_path))
     return built_master_paths
@@ -410,6 +411,7 @@ def _apply_overall_master(
     fallback_shared_site_base_point: BasePointConfig,
     rebuild: bool,
     frame: Optional[str],
+    anchor_mode: Optional[str],
 ) -> None:
     overall_name = _resolve_overall_master_name(manifest)
     if not overall_name:
@@ -469,6 +471,7 @@ def _apply_overall_master(
             use_payloads=True,
             rebuild=rebuild,
             frame=_normalize_frame(frame),
+            anchor_mode=anchor_mode,
         )
 
 
@@ -542,6 +545,7 @@ def federate_stages(
             fallback_shared_site_base_point=fallback_shared_site_base_point,
             rebuild=rebuild,
             frame=frame,
+            anchor_mode=resolved_anchor_mode,
         )
     finally:
         shutdown_usd_context()

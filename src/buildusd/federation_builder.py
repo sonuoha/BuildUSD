@@ -445,6 +445,7 @@ def build_federated_stage(
     use_payloads: bool = True,
     rebuild: bool = False,
     frame: str = "projected",
+    anchor_mode: Optional[str] = None,
 ) -> None:
     if not payload_paths:
         raise ValueError("No payload paths provided for federation.")
@@ -581,6 +582,47 @@ def build_federated_stage(
                 },
             )
         # anchorProjected is stamped on /World/Geospatial for Kit inspection.
+    except Exception:
+        pass
+    try:
+        geo_prim.CreateAttribute(
+            "ifc:projectedCRS", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(origin_epsg or federation_projected_crs))
+        geo_prim.CreateAttribute(
+            "ifc:geodeticCRS", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(geodetic_crs))
+        geo_prim.CreateAttribute(
+            "ifc:federationOriginMeters", Sdf.ValueTypeNames.Double3, custom=True
+        ).Set((float(origin_e), float(origin_n), float(origin_h)))
+        geo_prim.CreateAttribute(
+            "ifc:federationOriginUnit", Sdf.ValueTypeNames.String, custom=True
+        ).Set("m")
+        geo_prim.CreateAttribute(
+            "ifc:federationOriginEPSG", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(origin_epsg or federation_projected_crs))
+        if anchor_mode:
+            geo_prim.CreateAttribute(
+                "ifc:anchorMode", Sdf.ValueTypeNames.String, custom=True
+            ).Set(str(anchor_mode))
+        world.CreateAttribute(
+            "ifc:projectedCRS", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(origin_epsg or federation_projected_crs))
+        world.CreateAttribute(
+            "ifc:geodeticCRS", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(geodetic_crs))
+        world.CreateAttribute(
+            "ifc:federationOriginMeters", Sdf.ValueTypeNames.Double3, custom=True
+        ).Set((float(origin_e), float(origin_n), float(origin_h)))
+        world.CreateAttribute(
+            "ifc:federationOriginUnit", Sdf.ValueTypeNames.String, custom=True
+        ).Set("m")
+        world.CreateAttribute(
+            "ifc:federationOriginEPSG", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(origin_epsg or federation_projected_crs))
+        if anchor_mode:
+            world.CreateAttribute(
+                "ifc:anchorMode", Sdf.ValueTypeNames.String, custom=True
+            ).Set(str(anchor_mode))
     except Exception:
         pass
     try:
