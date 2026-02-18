@@ -15,6 +15,7 @@ from .conversion import (
 from .federation_orchestrator import (
     _apply_federation,
     _candidate_stage_files,
+    federate_into_stage,
     _load_manifest,
     _normalise_stage_root,
     _normalize_anchor_mode,
@@ -51,8 +52,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--manifest",
         dest="manifest_path",
-        required=True,
+        default=None,
         help="Manifest describing federation targets.",
+    )
+    parser.add_argument(
+        "--federate-into",
+        dest="federate_into",
+        default=None,
+        help="Explicit target master stage path for append-only federation of the provided stage list.",
     )
     parser.add_argument(
         "--parent-prim",
@@ -102,13 +109,46 @@ def main(argv: Sequence[str] | None = None) -> None:
     masters_root = (
         _normalise_stage_root(args.masters_root) if args.masters_root else stage_root
     )
-    manifest_path = Path(args.manifest_path).resolve()
-    manifest = _load_manifest(manifest_path)
     stage_paths = _candidate_stage_files(stage_root, args.stage_filters)
     if not stage_paths:
         LOG.warning("No stage files discovered under %s", stage_root)
         return
+    LOG.info("Resolved %d stage input(s) from --stage/--stage-root:", len(stage_paths))
+    for stage_path in stage_paths:
+        LOG.info("  - %s", stage_path)
     cli_anchor_mode = _normalize_anchor_mode(args.anchor_mode)
+    manifest = None
+    if args.manifest_path:
+        manifest_path = Path(args.manifest_path).resolve()
+        manifest = _load_manifest(manifest_path)
+    elif not args.federate_into:
+        raise SystemExit("Error: --manifest is required unless --federate-into is set.")
+
+    if args.federate_into:
+        if args.masters_root:
+            LOG.info(
+                "--masters-root is ignored when --federate-into is provided; target path controls output location."
+            )
+        federate_into_stage(
+            stage_paths,
+            out_stage_path=args.federate_into,
+            manifest=manifest,
+            parent_prim=args.parent_prim,
+            map_coordinate_system=args.map_coordinate_system,
+            fallback_shared_site_base_point=DEFAULT_SHARED_BASE_POINT,
+            fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
+            anchor_mode=cli_anchor_mode,
+            frame=args.frame,
+            offline=args.offline,
+            rebuild=args.rebuild,
+        )
+        return
+
+    if manifest is None:
+        raise SystemExit(
+            "Error: --manifest is required for manifest-driven federation."
+        )
+
     tasks = _plan_federation(
         manifest,
         stage_paths,
@@ -143,6 +183,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             fallback_shared_site_base_point=DEFAULT_SHARED_BASE_POINT,
             rebuild=args.rebuild,
             frame=args.frame,
+            anchor_mode=cli_anchor_mode,
         )
     finally:
         shutdown_usd_context()

@@ -2493,30 +2493,64 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
         shutdown_usd_context()
     if getattr(args, "federate", False):
         manifest_path = getattr(args, "manifest_path", None)
-        if not manifest_path:
+        manifest = None
+        can_run_federation = True
+        if manifest_path:
+            try:
+                manifest = ConversionManifest.from_file(Path(manifest_path))
+            except Exception as exc:
+                LOG.warning("Failed to load manifest %s: %s", manifest_path, exc)
+                manifest = None
+        elif not getattr(args, "federate_into", None):
             LOG.warning(
                 "--federate requested but no --manifest was supplied; skipping."
             )
-        else:
+            can_run_federation = False
+        if (
+            manifest_path
+            and manifest is None
+            and not getattr(args, "federate_into", None)
+        ):
+            LOG.warning("Federation skipped because manifest could not be loaded.")
+            can_run_federation = False
+        if can_run_federation:
             try:
                 from .federation_orchestrator import (
+                    federate_into_stage as _federate_into_stage,
                     federate_stages as _federate_stages,
                 )
 
-                manifest = ConversionManifest.from_file(Path(manifest_path))
                 stage_paths = [
                     result.stage_path for result in results if result.stage_path
                 ]
                 if stage_paths:
-                    _federate_stages(
-                        stage_paths,
-                        manifest=manifest,
-                        masters_root=args.output_dir or DEFAULT_OUTPUT_ROOT,
-                        map_coordinate_system=args.map_coordinate_system,
-                        anchor_mode=cli_anchor_mode,
-                        frame=getattr(args, "frame", "projected"),
-                        offline=args.offline,
-                    )
+                    if getattr(args, "federate_into", None):
+                        _federate_into_stage(
+                            stage_paths,
+                            out_stage_path=args.federate_into,
+                            manifest=manifest,
+                            parent_prim="/World",
+                            map_coordinate_system=args.map_coordinate_system,
+                            fallback_shared_site_base_point=DEFAULT_SHARED_BASE_POINT,
+                            fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
+                            anchor_mode=cli_anchor_mode,
+                            frame=getattr(args, "frame", "projected"),
+                            offline=args.offline,
+                        )
+                    elif manifest is not None:
+                        _federate_stages(
+                            stage_paths,
+                            manifest=manifest,
+                            masters_root=args.output_dir or DEFAULT_OUTPUT_ROOT,
+                            map_coordinate_system=args.map_coordinate_system,
+                            anchor_mode=cli_anchor_mode,
+                            frame=getattr(args, "frame", "projected"),
+                            offline=args.offline,
+                        )
+                    else:
+                        LOG.warning(
+                            "--federate requested without manifest; use --federate-into to target a single master stage."
+                        )
             except Exception as exc:
                 LOG.warning("Federation failed: %s", exc)
     _print_summary(results)

@@ -78,6 +78,74 @@ def _ensure_wgs84_attr(prim, wgs84: Tuple[float, float, float]) -> None:
     attr.Set((float(wgs84[0]), float(wgs84[1]), float(wgs84[2])))
 
 
+def _is_omniverse_path(value: object) -> bool:
+    try:
+        return str(value).lower().startswith("omniverse://")
+    except Exception:
+        return False
+
+
+def _normalize_payload_path(path: object) -> str:
+    text = str(path)
+    if _is_omniverse_path(text):
+        return text.lower()
+    try:
+        return str(Path(text).resolve()).lower()
+    except Exception:
+        return text.lower()
+
+
+def _existing_payloads(parent_prim) -> Tuple[Dict[str, str], set[str]]:
+    existing_payloads: Dict[str, str] = {}
+    existing_names: set[str] = set()
+    if not parent_prim:
+        return existing_payloads, existing_names
+    try:
+        children = list(parent_prim.GetChildren())
+    except Exception:
+        children = []
+    for child in children:
+        name = child.GetName()
+        existing_names.add(name)
+        payload_path = None
+        data = child.GetCustomData() or {}
+        if "ifc:federation:payloadPath" in data:
+            payload_path = data.get("ifc:federation:payloadPath")
+        if payload_path:
+            existing_payloads[_normalize_payload_path(payload_path)] = name
+            continue
+        if child.HasAuthoredPayloads():
+            payload_items = child.GetPayloads().GetAddedOrExplicitItems() or None
+            if payload_items:
+                try:
+                    existing_payloads[
+                        _normalize_payload_path(payload_items[0].assetPath)
+                    ] = name
+                except Exception:
+                    pass
+            continue
+        if child.HasAuthoredReferences():
+            ref_items = child.GetReferences().GetAddedOrExplicitItems() or None
+            if ref_items:
+                try:
+                    existing_payloads[
+                        _normalize_payload_path(ref_items[0].assetPath)
+                    ] = name
+                except Exception:
+                    pass
+    return existing_payloads, existing_names
+
+
+def _open_stage_for_anchor(path: str):
+    try:
+        return Usd.Stage.Open(str(path), load=Usd.Stage.LoadNone)
+    except Exception:
+        try:
+            return Usd.Stage.Open(str(path), Usd.Stage.LoadNone)
+        except Exception:
+            return Usd.Stage.Open(str(path))
+
+
 @dataclass(frozen=True)
 class GeospatialAnchor:
     prim_path: str
@@ -262,6 +330,7 @@ def federate_sites_geodetic(
     use_site0_as_origin_if_none: bool = True,
     use_payloads: bool = True,
     apply_grid_convergence_rotation: bool = False,
+    preserve_existing: bool = True,
 ) -> None:
     """
     Federate multiple site layers using geodetic ENU deltas.
@@ -280,6 +349,25 @@ def federate_sites_geodetic(
     geo_prim = geo_xf.GetPrim()
 
     origin_wgs84 = federation_origin_wgs84
+    existing_origin = None
+    if preserve_existing:
+        geo_attr = geo_prim.GetAttribute(_WGS84_REF_ATTR)
+        if geo_attr and geo_attr.HasValue():
+            existing_origin = _coerce_vec3(geo_attr.Get())
+    if existing_origin is not None:
+        if origin_wgs84 is not None and any(
+            abs(float(existing_origin[i]) - float(origin_wgs84[i])) > 1.0e-8
+            for i in range(3)
+        ):
+            _log_warn(
+                "Federation origin mismatch; keeping existing WGS84 origin "
+                f"{existing_origin} and ignoring requested {origin_wgs84}."
+            )
+        origin_wgs84 = (
+            float(existing_origin[0]),
+            float(existing_origin[1]),
+            float(existing_origin[2]),
+        )
     if origin_wgs84 is None and use_site0_as_origin_if_none:
         site0 = sites[0]
         layer_path = site0.get("layer_path")
@@ -306,25 +394,48 @@ def federate_sites_geodetic(
         _log_error("Federation origin WGS84 not provided and not derivable.")
         return
 
-    _ensure_wgs84_attr(geo_prim, origin_wgs84)
+    if existing_origin is None:
+        _ensure_wgs84_attr(geo_prim, origin_wgs84)
     if not validate_geodetic_federation_stage(
         federation_stage, geoprim_path=geoprim_path
     ):
         _log_error("Geospatial prim missing WGS84 reference; aborting.")
         return
 
-    _log_info("Phase 2/3: compute federation origin and ENU deltas.")
     origin_lat, origin_lon, origin_h = origin_wgs84
     origin_ecef = wgs84_to_ecef(origin_lat, origin_lon, origin_h)
 
-    _log_info(f"Phase 3/3: payloading {len(sites)} site(s).")
     root_path = Sdf.Path(federation_root)
     if not root_path.IsAbsolutePath():
         root_path = Sdf.Path("/World")
     sites_root = UsdGeom.Xform.Define(federation_stage, root_path)
 
-    used_names: set[str] = set()
+    existing_payload_map, existing_names = _existing_payloads(sites_root.GetPrim())
+    used_names: set[str] = set(existing_names)
+    seen_payloads: set[str] = set()
+    added_count = 0
+    skipped_existing_count = 0
+    skipped_duplicate_input_count = 0
+    skipped_missing_layer_count = 0
+    skipped_open_stage_count = 0
+    skipped_anchor_count = 0
     for site in sites:
+        layer_path = site.get("layer_path")
+        if not layer_path:
+            name_raw = site.get("name") or ""
+            safe_name = _sanitize_name(name_raw)
+            _log_warn(f"Skipping site '{safe_name}': missing layer_path.")
+            skipped_missing_layer_count += 1
+            continue
+        normalized_payload = _normalize_payload_path(layer_path)
+        if normalized_payload in seen_payloads:
+            skipped_duplicate_input_count += 1
+            continue
+        seen_payloads.add(normalized_payload)
+        if preserve_existing and normalized_payload in existing_payload_map:
+            skipped_existing_count += 1
+            continue
+
         name_raw = site.get("name") or Path(site.get("layer_path", "")).stem
         safe_name = _sanitize_name(name_raw)
         if safe_name in used_names:
@@ -334,13 +445,10 @@ def federate_sites_geodetic(
             safe_name = f"{safe_name}_{suffix}"
         used_names.add(safe_name)
 
-        layer_path = site.get("layer_path")
-        if not layer_path:
-            _log_warn(f"Skipping site '{safe_name}': missing layer_path.")
-            continue
-        site_stage = Usd.Stage.Open(str(layer_path))
+        site_stage = _open_stage_for_anchor(str(layer_path))
         if site_stage is None:
             _log_warn(f"Skipping site '{safe_name}': cannot open {layer_path}.")
+            skipped_open_stage_count += 1
             continue
 
         site_geoprim_path = site.get("geoprim_path", geoprim_path)
@@ -348,6 +456,7 @@ def federate_sites_geodetic(
             anchor = read_site_geospatial_anchor(site_stage, site_geoprim_path)
         except Exception as exc:
             _log_warn(f"Skipping site '{safe_name}': {exc}")
+            skipped_anchor_count += 1
             continue
 
         site_wgs84 = anchor.wgs84
@@ -356,6 +465,7 @@ def federate_sites_geodetic(
             site_ecef = wgs84_to_ecef(site_wgs84[0], site_wgs84[1], site_wgs84[2])
         if site_ecef is None:
             _log_warn(f"Skipping site '{safe_name}': no ECEF/WGS84 anchor.")
+            skipped_anchor_count += 1
             continue
 
         d_ecef = (
@@ -382,6 +492,20 @@ def federate_sites_geodetic(
             )
 
         try:
+            site_prim.SetCustomDataByKey("ifc:federation:payloadPath", str(layer_path))
+            site_prim.SetCustomDataByKey(
+                "ifc:federation:delta",
+                {"x": d_enu[0], "y": d_enu[1], "z": d_enu[2]},
+            )
+            if site_wgs84 is not None:
+                site_prim.SetCustomDataByKey(
+                    "ifc:federation:wgs84Anchor",
+                    {
+                        "latitude": site_wgs84[0],
+                        "longitude": site_wgs84[1],
+                        "height": site_wgs84[2],
+                    },
+                )
             geo_prim.SetCustomDataByKey(
                 f"ifc:federation:enuDelta:{safe_name}",
                 {"x": d_enu[0], "y": d_enu[1], "z": d_enu[2]},
@@ -389,16 +513,20 @@ def federate_sites_geodetic(
         except Exception:
             pass
 
-        _log_info(
-            "Federated {name}: wgs84={wgs84} ecef={ecef} d_enu={d_enu}".format(
-                name=safe_name,
-                wgs84=site_wgs84,
-                ecef=site_ecef,
-                d_enu=d_enu,
-            )
-        )
+        added_count += 1
 
-    _log_info("Geodetic federation complete.")
+    _log_info(
+        "Geodetic federation complete: added={added}, skipped_existing={existing}, "
+        "skipped_duplicate_input={dup}, skipped_missing_layer={missing}, "
+        "skipped_open_stage={open_stage}, skipped_anchor={anchor}.".format(
+            added=added_count,
+            existing=skipped_existing_count,
+            dup=skipped_duplicate_input_count,
+            missing=skipped_missing_layer_count,
+            open_stage=skipped_open_stage_count,
+            anchor=skipped_anchor_count,
+        )
+    )
 
 
 if __name__ == "__main__":

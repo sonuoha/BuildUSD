@@ -34,11 +34,23 @@ from .federation.geodetic_federation import (
     validate_geodetic_federation_stage,
 )
 from .usd_context import initialize_usd, shutdown_usd_context
-from .pxr_utils import Usd, UsdGeom
+from .pxr_utils import Sdf, Usd, UsdGeom
 
 LOG = logging.getLogger(__name__)
 
 PathLike = Union[str, Path]
+_WGS84_REF_ATTR = "omni:geospatial:wgs84:reference:referencePosition"
+_UNIT_FACTORS = {
+    "m": 1.0,
+    "meter": 1.0,
+    "meters": 1.0,
+    "mm": 0.001,
+    "millimeter": 0.001,
+    "millimeters": 0.001,
+    "cm": 0.01,
+    "centimeter": 0.01,
+    "centimeters": 0.01,
+}
 
 
 def _force_usdc_filename(name: str) -> str:
@@ -128,18 +140,242 @@ def _resolve_overall_wgs84_origin(
     return None
 
 
+def _normalize_pathlike(value: PathLike) -> str:
+    if isinstance(value, Path):
+        text = str(value)
+    else:
+        text = str(value)
+    if is_omniverse_path(text):
+        return text
+    return str(Path(text).resolve())
+
+
+def _normalize_payload_identifier(path: str) -> str:
+    if is_omniverse_path(path):
+        return str(path).lower()
+    try:
+        return str(Path(path).resolve()).lower()
+    except Exception:
+        return str(path).lower()
+
+
+def _dedupe_payload_paths(
+    payload_paths: Sequence[PathLike], *, out_stage_path: PathLike
+) -> list[str]:
+    normalized_out = _normalize_payload_identifier(_normalize_pathlike(out_stage_path))
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in payload_paths:
+        path_text = _normalize_pathlike(raw)
+        norm = _normalize_payload_identifier(path_text)
+        if norm == normalized_out:
+            LOG.warning(
+                "Skipping payload %s because it matches the target federated stage.",
+                path_text,
+            )
+            continue
+        if norm in seen:
+            continue
+        seen.add(norm)
+        normalized.append(path_text)
+    return normalized
+
+
+def _coerce_dict(value: object) -> Optional[dict]:
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+def _coerce_vec3(value: object) -> Optional[tuple[float, float, float]]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        return (float(value[0]), float(value[1]), float(value[2]))
+    try:
+        if hasattr(value, "__len__") and len(value) >= 3:
+            return (float(value[0]), float(value[1]), float(value[2]))
+    except Exception:
+        pass
+    return None
+
+
+def _unit_factor(unit: Optional[str]) -> float:
+    text = str(unit or "m").strip().lower()
+    return _UNIT_FACTORS.get(text, 1.0)
+
+
+def _coerce_base_point(
+    payload: object, *, default_epsg: Optional[str]
+) -> Optional[BasePointConfig]:
+    mapping = _coerce_dict(payload)
+    if not mapping:
+        return None
+    try:
+        if "easting" in mapping and "northing" in mapping:
+            easting = float(mapping.get("easting", 0.0))
+            northing = float(mapping.get("northing", 0.0))
+            height = float(mapping.get("height", 0.0))
+        elif "x" in mapping and "y" in mapping:
+            easting = float(mapping.get("x", 0.0))
+            northing = float(mapping.get("y", 0.0))
+            height = float(mapping.get("z", 0.0))
+        else:
+            return None
+    except Exception:
+        return None
+    factor = _unit_factor(mapping.get("unit"))
+    epsg = mapping.get("epsg") or default_epsg
+    return BasePointConfig(
+        easting=easting * factor,
+        northing=northing * factor,
+        height=height * factor,
+        unit="m",
+        epsg=str(epsg).strip() if epsg else None,
+    )
+
+
+def _string_or_none(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _get_custom_data(prim, key: str) -> object:
+    if not prim:
+        return None
+    try:
+        return prim.GetCustomDataByKey(key)
+    except Exception:
+        return None
+
+
+def _resolve_existing_stage_hints(
+    out_stage_path: str,
+) -> tuple[
+    Optional[BasePointConfig],
+    Optional[str],
+    Optional[str],
+    Optional[tuple[float, float, float]],
+]:
+    try:
+        stage = Usd.Stage.Open(out_stage_path, load=Usd.Stage.LoadNone)
+    except Exception:
+        try:
+            stage = Usd.Stage.Open(out_stage_path, Usd.Stage.LoadNone)
+        except Exception:
+            stage = Usd.Stage.Open(out_stage_path)
+    if stage is None:
+        return (None, None, None, None)
+
+    layer = stage.GetRootLayer()
+    layer_data = dict(getattr(layer, "customLayerData", {}) or {})
+    world = stage.GetPrimAtPath("/World")
+    geo = stage.GetPrimAtPath("/World/Geospatial")
+
+    projected_crs = _string_or_none(layer_data.get("projectedCRS"))
+    geodetic_crs = _string_or_none(layer_data.get("geodeticCRS"))
+    if projected_crs is None:
+        projected_crs = _string_or_none(_get_custom_data(world, "ifc:projectedCRS"))
+    if projected_crs is None:
+        projected_crs = _string_or_none(_get_custom_data(geo, "ifc:projectedCRS"))
+    if geodetic_crs is None:
+        geodetic_crs = _string_or_none(_get_custom_data(world, "ifc:geodeticCRS"))
+    if geodetic_crs is None:
+        geodetic_crs = _string_or_none(_get_custom_data(geo, "ifc:geodeticCRS"))
+
+    origin_payload = (
+        _coerce_dict(layer_data.get("federationOrigin"))
+        or _coerce_dict(_get_custom_data(world, "ifc:federationOrigin"))
+        or _coerce_dict(layer_data.get("anchorProjected"))
+        or _coerce_dict(_get_custom_data(world, "ifc:anchorProjected"))
+        or _coerce_dict(_get_custom_data(geo, "ifc:anchorProjected"))
+    )
+    origin = _coerce_base_point(origin_payload, default_epsg=projected_crs)
+
+    wgs84_origin = None
+    if geo:
+        try:
+            wgs84_attr = geo.GetAttribute(_WGS84_REF_ATTR)
+            if wgs84_attr and wgs84_attr.HasValue():
+                wgs84_origin = _coerce_vec3(wgs84_attr.Get())
+        except Exception:
+            wgs84_origin = None
+
+    return (origin, projected_crs, geodetic_crs, wgs84_origin)
+
+
+def _stamp_geodetic_federation_metadata(
+    stage: Usd.Stage,
+    *,
+    projected_crs: str,
+    geodetic_crs: str,
+    anchor_mode: Optional[str],
+) -> None:
+    world = UsdGeom.Xform.Define(stage, "/World").GetPrim()
+    geo = UsdGeom.Xform.Define(stage, "/World/Geospatial").GetPrim()
+    if world:
+        stage.SetDefaultPrim(world)
+    try:
+        layer = stage.GetRootLayer()
+        layer_data = dict(getattr(layer, "customLayerData", {}) or {})
+        layer_data.update(
+            {
+                "projectedCRS": projected_crs,
+                "geodeticCRS": geodetic_crs,
+                "federationVersion": 1,
+            }
+        )
+        layer.customLayerData = layer_data
+    except Exception:
+        pass
+    for prim in (world, geo):
+        if not prim:
+            continue
+        try:
+            prim.SetCustomDataByKey("ifc:projectedCRS", projected_crs)
+            prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
+            if anchor_mode:
+                prim.SetCustomDataByKey("ifc:anchorMode", anchor_mode)
+        except Exception:
+            pass
+        try:
+            prim.CreateAttribute(
+                "ifc:projectedCRS", Sdf.ValueTypeNames.String, custom=True
+            ).Set(str(projected_crs))
+            prim.CreateAttribute(
+                "ifc:geodeticCRS", Sdf.ValueTypeNames.String, custom=True
+            ).Set(str(geodetic_crs))
+            if anchor_mode:
+                prim.CreateAttribute(
+                    "ifc:anchorMode", Sdf.ValueTypeNames.String, custom=True
+                ).Set(str(anchor_mode))
+        except Exception:
+            pass
+
+
 def _build_geodetic_federated_stage(
     *,
     out_stage_path: str,
     payload_paths: Sequence[str],
     origin_wgs84: Optional[tuple[float, float, float]],
+    projected_crs: str,
+    geodetic_crs: str,
     rebuild: bool,
     use_payloads: bool,
+    anchor_mode: Optional[str],
 ) -> None:
     if rebuild:
         stage = Usd.Stage.CreateNew(out_stage_path)
     else:
-        stage = Usd.Stage.Open(out_stage_path)
+        try:
+            stage = Usd.Stage.Open(out_stage_path, load=Usd.Stage.LoadNone)
+        except Exception:
+            try:
+                stage = Usd.Stage.Open(out_stage_path, Usd.Stage.LoadNone)
+            except Exception:
+                stage = Usd.Stage.Open(out_stage_path)
         if stage is None:
             stage = Usd.Stage.CreateNew(out_stage_path)
     if stage is None:
@@ -156,15 +392,18 @@ def _build_geodetic_federated_stage(
         sites,
         federation_origin_wgs84=origin_wgs84,
         use_payloads=use_payloads,
+        preserve_existing=not rebuild,
     )
     if not validate_geodetic_federation_stage(stage):
         LOG.warning(
             "Geodetic federation validation failed for %s.", path_name(out_stage_path)
         )
-
-    world = stage.GetPrimAtPath("/World")
-    if world:
-        stage.SetDefaultPrim(world)
+    _stamp_geodetic_federation_metadata(
+        stage,
+        projected_crs=projected_crs,
+        geodetic_crs=geodetic_crs,
+        anchor_mode=anchor_mode,
+    )
     stage.GetRootLayer().Save()
 
 
@@ -362,8 +601,11 @@ def _apply_federation(
                 out_stage_path=str(master_stage_path),
                 payload_paths=payload_paths,
                 origin_wgs84=_resolve_wgs84_origin(first_plan),
+                projected_crs=federation_projected_crs,
+                geodetic_crs=geodetic_crs,
                 rebuild=rebuild,
                 use_payloads=True,
+                anchor_mode=group[0].anchor_mode,
             )
         else:
             build_federated_stage(
@@ -457,8 +699,11 @@ def _apply_overall_master(
             out_stage_path=str(overall_stage_path),
             payload_paths=payload_paths,
             origin_wgs84=_resolve_overall_wgs84_origin(manifest),
+            projected_crs=projected_crs,
+            geodetic_crs=geodetic_crs,
             rebuild=rebuild,
             use_payloads=True,
+            anchor_mode=anchor_mode,
         )
     else:
         build_federated_stage(
@@ -473,6 +718,135 @@ def _apply_overall_master(
             frame=_normalize_frame(frame),
             anchor_mode=anchor_mode,
         )
+
+
+def federate_into_stage(
+    payload_paths: Sequence[PathLike],
+    *,
+    out_stage_path: PathLike,
+    manifest: Optional[ConversionManifest] = None,
+    parent_prim: str = "/World",
+    map_coordinate_system: str = "EPSG:7855",
+    fallback_shared_site_base_point: BasePointConfig = DEFAULT_SHARED_BASE_POINT,
+    fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
+    anchor_mode: Optional[str] = None,
+    frame: Optional[str] = None,
+    offline: bool = False,
+    rebuild: bool = False,
+) -> Optional[str]:
+    """Append the provided payload stages into one target federated stage."""
+
+    if not payload_paths:
+        return None
+
+    out_stage = _normalize_pathlike(out_stage_path)
+    normalized_payloads = _dedupe_payload_paths(payload_paths, out_stage_path=out_stage)
+    if not normalized_payloads:
+        LOG.warning("No payload stages left to federate into %s.", out_stage)
+        return None
+    LOG.info("Resolved payload list for federate-into:")
+    for payload in normalized_payloads:
+        LOG.info("  - %s", payload)
+
+    if not is_omniverse_path(out_stage):
+        ensure_parent_directory(out_stage)
+
+    resolved_anchor_mode = _normalize_anchor_mode(anchor_mode)
+    federation_origin = fallback_shared_site_base_point
+    projected_crs = map_coordinate_system
+    geodetic_crs = fallback_geodetic_crs
+    origin_wgs84 = None
+
+    if manifest is not None:
+        defaults = manifest.defaults
+        federation_origin = (
+            defaults.overall_base_point
+            or defaults.overall_shared_site_base_point
+            or defaults.shared_site_base_point
+            or fallback_shared_site_base_point
+        )
+        projected_crs = defaults.projected_crs or projected_crs
+        geodetic_crs = defaults.geodetic_crs or geodetic_crs
+        origin_wgs84 = _resolve_overall_wgs84_origin(manifest)
+    else:
+        LOG.info(
+            "No manifest supplied for federate-into; using existing target-stage metadata and built-in fallbacks."
+        )
+
+    frame_mode = _normalize_frame(frame)
+    LOG.info(
+        "Federate-into start: target=%s, payloads=%d, frame=%s, rebuild=%s, anchor_mode=%s",
+        out_stage,
+        len(normalized_payloads),
+        frame_mode,
+        rebuild,
+        resolved_anchor_mode or "none",
+    )
+
+    initialize_usd(offline=offline)
+    try:
+        if not rebuild:
+            (
+                existing_origin,
+                existing_projected_crs,
+                existing_geodetic_crs,
+                existing_origin_wgs84,
+            ) = _resolve_existing_stage_hints(out_stage)
+            if existing_origin is not None:
+                LOG.info(
+                    "Using existing target-stage projected origin for federate-into: %s",
+                    out_stage,
+                )
+                federation_origin = existing_origin
+            if existing_projected_crs:
+                LOG.info(
+                    "Using existing target-stage projected CRS for federate-into: %s",
+                    existing_projected_crs,
+                )
+                projected_crs = existing_projected_crs
+            if existing_geodetic_crs:
+                geodetic_crs = existing_geodetic_crs
+            if existing_origin_wgs84 is not None:
+                LOG.info(
+                    "Using existing target-stage WGS84 origin for federate-into: %s",
+                    existing_origin_wgs84,
+                )
+                origin_wgs84 = existing_origin_wgs84
+            if existing_origin is None and _normalize_frame(frame) == "projected":
+                LOG.warning(
+                    "Target stage %s has no projected origin metadata; using manifest/CLI hints.",
+                    out_stage,
+                )
+
+        if frame_mode == "geodetic":
+            _build_geodetic_federated_stage(
+                out_stage_path=out_stage,
+                payload_paths=normalized_payloads,
+                origin_wgs84=origin_wgs84,
+                projected_crs=projected_crs,
+                geodetic_crs=geodetic_crs,
+                rebuild=rebuild,
+                use_payloads=True,
+                anchor_mode=resolved_anchor_mode,
+            )
+        else:
+            build_federated_stage(
+                payload_paths=normalized_payloads,
+                out_stage_path=out_stage,
+                federation_origin=federation_origin,
+                federation_projected_crs=projected_crs,
+                geodetic_crs=geodetic_crs,
+                parent_prim_path=parent_prim or "/World",
+                use_payloads=True,
+                rebuild=rebuild,
+                frame=frame_mode,
+                anchor_mode=resolved_anchor_mode,
+            )
+    finally:
+        shutdown_usd_context()
+    LOG.info("Federate-into complete: target=%s", out_stage)
+
+    return out_stage
 
 
 def federate_stages(

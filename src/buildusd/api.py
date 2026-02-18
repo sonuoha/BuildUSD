@@ -12,6 +12,7 @@ from .federation_orchestrator import (
     DEFAULT_MASTER_STAGE,
     DEFAULT_SHARED_BASE_POINT,
     FederationTask,
+    federate_into_stage as _federate_into_stage,
     federate_stages as _federate_stages,
 )
 from .io_utils import is_omniverse_path
@@ -46,6 +47,7 @@ __all__ = [
     "set_stage_unit",
     "set_stage_up_axis",
     "federate_stages",
+    "federate_into_stage",
     "DEFAULT_BASE_POINT",
     "DEFAULT_SHARED_BASE_POINT",
     "DEFAULT_GEODETIC_CRS",
@@ -281,4 +283,45 @@ def federate_stages(settings: FederationSettings) -> Sequence[FederationTask]:
         anchor_mode=_normalize_anchor_mode(settings.anchor_mode),
         frame=settings.frame,
         offline=settings.offline,
+    )
+
+
+def federate_into_stage(
+    stage_paths: Sequence[PathLike],
+    *,
+    out_stage_path: PathLike,
+    manifest: Optional[ConversionManifest] = None,
+    manifest_path: Optional[PathLike] = None,
+    parent_prim: str = FEDERATION_DEFAULTS.parent_prim,
+    map_coordinate_system: str = FEDERATION_DEFAULTS.map_coordinate_system,
+    fallback_shared_site_base_point: BasePointConfig = DEFAULT_SHARED_BASE_POINT,
+    fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
+    anchor_mode: AnchorModeSetting = FEDERATION_DEFAULTS.anchor_mode,
+    frame: FederationFrame = FEDERATION_DEFAULTS.frame,
+    offline: bool = FEDERATION_DEFAULTS.offline,
+    rebuild: bool = False,
+) -> Optional[str]:
+    """Append specific stage payloads into a single target federated stage."""
+
+    manifest_obj = manifest
+    if manifest_obj is None and manifest_path is not None:
+        path_obj = (
+            Path(manifest_path)
+            if not isinstance(manifest_path, Path)
+            else manifest_path
+        )
+        manifest_obj = ConversionManifest.from_file(path_obj.resolve())
+
+    return _federate_into_stage(
+        payload_paths=stage_paths,
+        out_stage_path=out_stage_path,
+        manifest=manifest_obj,
+        parent_prim=parent_prim,
+        map_coordinate_system=map_coordinate_system,
+        fallback_shared_site_base_point=fallback_shared_site_base_point,
+        fallback_geodetic_crs=fallback_geodetic_crs,
+        anchor_mode=_normalize_anchor_mode(anchor_mode),
+        frame=frame,
+        offline=offline,
+        rebuild=rebuild,
     )

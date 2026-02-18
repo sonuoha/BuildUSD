@@ -89,8 +89,10 @@ Usage (CLI)
   - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.json
   - python -m buildusd.federate --stage-root data/output --manifest src/buildusd/config/sample_manifest.yaml --masters-root data/federated --rebuild
   - python -m buildusd --input C:\\path\\to\\dir --all --manifest src/buildusd/config/sample_manifest.yaml --federate
+  - python -m buildusd --input C:\\path\\to\\dir --all --federate --federate-into data/federated/ProjectMaster.usdc
+  - python -m buildusd.federate --stage-root data/output --stage A.usdc B.usdc --federate-into data/federated/ProjectMaster.usdc
 - Federation CLI options (`python -m buildusd.federate`):
-  - `--stage-root`, `--stage`, `--masters-root`, `--manifest`, `--parent-prim`, `--map-coordinate-system`, `--anchor-mode`, `--frame`, `--offline`, `--rebuild`
+  - `--stage-root`, `--stage`, `--masters-root`, `--manifest`, `--federate-into`, `--parent-prim`, `--map-coordinate-system`, `--anchor-mode`, `--frame`, `--offline`, `--rebuild`
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m buildusd --input omniverse://server/Projects/IFC --all
 - Detail routing examples:
@@ -128,7 +130,7 @@ CLI options (summary)
 - Input/output: `--input`, `--output`, `--ifc-names`, `--exclude`, `--all`, `--manifest`
 - Execution: `--offline`, `--checkpoint`, `--usd-format`, `--usd-auto-binary-threshold-mb`, `--map-coordinate-system`, `--geospatial-mode`
 - 2D: `--include-2d`, `--annotation-width-default`, `--annotation-width-rule`, `--annotation-width-config`
-- Anchoring/federation: `--anchor-mode`, `--federate`, `--frame` (federation only)
+- Anchoring/federation: `--anchor-mode`, `--federate`, `--federate-into`, `--frame` (federation only)
 - Detail: `--detail-mode`, `--detail-scope`, `--detail-objects`, `--detail-engine`, `--enable-semantic-subcomponents`, `--semantic-tokens`
 - Utilities: `--set-stage-unit`, `--stage-unit-value`, `--set-stage-up-axis`, `--stage-up-axis`
 
@@ -154,6 +156,7 @@ python -m buildusd
   --include-2d                          Enable 2D annotation extraction
   --anchor-mode {local|basepoint|none}  Anchor mode for model offsets
   --federate                            Run federation after conversion
+  --federate-into PATH                  Explicit target stage for append-only federation
   --frame {projected|geodetic}          Federation frame (used with --federate)
   --geospatial-mode {auto|usd|omni|none} Geospatial metadata mode
   --usd-format {usdc|usda|usd|auto}     Output USD format
@@ -172,7 +175,8 @@ python -m buildusd.federate
   --stage-root PATH                     Root directory containing converted stages
   --stage PATHS...                      Specific stage files to federate
   --masters-root PATH                   Output directory for federated masters
-  --manifest PATH                       Manifest describing federation targets
+  --manifest PATH                       Manifest describing federation targets (optional when --federate-into is set)
+  --federate-into PATH                  Explicit target stage for append-only federation
   --parent-prim PATH                    Parent prim for payloads (default: /World)
   --map-coordinate-system EPSG          Fallback CRS when manifest omits projected_crs
   --anchor-mode {local|basepoint|none}  Match anchoring used by converted stages
@@ -336,11 +340,13 @@ Federated Stage Behavior (via `buildusd.federate`)
 - Each converted USD stage is referenced as a payload under `/World/<safe_name>` in the manifest-selected master stage.
 - The payload targets the stage's default prim so additional `/World` nesting is avoided when possible.
 - The federation output is idempotent: re-running adds missing payloads; use `--rebuild` to recreate the master stage from scratch.
+- `--federate-into` supports append-only payloading into one explicit target stage while preserving previously-authored payloads and per-payload edits that are not part of the new input list.
+- For `--federate-into`, an existing target stage is authoritative for origin/CRS resolution when metadata is present; manifest/default values are treated as fallback hints.
 - If `defaults.overall_master_name` is set, a top-level overall master is built by payloading the per-site master stages.
-- Running `python -m buildusd --federate` after conversion uses the same routing logic as `buildusd.federate` and respects `--anchor-mode`/`--frame` for alignment.
+- Running `python -m buildusd --federate` after conversion uses the same routing logic as `buildusd.federate`, including explicit `--federate-into`, and respects `--anchor-mode`/`--frame` for alignment.
 
 Programmatic Use
-- `from buildusd import api` exposes structured helpers. `api.ConversionSettings` and `api.convert()` mirror the CLI; `api.FederationSettings` and `api.federate_stages()` do the same for master assembly; `api.apply_stage_anchor_transform()` anchors custom USD stages consistently.
+- `from buildusd import api` exposes structured helpers. `api.ConversionSettings` and `api.convert()` mirror the CLI; `api.FederationSettings` and `api.federate_stages()` do the same for manifest-routed master assembly; `api.federate_into_stage()` appends specific stage payloads into one explicit target; `api.apply_stage_anchor_transform()` anchors custom USD stages consistently.
 - `api.CONVERSION_DEFAULTS` / `api.FEDERATION_DEFAULTS` expose the packaged defaults, and `api.DEFAULT_CONVERSION_OPTIONS` offers a ready-to-clone baseline for geometry harvesting.
 - Anchor modes accept `"local"`, `"basepoint"`, or `None`/`"none"`; `none` skips model offsets and only stamps geospatial metadata when a lon/lat override is supplied.
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.

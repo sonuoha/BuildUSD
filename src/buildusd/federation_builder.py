@@ -434,6 +434,26 @@ def _existing_payloads(stage: Usd.Stage, federation_path: Sdf.Path) -> Dict[str,
     return existing
 
 
+def _open_stage_for_anchor(path: str):
+    try:
+        return Usd.Stage.Open(str(path), load=Usd.Stage.LoadNone)
+    except Exception:
+        try:
+            return Usd.Stage.Open(str(path), Usd.Stage.LoadNone)
+        except Exception:
+            return Usd.Stage.Open(str(path))
+
+
+def _open_stage_for_edit(path: str):
+    try:
+        return Usd.Stage.Open(str(path), load=Usd.Stage.LoadNone)
+    except Exception:
+        try:
+            return Usd.Stage.Open(str(path), Usd.Stage.LoadNone)
+        except Exception:
+            return Usd.Stage.Open(str(path))
+
+
 def build_federated_stage(
     payload_paths: Sequence[str],
     out_stage_path: str,
@@ -451,12 +471,20 @@ def build_federated_stage(
         raise ValueError("No payload paths provided for federation.")
 
     frame_mode = _normalize_frame(frame)
+    LOG.info(
+        "build_federated_stage start: out=%s, payloads=%d, frame=%s, rebuild=%s, anchor_mode=%s",
+        out_stage_path,
+        len(payload_paths),
+        frame_mode,
+        rebuild,
+        anchor_mode or "none",
+    )
     stage: Optional[Usd.Stage] = None
     opened_existing = False
     if rebuild:
         stage = Usd.Stage.CreateNew(out_stage_path)
     elif is_omniverse_path(out_stage_path):
-        stage = Usd.Stage.Open(out_stage_path)
+        stage = _open_stage_for_edit(out_stage_path)
         if stage:
             opened_existing = True
         else:
@@ -464,12 +492,17 @@ def build_federated_stage(
     else:
         out_path = Path(out_stage_path)
         if out_path.exists():
-            stage = Usd.Stage.Open(str(out_path))
+            stage = _open_stage_for_edit(str(out_path))
             opened_existing = True
         else:
             stage = Usd.Stage.CreateNew(str(out_path))
     if stage is None:
         raise RuntimeError(f"Failed to open or create stage: {out_stage_path}")
+    LOG.info(
+        "Target federated stage ready: %s (opened_existing=%s)",
+        out_stage_path,
+        opened_existing,
+    )
 
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
@@ -673,26 +706,35 @@ def build_federated_stage(
     existing_payload_map = _existing_payloads(stage, parent_path)
     existing_names = {child.GetName() for child in world.GetChildren()}
     seen_payloads: set[str] = set()
+    added_count = 0
+    skipped_existing_count = 0
+    skipped_duplicate_input_count = 0
+    skipped_no_anchor_count = 0
+    skipped_geodetic_anchor_count = 0
+    skipped_reproject_count = 0
+    skipped_missing_crs_count = 0
 
     for payload_path in payload_paths:
         normalized_payload = _normalize_payload_path(payload_path)
         if normalized_payload in seen_payloads:
+            skipped_duplicate_input_count += 1
             continue
         seen_payloads.add(normalized_payload)
         if normalized_payload in existing_payload_map:
-            LOG.info(
-                "Skipping %s: already federated as %s.",
-                payload_path,
-                existing_payload_map[normalized_payload],
-            )
+            skipped_existing_count += 1
             continue
 
         payload_name = _unique_name(Path(payload_path).stem, existing_names)
         existing_names.add(payload_name)
-        payload_stage = Usd.Stage.Open(str(payload_path))
+        payload_stage = _open_stage_for_anchor(str(payload_path))
+        if payload_stage is None:
+            LOG.warning("Skipping %s: unable to open payload stage.", payload_path)
+            skipped_no_anchor_count += 1
+            continue
         anchor = extract_payload_anchor(payload_stage)
         if not anchor or anchor.anchor_e is None or anchor.anchor_n is None:
             LOG.warning("Skipping %s: no anchor metadata found.", payload_path)
+            skipped_no_anchor_count += 1
             continue
 
         anchor_e = float(anchor.anchor_e)
@@ -709,6 +751,7 @@ def build_federated_stage(
                     "Skipping %s: unable to resolve WGS84 anchor for geodetic frame.",
                     payload_path,
                 )
+                skipped_geodetic_anchor_count += 1
                 continue
             target_ecef = geodetic_to_ecef(
                 anchor_wgs84[0], anchor_wgs84[1], anchor_wgs84[2]
@@ -720,13 +763,6 @@ def build_federated_stage(
                 origin_wgs84[0],
                 origin_wgs84[1],
                 origin_wgs84[2],
-            )
-            LOG.info(
-                "Federate %s: frame=geodetic anchor_wgs84=%s source=%s delta=%s",
-                payload_path,
-                anchor_wgs84,
-                anchor.source,
-                delta,
             )
         else:
             if anchor_crs and anchor_crs != (origin_epsg or federation_projected_crs):
@@ -744,6 +780,7 @@ def build_federated_stage(
                         anchor_crs,
                         origin_epsg or federation_projected_crs,
                     )
+                    skipped_reproject_count += 1
                     continue
                 anchor_e, anchor_n, anchor_h = reproj
             elif anchor_crs is None:
@@ -751,17 +788,10 @@ def build_federated_stage(
                     "Skipping %s: anchor CRS missing and no WGS84 fallback.",
                     payload_path,
                 )
+                skipped_missing_crs_count += 1
                 continue
 
             delta = (anchor_e - origin_e, anchor_n - origin_n, anchor_h - origin_h)
-            LOG.info(
-                "Federate %s: frame=projected anchor=%s (%s) source=%s delta=%s",
-                payload_path,
-                (anchor_e, anchor_n, anchor_h),
-                anchor_crs or anchor.projected_crs,
-                anchor.source,
-                delta,
-            )
 
         payload_prim_path = parent_path.AppendChild(payload_name)
         payload_xf = UsdGeom.Xform.Define(stage, payload_prim_path)
@@ -790,8 +820,22 @@ def build_federated_stage(
         else:
             payload_prim.GetReferences().AddReference(str(payload_path))
         UsdGeom.Imageable(payload_prim).CreatePurposeAttr().Set(UsdGeom.Tokens.default_)
+        added_count += 1
 
     stage.GetRootLayer().Save()
+    LOG.info(
+        "Federation update %s: added=%d, skipped_existing=%d, "
+        "skipped_duplicate_input=%d, skipped_no_anchor=%d, "
+        "skipped_geodetic_anchor=%d, skipped_reproject=%d, skipped_missing_crs=%d",
+        out_stage_path,
+        added_count,
+        skipped_existing_count,
+        skipped_duplicate_input_count,
+        skipped_no_anchor_count,
+        skipped_geodetic_anchor_count,
+        skipped_reproject_count,
+        skipped_missing_crs_count,
+    )
 
 
 def validate_federation(stage_path: str) -> bool:

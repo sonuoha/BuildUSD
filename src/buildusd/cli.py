@@ -169,6 +169,17 @@ def parse_args(
         help="After conversion, assemble/refresh federated master stages from the converted outputs.",
     )
     parser.add_argument(
+        "--federate-into",
+        dest="federate_into",
+        nargs="+",
+        action=_JoinPathAction,
+        default=None,
+        help=(
+            "With --federate, append converted stage payloads into this explicit target master "
+            "stage path instead of manifest-routed masters."
+        ),
+    )
+    parser.add_argument(
         "--frame",
         dest="frame",
         choices=("projected", "geodetic"),
