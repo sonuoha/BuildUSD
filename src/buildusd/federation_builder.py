@@ -72,6 +72,29 @@ def _coerce_anchor_dict(value: Any) -> Optional[Dict[str, Any]]:
     return value
 
 
+def _prim_custom_data_value(prim, key: str) -> Any:
+    if not prim:
+        return None
+    try:
+        value = prim.GetCustomDataByKey(key)
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    try:
+        data = dict(prim.GetCustomData() or {})
+    except Exception:
+        return None
+    if key in data:
+        return data.get(key)
+    current: Any = data
+    for part in str(key).split(":"):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current.get(part)
+    return current
+
+
 def _anchor_from_dict(payload: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
     if payload is None:
         return None
@@ -211,11 +234,12 @@ def _extract_anchor_from_world(stage: Usd.Stage) -> Optional[AnchorInfo]:
     world = stage.GetPrimAtPath("/World")
     if not world:
         return None
-    data = dict(world.GetCustomData() or {})
-    anchor_mode = data.get("ifc:anchorMode")
-    projected_crs = data.get("ifc:projectedCRS")
+    anchor_mode = _prim_custom_data_value(world, "ifc:anchorMode")
+    projected_crs = _prim_custom_data_value(world, "ifc:projectedCRS")
 
-    anchor_payload = _coerce_anchor_dict(data.get("ifc:anchorProjected"))
+    anchor_payload = _coerce_anchor_dict(
+        _prim_custom_data_value(world, "ifc:anchorProjected")
+    )
     if anchor_payload:
         anchor = _anchor_from_dict(anchor_payload)
         if anchor:
@@ -228,8 +252,10 @@ def _extract_anchor_from_world(stage: Usd.Stage) -> Optional[AnchorInfo]:
                 source="world.anchorProjected",
             )
 
-    model_offset = _coerce_anchor_dict(data.get("ifc:modelOffset"))
-    model_offset_type = data.get("ifc:modelOffsetType")
+    model_offset = _coerce_anchor_dict(
+        _prim_custom_data_value(world, "ifc:modelOffset")
+    )
+    model_offset_type = _prim_custom_data_value(world, "ifc:modelOffsetType")
     if anchor_mode and model_offset and model_offset_type:
         anchor = _anchor_from_dict(model_offset)
         if anchor:
@@ -262,12 +288,13 @@ def _extract_anchor_from_geospatial(stage: Usd.Stage) -> Optional[AnchorInfo]:
     geo = stage.GetPrimAtPath("/World/Geospatial")
     if not geo:
         return None
-    data = dict(geo.GetCustomData() or {})
-    anchor_payload = _coerce_anchor_dict(data.get("ifc:anchorProjected"))
+    anchor_payload = _coerce_anchor_dict(
+        _prim_custom_data_value(geo, "ifc:anchorProjected")
+    )
     if anchor_payload:
         anchor = _anchor_from_dict(anchor_payload)
         if anchor:
-            projected = data.get("ifc:projectedCRS")
+            projected = _prim_custom_data_value(geo, "ifc:projectedCRS")
             return AnchorInfo(
                 projected_crs=anchor_payload.get("epsg") or projected,
                 anchor_e=anchor[0],
@@ -405,10 +432,7 @@ def _existing_payloads(stage: Usd.Stage, federation_path: Sdf.Path) -> Dict[str,
     if not fed:
         return existing
     for child in fed.GetChildren():
-        payload_path = None
-        data = child.GetCustomData() or {}
-        if "ifc:federation:payloadPath" in data:
-            payload_path = data.get("ifc:federation:payloadPath")
+        payload_path = _prim_custom_data_value(child, "ifc:federation:payloadPath")
         if payload_path:
             existing[_normalize_payload_path(payload_path)] = child.GetName()
             continue

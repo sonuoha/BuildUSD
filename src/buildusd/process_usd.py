@@ -5432,33 +5432,18 @@ def assign_world_geolocation(
         anchor_mode,
     )
 
-    # Resolve lon/lat/height
-    geo_coord = lonlat_override or _derive_lonlat_from_base_point(
-        base_point, projected_crs
+    anchor_e, anchor_n, anchor_h, anchor_unit = _base_point_components_in_meters(
+        base_point
     )
-    if lonlat_override:
-        LOG.debug(
-            "Using lonlat_override for geospatial reference: lon=%s lat=%s height=%s",
-            lonlat_override.longitude,
-            lonlat_override.latitude,
-            lonlat_override.height,
-        )
-    elif geo_coord:
-        LOG.debug(
-            "Derived geospatial reference: lon=%s lat=%s height=%s from projected_crs=%s",
-            geo_coord.longitude,
-            geo_coord.latitude,
-            geo_coord.height,
-            projected_crs,
-        )
-    if geo_coord is None:
-        LOG.debug(
-            "Geospatial mode %s requested but no lon/lat could be derived; skipping metadata.",
-            mode,
-        )
-        return None
+    anchor_projected = {
+        "easting": float(anchor_e),
+        "northing": float(anchor_n),
+        "height": float(anchor_h),
+        "epsg": str(getattr(base_point, "epsg", None) or projected_crs or ""),
+        "unit": "m",
+    }
 
-    # Normalise units/up-axis for USDGeospatial consumers
+    # Normalise units/up-axis for downstream consumers even when lon/lat reprojection is unavailable.
     meters_per_unit = _unit_factor(unit_hint or getattr(base_point, "unit", None))
     if meters_per_unit <= 0:
         meters_per_unit = 1.0
@@ -5473,29 +5458,14 @@ def assign_world_geolocation(
     except Exception:
         pass
 
-    # Stamp metadata on the prim and root layer for portability (use only crate-friendly scalar types)
+    # Stamp projected/anchor metadata even when geodetic conversion is unavailable.
     try:
-        anchor_e, anchor_n, anchor_h, anchor_unit = _base_point_components_in_meters(
-            base_point
-        )
-        anchor_projected = {
-            "easting": float(anchor_e),
-            "northing": float(anchor_n),
-            "height": float(anchor_h),
-            "epsg": str(getattr(base_point, "epsg", None) or projected_crs or ""),
-            "unit": "m",
-        }
         world_prim.SetCustomDataByKey("ifc:geospatialMode", mode)
         world_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
         world_prim.SetCustomDataByKey("ifc:projectedCRS", projected_crs)
+        world_prim.SetCustomDataByKey("ifc:anchorProjected", anchor_projected)
         if anchor_mode:
             world_prim.SetCustomDataByKey("ifc:anchorMode", str(anchor_mode))
-        coords_payload = {
-            "lon": float(geo_coord.longitude),
-            "lat": float(geo_coord.latitude),
-            "height": float(geo_coord.height) if geo_coord.height is not None else 0.0,
-        }
-        world_prim.SetCustomDataByKey("ifc:geodeticCoordinates", coords_payload)
         if model_offset:
             world_prim.SetCustomDataByKey(
                 "ifc:modelOffset",
@@ -5510,7 +5480,6 @@ def assign_world_geolocation(
     except Exception:
         pass
 
-    # Also expose CRS + anchor metadata as prim properties for consumers that avoid customData.
     try:
         world_prim.CreateAttribute(
             "ifc:projectedCRS", Sdf.ValueTypeNames.String, custom=True
@@ -5518,19 +5487,13 @@ def assign_world_geolocation(
         world_prim.CreateAttribute(
             "ifc:geodeticCRS", Sdf.ValueTypeNames.String, custom=True
         ).Set(str(geodetic_crs))
+        world_prim.CreateAttribute(
+            "ifc:anchorProjectedMeters", Sdf.ValueTypeNames.Double3, custom=True
+        ).Set((float(anchor_e), float(anchor_n), float(anchor_h)))
         if anchor_mode:
             world_prim.CreateAttribute(
                 "ifc:anchorMode", Sdf.ValueTypeNames.Token, custom=True
             ).Set(str(anchor_mode))
-        world_prim.CreateAttribute(
-            "ifc:geodeticCoordinates", Sdf.ValueTypeNames.Double3, custom=True
-        ).Set(
-            (
-                float(geo_coord.longitude),
-                float(geo_coord.latitude),
-                float(geo_coord.height) if geo_coord.height is not None else 0.0,
-            )
-        )
         if model_offset:
             world_prim.CreateAttribute(
                 "ifc:modelOffset", Sdf.ValueTypeNames.Double3, custom=True
@@ -5556,7 +5519,6 @@ def assign_world_geolocation(
                 "geospatialMode": mode,
                 "geodeticCRS": geodetic_crs,
                 "projectedCRS": projected_crs,
-                "geodeticCoordinates": coords_payload,
                 "anchorProjected": anchor_projected,
             }
         )
@@ -5570,6 +5532,74 @@ def assign_world_geolocation(
             }
         if model_offset_type:
             data["modelOffsetType"] = str(model_offset_type)
+        layer.customLayerData = data
+    except Exception:
+        pass
+
+    # Resolve lon/lat/height
+    geo_coord = lonlat_override or _derive_lonlat_from_base_point(
+        base_point, projected_crs
+    )
+    if lonlat_override:
+        LOG.debug(
+            "Using lonlat_override for geospatial reference: lon=%s lat=%s height=%s",
+            lonlat_override.longitude,
+            lonlat_override.latitude,
+            lonlat_override.height,
+        )
+    elif geo_coord:
+        LOG.debug(
+            "Derived geospatial reference: lon=%s lat=%s height=%s from projected_crs=%s",
+            geo_coord.longitude,
+            geo_coord.latitude,
+            geo_coord.height,
+            projected_crs,
+        )
+    if geo_coord is None:
+        LOG.debug(
+            "Geospatial mode %s requested but no lon/lat could be derived; projected metadata was stamped without WGS84 coordinates.",
+            mode,
+        )
+        return None
+
+    # Stamp metadata on the prim and root layer for portability (use only crate-friendly scalar types)
+    try:
+        world_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
+        coords_payload = {
+            "lon": float(geo_coord.longitude),
+            "lat": float(geo_coord.latitude),
+            "height": float(geo_coord.height) if geo_coord.height is not None else 0.0,
+        }
+        world_prim.SetCustomDataByKey("ifc:geodeticCoordinates", coords_payload)
+    except Exception:
+        pass
+
+    # Also expose CRS + anchor metadata as prim properties for consumers that avoid customData.
+    try:
+        world_prim.CreateAttribute(
+            "ifc:geodeticCRS", Sdf.ValueTypeNames.String, custom=True
+        ).Set(str(geodetic_crs))
+        world_prim.CreateAttribute(
+            "ifc:geodeticCoordinates", Sdf.ValueTypeNames.Double3, custom=True
+        ).Set(
+            (
+                float(geo_coord.longitude),
+                float(geo_coord.latitude),
+                float(geo_coord.height) if geo_coord.height is not None else 0.0,
+            )
+        )
+    except Exception:
+        pass
+
+    try:
+        layer = stage.GetRootLayer()
+        data = dict(getattr(layer, "customLayerData", {}) or {})
+        data.update(
+            {
+                "geodeticCRS": geodetic_crs,
+                "geodeticCoordinates": coords_payload,
+            }
+        )
         layer.customLayerData = data
     except Exception:
         pass

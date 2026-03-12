@@ -95,6 +95,29 @@ def _normalize_payload_path(path: object) -> str:
         return text.lower()
 
 
+def _prim_custom_data_value(prim, key: str):
+    if not prim:
+        return None
+    try:
+        value = prim.GetCustomDataByKey(key)
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    try:
+        data = dict(prim.GetCustomData() or {})
+    except Exception:
+        return None
+    if key in data:
+        return data.get(key)
+    current = data
+    for part in str(key).split(":"):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current.get(part)
+    return current
+
+
 def _existing_payloads(parent_prim) -> Tuple[Dict[str, str], set[str]]:
     existing_payloads: Dict[str, str] = {}
     existing_names: set[str] = set()
@@ -107,10 +130,7 @@ def _existing_payloads(parent_prim) -> Tuple[Dict[str, str], set[str]]:
     for child in children:
         name = child.GetName()
         existing_names.add(name)
-        payload_path = None
-        data = child.GetCustomData() or {}
-        if "ifc:federation:payloadPath" in data:
-            payload_path = data.get("ifc:federation:payloadPath")
+        payload_path = _prim_custom_data_value(child, "ifc:federation:payloadPath")
         if payload_path:
             existing_payloads[_normalize_payload_path(payload_path)] = name
             continue
