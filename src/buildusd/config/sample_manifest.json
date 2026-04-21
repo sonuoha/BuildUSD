@@ -1,7 +1,7 @@
 {
   "_comment": "Sample conversion manifest showcasing defaults, master definitions, file rules, and revision metadata.",
   "defaults": {
-    "_comment": "Fallbacks applied to every IFC when no more specific rule overrides them.",
+    "_comment": "Fallbacks applied to every IFC when no more specific rule overrides them. Coordinates are generic Melbourne-area examples.",
     "master": "ARCH",
     "master_name": "Federated Model",
     "projected_crs": "EPSG:7855",
@@ -9,8 +9,8 @@
     "file_revision": "REV-DEFAULT",
     "base_point": {
       "_comment": "Base point expressed in projected units (meters by default).",
-      "easting": 333800.49,
-      "northing": 5809101.468,
+      "easting": 320447.054,
+      "northing": 5812195.56,
       "height": 0.0,
       "unit": "m"
     }
@@ -25,21 +25,21 @@
       "file_revision": "REV-ARCH"
     },
     {
-      "_comment": "Civil master with its own CRS, base point, and geodetic anchor.",
+      "_comment": "Civil master with its own base point and geodetic anchor.",
       "id": "CIVIL",
       "name": "Civil_Master",
-      "projected_crs": "EPSG:7856",
+      "projected_crs": "EPSG:7855",
       "geodetic_crs": "EPSG:4326",
       "file_revision": "REV-CIVIL",
       "base_point": {
-        "easting": 333750.0,
-        "northing": 5809150.0,
+        "easting": 320618.263,
+        "northing": 5812421.336,
         "height": 2.0,
         "unit": "m"
       },
       "lonlat": {
-        "longitude": 144.9631,
-        "latitude": -37.8136,
+        "longitude": 144.962,
+        "latitude": -37.818,
         "height": 2.0
       }
     }
@@ -51,8 +51,8 @@
       "master": "CIVIL",
       "file_revision": "REV-CIV-BATCH-1",
       "base_point": {
-        "easting": 333745.0,
-        "northing": 5809155.0,
+        "easting": 320625.0,
+        "northing": 5812428.0,
         "height": 1.8,
         "unit": "m"
       }
@@ -64,14 +64,14 @@
       "geodetic_crs": "EPSG:4979",
       "file_revision": "REV-BRIDGE-2025Q4",
       "base_point": {
-        "easting": 333905.123,
-        "northing": 5809205.456,
+        "easting": 320878.72,
+        "northing": 5812593.543,
         "height": 4.5,
         "unit": "m"
       },
       "lonlat": {
-        "longitude": 144.9712,
-        "latitude": -37.8129,
+        "longitude": 144.965,
+        "latitude": -37.8165,
         "height": 4.5
       }
     }

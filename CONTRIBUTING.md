@@ -14,14 +14,14 @@ Thanks for your interest in improving BuildUSD! This document outlines the basic
 4. Open a PR with a clear description and checklist of what changed and how it was tested.
 
 ## Development setup
-- Python 3.11+ recommended.
+- Python 3.11 or 3.12 recommended.
 - Create a virtual environment and install dev deps:
-  - `pip install -e .[dev]` (or `uv sync` if you use uv).
+  - `pip install -e ".[dev]"` (or `uv sync` if you use uv).
 - Optional runtimes: pxr USD (offline) or Omniverse Kit; ensure one runtime is available for integration tests.
 
 ## Tests and quality
-- Run lint/format/type checks: `ruff check .`, `black --check .`, `mypy .` (when configured).
-- Run unit/integration tests: `pytest` (when present).
+- Run lint/format/type checks: `ruff check .`, `ruff format --check .`, `mypy .` (when configured).
+- Run unit/integration tests: `pytest`.
 - For IFC → USD integration, use the sample IFC corpus and compare against golden USD outputs if available.
 
 ## Commit style
