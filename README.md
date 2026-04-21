@@ -1,4 +1,4 @@
-IFC → USD Converter (Federated)
+# BuildUSD: IFC to USD Converter (Federated)
 
 Overview
 - Converts IFC files to USD with prototypes, materials, and instances.
@@ -7,19 +7,19 @@ Overview
 - Authors IFC properties/quantities as USD attributes under a BIMData namespace.
 
 Requirements
-- Python ≥ 3.11
+- Python >= 3.11, < 3.13
 - Shared dependencies (see `pyproject.toml`):
-  - `ifcopenshell==0.8.3.post2`
-  - `pyproj==3.7.2` (for CRS transforms)
-  - `numpy`, `click`, `rich`, etc.
-- **Kit mode (default)** – no standalone `usd-core` wheel required. Install Omniverse Kit (``pip install --extra-index-url https://pypi.nvidia.com omniverse-kit``) so `omni.client` and Kit's pxr are available.
-- **Offline mode (`--offline`)** – install a standalone USD build (e.g. ``pip install usd-core``). All paths must be local; `omniverse://` URIs are rejected and checkpointing is skipped.
+  - `ifcopenshell>=0.8.3.post2,<0.9`
+  - `pyproj>=3.7` (for CRS transforms)
+  - `numpy`, `polars`, `PyYAML`, `shapely`, `webcolors`
+- **Kit mode (default)** - no standalone `usd-core` wheel required. Install Omniverse Kit (`pip install --extra-index-url https://pypi.nvidia.com "buildusd[kit]"`) so `omni.client` and Kit's pxr are available.
+- **Offline mode (`--offline`)** - install a standalone USD build (`pip install "buildusd[offline]"`). All paths must be local; `omniverse://` URIs are rejected and checkpointing is skipped.
 
 Support matrix (tested)
 - OS: Windows 10/11, Ubuntu 22.04 (headless OK).
 - Python: 3.11, 3.12.
 - IfcOpenShell: 0.8.3.post2.
-- USD bindings: Omniverse Kit pxr (Kit 105/106), usd-core 24.08.
+- USD bindings: Omniverse Kit pxr, usd-core 25.8.
 - pythonocc: optional; OCC detail requires an OCC-enabled ifcopenshell build.
 
 Environment
@@ -40,14 +40,14 @@ Quick start (Nucleus / Kit)
 - Expected: authored layers on Nucleus; headless Kit session auto-starts.
 
 Install
-- Create/activate venv and install dependencies per your workflow (e.g., ``pip install -e .`` or ``uv sync``).
+- Create/activate venv and install dependencies per your workflow (e.g., `pip install -e ".[offline]"` for local USD use, `pip install -e ".[dev]"` for development, or `uv sync` if you use uv).
 - **Kit mode**
   - Accept the Kit EULA once (PowerShell ``set OMNI_KIT_ACCEPT_EULA=yes``, bash ``export OMNI_KIT_ACCEPT_EULA=yes``).
-  - Install Kit: ``pip install --extra-index-url https://pypi.nvidia.com omniverse-kit``.
+  - Install Kit: `pip install --extra-index-url https://pypi.nvidia.com -e ".[kit]"`.
   - Optional: ``python -c "from omni.kit_app import KitApp; KitApp().shutdown(); print('Omniverse ready')"`` to verify the runtime.
   - The converter auto-starts a headless Kit session whenever an `omniverse://` path is encountered.
 - **Offline mode**
-  - Install ``usd-core`` (or another pxr build) alongside ifcopenshell.
+  - Install `usd-core` (or another pxr build) alongside ifcopenshell via `pip install -e ".[offline]"`.
 - Run ``python -m buildusd ...`` from the repo root, or ``pip install -e .`` for a global CLI.
 - Legacy invocations like ``python -m ifc_converter`` continue to work via a compatibility shim.
 - INFO logs show which directory or Nucleus path is scanned and each IFC file as it starts processing (`PYTHONUNBUFFERED=1` for unbuffered output).
@@ -197,9 +197,8 @@ Model offsets & anchoring
 - MapConversion grid rotation (when applicable) is applied via ifcopenshell model-rotation (quaternion), not USD XformOps.
 - Each IFC file gets its own resolved offset; offsets are not shared across files.
 
-Usage (VS Code)
-- Press F5 and pick one of the provided launch configurations in .vscode/launch.json.
-- Modify args there to suit your inputs.
+Usage (debugging)
+- Run the CLI examples above from an activated environment, or create local editor launch settings with the same arguments. Editor-specific launch files are intentionally not required by the repo.
 
 Usage (Python)
 - from buildusd import convert
@@ -226,7 +225,7 @@ ConversionOptions examples (programmatic)
   - `options = ConversionOptions(include_2d=True)`
 
 Manifest schema
-- Sample manifests live in `src/buildusd/config/sample_manifest.{json,yaml}`. Keep the same structure (masters, base points, CRS). Add a jsonschema alongside your manifests if you want automated validation (e.g., `manifest.schema.json`) and validate with `buildusd validate-manifest` when available.
+- Sample manifests live in `src/buildusd/config/sample_manifest.{json,yaml}`. Keep the same structure (masters, base points, CRS). Add a JSON Schema alongside your manifests if you want automated validation (e.g., `manifest.schema.json`).
 
 Outputs
 - Per-IFC stages and layers are written to data/output:

@@ -1,4 +1,5 @@
 # Sample conversion manifest demonstrating defaults, master routes, and per-file overrides.
+# Coordinates are generic Melbourne-area examples.
 defaults:
   # Optional default federated master id (must match a master.id below).
   master: ARCH
@@ -8,8 +9,8 @@ defaults:
   file_revision: REV-DEFAULT
   base_point:
     # Easting/northing/height in the projected unit (meters here).
-    easting: 333800.49
-    northing: 5809101.468
+    easting: 320447.054
+    northing: 5812195.56
     height: 0.0
     unit: m
 
@@ -22,19 +23,19 @@ masters:
     file_revision: REV-ARCH
 
   - id: CIVIL
-    # Civil discipline master with its own CRS, base point, and lon/lat anchor.
+    # Civil discipline master with its own base point and lon/lat anchor.
     name: Civil_Master
-    projected_crs: EPSG:7856
+    projected_crs: EPSG:7855
     geodetic_crs: EPSG:4326
     file_revision: REV-CIVIL
     base_point:
-      easting: 333750.0
-      northing: 5809150.0
+      easting: 320618.263
+      northing: 5812421.336
       height: 2.0
       unit: m
     lonlat:
-      longitude: 144.9631
-      latitude: -37.8136
+      longitude: 144.962
+      latitude: -37.818
       height: 2.0
 
 files:
@@ -43,8 +44,8 @@ files:
     master: CIVIL
     file_revision: REV-CIV-BATCH-1
     base_point:
-      easting: 333745.0
-      northing: 5809155.0
+      easting: 320625.0
+      northing: 5812428.0
       height: 1.8
       unit: m
 
@@ -54,11 +55,11 @@ files:
     geodetic_crs: EPSG:4979
     file_revision: REV-BRIDGE-2025Q4
     base_point:
-      easting: 333905.123
-      northing: 5809205.456
+      easting: 320878.72
+      northing: 5812593.543
       height: 4.5
       unit: m
     lonlat:
-      longitude: 144.9712
-      latitude: -37.8129
+      longitude: 144.965
+      latitude: -37.8165
       height: 4.5

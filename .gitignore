@@ -9,12 +9,17 @@ wheels/
 
 # Virtual environments
 .venv
+.venv_*/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 
 # Local Development files
 src/dev/*.py
 src/dev/__pycache__/*.pyc
 src/dev/__pycache__/*.pyo
 src/buildusd/config/manifest.yaml
+/scripts/
 
 # Ignore heavy BIM sample files
 /output/*.usd*
@@ -27,15 +32,13 @@ src/buildusd/config/manifest.yaml
 # Generated USD artifacts
 output/
 data/output/
+local_output/
+out_test/
 
-*.sh
-*.bat
-*.ps1
-
-*test*
-/tests*
-/tests/**
-tests/*
+# Heavy test fixtures/golden outputs are kept outside normal Git history.
+/tests/data/ifc/
+/tests/data/usd/
+/tests/**/__pycache__/
 
 # Local git worktrees
 /_worktree_*/
@@ -85,14 +88,13 @@ code-review.csv
 _tmp_update_ifc.py
 tmp_patch.diff
 build_log.txt
+todo/
+todo/**
+.pytest_tmp/
 
 # Empty or misnamed files
 python
 conda
-
-# Ignore
-scripts/
-scripts/*
 
 #media files
 media/media/*
