@@ -17,7 +17,7 @@ We are committed to fostering a welcoming and harassment-free community.
 - Repeated or severe violations may result in temporary or permanent bans.
 
 ## Reporting
-- If you experience or witness unacceptable behavior, please report it privately to the maintainers at security@buildusd.example (replace with the appropriate contact).
+- If you experience or witness unacceptable behavior, please report it privately to the maintainers through the repository's private security advisory flow or another private maintainer contact.
 - All reports will be reviewed promptly and handled confidentially to the extent possible.
 
 ## Attribution

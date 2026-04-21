@@ -1,29 +1,59 @@
 [project]
 name = "buildusd"
 version = "0.1.5"
-description = ""
+description = "Convert IFC building models into USD stages with materials, metadata, georeferencing, and federation support."
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "BuildUSD contributors" }]
+keywords = ["ifc", "usd", "openusd", "bim", "aec", "geospatial"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Scientific/Engineering :: GIS",
+]
 
 dependencies = [
-    "ifcopenshell>=0.8.3",
-    "polars",
-    "numpy",
-    "shapely",
+    "ifcopenshell>=0.8.3.post2,<0.9",
+    "numpy>=1.26",
+    "polars>=1",
+    "pyproj>=3.7",
+    "PyYAML>=6",
+    "shapely>=2",
     "webcolors>=1.12",
-    ]
-[project.optional-dependencies]
-kit = ["omniverse-kit>=108.1", "usd-core>=25.8"]
-conda-extras = ["pythonocc-core==7.8.1"]
-test = ["pytest"]
+]
 
+[project.urls]
+Homepage = "https://github.com/sonuoha/BuildUSD"
+Issues = "https://github.com/sonuoha/BuildUSD/issues"
+Source = "https://github.com/sonuoha/BuildUSD"
+
+[project.optional-dependencies]
+offline = ["usd-core>=25.8"]
+kit = ["omniverse-kit>=108.1"]
+test = ["pytest>=8", "usd-core>=25.8"]
+dev = [
+    "build>=1.2",
+    "mypy>=1.11",
+    "pre-commit>=3.7",
+    "pytest>=8",
+    "ruff>=0.7.2",
+    "usd-core>=25.8",
+]
 
 [project.scripts]
 buildusd = "buildusd.main:main"
 ifc-convert = "buildusd.main:main"
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -31,3 +61,31 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["buildusd*", "ifc_converter*"]
+exclude = ["buildusd.debug*"]
+
+[tool.setuptools.package-data]
+"buildusd.config" = ["sample_*.json", "sample_*.yaml"]
+
+[tool.pytest.ini_options]
+addopts = "-m \"not slow\""
+markers = [
+    "slow: Slow integration/golden snapshot conversions (run in CI or explicitly)",
+]
+testpaths = ["tests"]
+norecursedirs = [
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    ".venv_*",
+    "_worktree_*",
+    "build",
+    "data",
+    "dist",
+    "local_output",
+    "out_test",
+    "patch",
+    "todo",
+]

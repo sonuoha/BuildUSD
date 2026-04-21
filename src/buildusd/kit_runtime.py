@@ -13,14 +13,8 @@ _KIT_THREAD_STOP = None
 
 _BASE_ARGS: list[str] = ["--no-window"]
 _DEFAULT_EXTENSIONS: tuple[str, ...] = ("omni.client", "omni.usd")
-_DEFAULT_EXT_FOLDERS: tuple[str, ...] = (r"C:\Users\samue\_dev\kit-sdk-106\exts",)
+_DEFAULT_EXT_FOLDERS: tuple[str, ...] = ()
 _CESIUM_EXT_ENV = "BUILDUSD_CESIUM_EXT_FOLDERS"
-_CESIUM_DEFAULT_FOLDERS = (
-    r"C:\Users\samue\OneDrive\Documents\Kit\shared\exts",
-    r"C:\Users\samue\OneDrive\Documents\Kit\shared\exts\cesium.omniverse",
-    r"C:\Users\samue\OneDrive\Documents\Kit\shared\exts\cesium.usd.plugins",
-)
-os.environ.setdefault(_CESIUM_EXT_ENV, os.pathsep.join(_CESIUM_DEFAULT_FOLDERS))
 
 
 def _normalize_extensions(extensions: Iterable[str] | None) -> Sequence[str]:
