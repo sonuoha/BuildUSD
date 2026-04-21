@@ -176,6 +176,19 @@ def _extract_anchor_from_layer(layer: Sdf.Layer) -> Optional[AnchorInfo]:
     anchor_mode = data.get("anchorMode") or data.get("ifc:anchorMode")
     projected_crs = data.get("projectedCRS") or data.get("ifc:projectedCRS")
 
+    stage_origin_payload = _coerce_anchor_dict(data.get("stageOriginProjected"))
+    if stage_origin_payload:
+        anchor = _anchor_from_dict(stage_origin_payload)
+        if anchor:
+            return AnchorInfo(
+                projected_crs=stage_origin_payload.get("epsg") or projected_crs,
+                anchor_e=anchor[0],
+                anchor_n=anchor[1],
+                anchor_h=anchor[2],
+                anchor_mode=anchor_mode,
+                source="layer.stageOriginProjected",
+            )
+
     anchor_payload = _coerce_anchor_dict(data.get("anchorProjected"))
     if anchor_payload:
         anchor = _anchor_from_dict(anchor_payload)
@@ -236,6 +249,21 @@ def _extract_anchor_from_world(stage: Usd.Stage) -> Optional[AnchorInfo]:
         return None
     anchor_mode = _prim_custom_data_value(world, "ifc:anchorMode")
     projected_crs = _prim_custom_data_value(world, "ifc:projectedCRS")
+
+    stage_origin_payload = _coerce_anchor_dict(
+        _prim_custom_data_value(world, "ifc:stageOriginProjected")
+    )
+    if stage_origin_payload:
+        anchor = _anchor_from_dict(stage_origin_payload)
+        if anchor:
+            return AnchorInfo(
+                projected_crs=stage_origin_payload.get("epsg") or projected_crs,
+                anchor_e=anchor[0],
+                anchor_n=anchor[1],
+                anchor_h=anchor[2],
+                anchor_mode=anchor_mode,
+                source="world.stageOriginProjected",
+            )
 
     anchor_payload = _coerce_anchor_dict(
         _prim_custom_data_value(world, "ifc:anchorProjected")

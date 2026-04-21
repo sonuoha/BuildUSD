@@ -155,6 +155,11 @@ def _stamp_federation_debug(
     coordinate_operation_m=None,
     localization_applied: Optional[bool] = None,
     localization_skip_reason: Optional[str] = None,
+    resolved_projected_crs: Optional[str] = None,
+    resolved_projected_crs_source: Optional[str] = None,
+    stage_origin_projected_m=None,
+    stage_georef_source: Optional[str] = None,
+    stage_georef_status: Optional[str] = None,
 ) -> None:
     """Stamp small, crate-safe debug metadata for traceability."""
     if stage is None:
@@ -207,6 +212,32 @@ def _stamp_federation_debug(
             world.SetCustomDataByKey(
                 "ifc:federation:localizationSkipReason",
                 str(localization_skip_reason),
+            )
+        if resolved_projected_crs:
+            world.SetCustomDataByKey(
+                "ifc:federation:resolvedProjectedCRS", str(resolved_projected_crs)
+            )
+        if resolved_projected_crs_source:
+            world.SetCustomDataByKey(
+                "ifc:federation:resolvedProjectedCRSSource",
+                str(resolved_projected_crs_source),
+            )
+        if stage_origin_projected_m:
+            world.SetCustomDataByKey(
+                "ifc:federation:stageOriginProjectedMeters",
+                {
+                    "x": stage_origin_projected_m[0],
+                    "y": stage_origin_projected_m[1],
+                    "z": stage_origin_projected_m[2],
+                },
+            )
+        if stage_georef_source:
+            world.SetCustomDataByKey(
+                "ifc:federation:stageGeorefSource", str(stage_georef_source)
+            )
+        if stage_georef_status:
+            world.SetCustomDataByKey(
+                "ifc:federation:stageGeorefStatus", str(stage_georef_status)
             )
     except Exception:
         pass
@@ -1539,6 +1570,9 @@ def _process_single_ifc(
         effective_base_point = (
             plan.base_point if plan and plan.base_point else default_base_point
         )
+        external_projected_crs = (
+            plan.projected_crs if plan and plan.projected_crs else coordinate_system
+        )
         shared_site_point = (
             plan.shared_site_base_point
             if plan and getattr(plan, "shared_site_base_point", None)
@@ -1562,6 +1596,7 @@ def _process_single_ifc(
                 if shared_site_point is not None
                 else None
             ),
+            external_projected_crs=external_projected_crs,
             map_conv=map_conv,
         )
         projected_crs_label = geo_plan.projected_crs_label
@@ -1595,8 +1630,14 @@ def _process_single_ifc(
             )
         if map_conv_active is not None and not has_projected_crs:
             logger.info(
-                "IfcProjectedCRS is missing for %s; using heuristic MapConversion anchoring.",
+                "IfcProjectedCRS is missing for %s; using coordinate operation with external/fallback CRS resolution.",
                 path_name(ifc_path),
+            )
+        for warning in geo_plan.coordinate_reference.warnings:
+            logger.warning(
+                "Coordinate reference warning for %s: %s",
+                path_name(ifc_path),
+                warning,
             )
         if map_conv is not None:
             logger.info(
@@ -1653,13 +1694,16 @@ def _process_single_ifc(
                 "yes" if geo_plan.localization.apply_model_offset else "no",
             )
             logger.debug(
-                "GeoAnchor details: crs=%s has_projected_crs=%s geom_space=%s map_conv_active=%s requested_anchor_source=%s actual_anchor=%s localization=%s info=%s",
+                "GeoAnchor details: ifc_crs=%s resolved_crs=%s resolved_crs_source=%s has_projected_crs=%s geom_space=%s map_conv_active=%s requested_anchor_source=%s actual_anchor=%s stage_origin=%s localization=%s info=%s",
                 projected_crs_label,
+                geo_plan.coordinate_reference.projected_crs,
+                geo_plan.coordinate_reference.projected_crs_source,
                 has_projected_crs,
                 geo_plan.geom_space,
                 "yes" if map_conv_active is not None else "no",
                 geo_plan.localization.requested_anchor_source,
                 geo_plan.georef.projected_anchor_world_m,
+                geo_plan.stage_georef.stage_origin_projected_m,
                 geo_plan.localization,
                 strategy_info,
             )
@@ -1677,7 +1721,7 @@ def _process_single_ifc(
             model_offset_applied = geo_plan.localization.applied_model_offset_m
 
         logger.info(
-            "Localization requested=%s -> modelOffset=%s applied=%s skip_reason=%s georef_origin=%s",
+            "Localization requested=%s -> modelOffset=%s applied=%s skip_reason=%s georef_origin=%s stage_origin=%s georef_status=%s",
             anchor_mode_norm,
             tuple(round(v, 6) for v in geo_plan.localization.candidate_model_offset_m)
             if geo_plan.localization.candidate_model_offset_m
@@ -1685,6 +1729,10 @@ def _process_single_ifc(
             "yes" if model_offset_applied is not None else "no",
             geo_plan.localization.skip_reason,
             geo_plan.georef.georef_origin,
+            tuple(round(v, 6) for v in geo_plan.stage_georef.stage_origin_projected_m)
+            if geo_plan.stage_georef.stage_origin_projected_m
+            else None,
+            geo_plan.stage_georef.status,
         )
 
         logger.info("Building prototypes for %s...", path_name(ifc_path))
@@ -1781,9 +1829,7 @@ def _process_single_ifc(
             raise ValueError(
                 f"No base point configured for {path_name(ifc_path)}; provide a manifest entry or update defaults."
             )
-        projected_crs = (
-            plan.projected_crs if plan and plan.projected_crs else coordinate_system
-        )
+        projected_crs = geo_plan.stage_georef.projected_crs or external_projected_crs
         if not projected_crs:
             raise ValueError(
                 f"No projected CRS available for {path_name(ifc_path)}; supply --map-coordinate-system or manifest override."
@@ -1811,9 +1857,9 @@ def _process_single_ifc(
             else shared_site_point
         )
         georef_base_point: BasePointConfig | None = None
-        if geo_plan.georef.projected_anchor_world_m is not None:
+        if geo_plan.stage_georef.stage_origin_projected_m is not None:
             georef_base_point = _base_point_from_xyz_m(
-                geo_plan.georef.projected_anchor_world_m, projected_crs
+                geo_plan.stage_georef.stage_origin_projected_m, projected_crs
             )
 
         if anchor_mode is not None and georef_base_point is not None:
@@ -1849,6 +1895,11 @@ def _process_single_ifc(
                 model_offset=model_offset_applied,
                 model_offset_type=geo_plan.localization.model_offset_type,
                 anchor_mode=anchor_mode,
+                source_crs=geo_plan.coordinate_reference.source_crs,
+                coordinate_operation_kind=geo_plan.coordinate_reference.coordinate_operation_kind,
+                stage_origin_projected_m=geo_plan.stage_georef.stage_origin_projected_m,
+                georef_source=geo_plan.stage_georef.georef_source,
+                georef_status=geo_plan.stage_georef.status,
             )
         else:
             geodetic_result = None
@@ -1868,6 +1919,11 @@ def _process_single_ifc(
             coordinate_operation_m=geo_plan.georef.coordinate_operation_origin_world_m,
             localization_applied=geo_plan.localization.apply_model_offset,
             localization_skip_reason=geo_plan.localization.skip_reason,
+            resolved_projected_crs=geo_plan.coordinate_reference.projected_crs,
+            resolved_projected_crs_source=geo_plan.coordinate_reference.projected_crs_source,
+            stage_origin_projected_m=geo_plan.stage_georef.stage_origin_projected_m,
+            stage_georef_source=geo_plan.stage_georef.georef_source,
+            stage_georef_status=geo_plan.stage_georef.status,
         )
 
         if resolved_geospatial_mode == "omni":

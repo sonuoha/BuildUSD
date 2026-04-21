@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,6 +52,30 @@ class GeoreferencePlan:
 
 
 @dataclass(frozen=True)
+class CoordinateReference:
+    source_crs: Optional[str]
+    projected_crs: Optional[str]
+    projected_crs_label: Optional[str]
+    projected_crs_source: Optional[str]
+    coordinate_operation_kind: Optional[str]
+    coordinate_operation_source: Optional[str]
+    coordinate_operation_origin_world_m: Optional[tuple[float, float, float]]
+    has_authoritative_operation: bool
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class StageGeoreference:
+    projected_crs: Optional[str]
+    projected_crs_source: Optional[str]
+    stage_origin_projected_m: Optional[tuple[float, float, float]]
+    georef_source: Optional[str]
+    status: str
+    coordinate_operation_origin_world_m: Optional[tuple[float, float, float]]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class IfcGeoreferencingPlan:
     projected_crs_label: Optional[str]
     has_projected_crs: bool
@@ -69,7 +94,41 @@ class IfcGeoreferencingPlan:
     rotation: RotationPlan
     localization: LocalizationPlan
     coordinate_operation_localization: Optional[LocalizationPlan]
+    coordinate_reference: CoordinateReference
     georef: GeoreferencePlan
+    stage_georef: StageGeoreference
+
+
+_EPSG_PATTERN = re.compile(r"\bEPSG[:/ ]?(\d{3,6})\b", re.IGNORECASE)
+
+
+def _normalize_crs_identifier(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    match = _EPSG_PATTERN.search(text)
+    if match:
+        return f"EPSG:{match.group(1)}"
+    if text.upper().startswith("EPSG:"):
+        code = text.split(":", 1)[1].strip()
+        return f"EPSG:{code}" if code else None
+    return text
+
+
+def _ifc_crs_identifier(crs) -> Optional[str]:
+    if crs is None:
+        return None
+    for key in ("Name", "Description", "GeodeticDatum", "MapProjection"):
+        try:
+            value = getattr(crs, key, None)
+        except Exception:
+            value = None
+        normalized = _normalize_crs_identifier(value)
+        if normalized:
+            return normalized
+    return None
 
 
 def _ifc_projected_crs_present(ifc) -> bool:
@@ -96,6 +155,108 @@ def _ifc_projected_crs_label(ifc) -> Optional[str]:
         if parts:
             return " | ".join(parts)
     return None
+
+
+def _ifc_projected_crs_identifier(ifc) -> Optional[str]:
+    try:
+        entries = ifc.by_type("IfcProjectedCRS") or []
+    except Exception:
+        return None
+    for crs in entries:
+        identifier = _ifc_crs_identifier(crs)
+        if identifier:
+            return identifier
+    return None
+
+
+def _discover_ifc_coordinate_operation(
+    ifc,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    try:
+        contexts = ifc.by_type("IfcGeometricRepresentationContext") or []
+    except Exception:
+        return (None, None, None)
+    best_kind: Optional[str] = None
+    best_source_crs: Optional[str] = None
+    best_target_crs: Optional[str] = None
+    for ctx in contexts:
+        ops = getattr(ctx, "HasCoordinateOperation", None) or []
+        for op in ops:
+            if op is None or not hasattr(op, "is_a"):
+                continue
+            kind = None
+            if op.is_a("IfcMapConversion"):
+                kind = "IfcMapConversion"
+            elif op.is_a("IfcRigidOperation"):
+                kind = "IfcRigidOperation"
+            if kind is None:
+                continue
+            source_crs = _ifc_crs_identifier(getattr(op, "SourceCRS", None))
+            target_crs = _ifc_crs_identifier(getattr(op, "TargetCRS", None))
+            if (
+                getattr(ctx, "ContextType", None) == "Model"
+                and getattr(ctx, "CoordinateSpaceDimension", None) == 3
+            ):
+                return (kind, source_crs, target_crs)
+            if best_kind is None:
+                best_kind = kind
+                best_source_crs = source_crs
+                best_target_crs = target_crs
+    return (best_kind, best_source_crs, best_target_crs)
+
+
+def resolve_coordinate_reference(
+    ifc,
+    *,
+    map_conv: Optional[MapConversionData],
+    external_projected_crs: Optional[str],
+) -> CoordinateReference:
+    ifc_projected_crs_label = _ifc_projected_crs_label(ifc)
+    ifc_projected_crs = _ifc_projected_crs_identifier(ifc)
+    operation_kind, source_crs, target_crs = _discover_ifc_coordinate_operation(ifc)
+    coordinate_operation_origin = coordinate_operation_origin_world_m(map_conv)
+    warnings: list[str] = []
+
+    resolved_projected_crs = (
+        target_crs
+        or ifc_projected_crs
+        or _normalize_crs_identifier(external_projected_crs)
+    )
+    if target_crs:
+        projected_crs_source = "ifc_coordinate_operation"
+    elif ifc_projected_crs:
+        projected_crs_source = "ifc_projected_crs"
+    elif external_projected_crs:
+        projected_crs_source = "external"
+    else:
+        projected_crs_source = None
+
+    normalized_external = _normalize_crs_identifier(external_projected_crs)
+    if resolved_projected_crs and normalized_external:
+        if target_crs and normalized_external != target_crs:
+            warnings.append(
+                "external_projected_crs_conflicts_with_ifc_coordinate_operation"
+            )
+        elif (
+            not target_crs
+            and ifc_projected_crs
+            and normalized_external != ifc_projected_crs
+        ):
+            warnings.append("external_projected_crs_conflicts_with_ifc_projected_crs")
+
+    return CoordinateReference(
+        source_crs=source_crs,
+        projected_crs=resolved_projected_crs,
+        projected_crs_label=ifc_projected_crs_label,
+        projected_crs_source=projected_crs_source,
+        coordinate_operation_kind=operation_kind,
+        coordinate_operation_source="ifc_coordinate_operation"
+        if operation_kind is not None
+        else None,
+        coordinate_operation_origin_world_m=coordinate_operation_origin,
+        has_authoritative_operation=map_conv is not None,
+        warnings=tuple(warnings),
+    )
 
 
 def ifc_site_placement_raw(ifc) -> Optional[tuple[float, float, float]]:
@@ -459,6 +620,24 @@ def _stats_after_offset(
     )
 
 
+def _source_point_to_projected_m(
+    point_m: tuple[float, float, float],
+    *,
+    geom_space: str,
+    map_conv: Optional[MapConversionData],
+    unit_scale_m: float,
+) -> Optional[tuple[float, float, float]]:
+    if geom_space == "global":
+        return (
+            float(point_m[0]),
+            float(point_m[1]),
+            float(point_m[2]),
+        )
+    if map_conv is None:
+        return None
+    return mapconv_local_to_world_m(map_conv, point_m, unit_scale_m=unit_scale_m)
+
+
 def decide_localization_plan(
     *,
     points_m: tuple[tuple[float, float, float], ...],
@@ -539,6 +718,80 @@ def decide_localization_plan(
     )
 
 
+def derive_stage_georeference(
+    *,
+    coordinate_reference: CoordinateReference,
+    localization: LocalizationPlan,
+    geom_space: str,
+    map_conv: Optional[MapConversionData],
+    unit_scale_m: float,
+) -> StageGeoreference:
+    warnings = list(coordinate_reference.warnings)
+    stage_origin_projected_m: Optional[tuple[float, float, float]] = None
+    georef_source: Optional[str] = None
+
+    if (
+        localization.apply_model_offset
+        and localization.applied_model_offset_m is not None
+    ):
+        stage_origin_projected_m = _source_point_to_projected_m(
+            localization.applied_model_offset_m,
+            geom_space=geom_space,
+            map_conv=map_conv,
+            unit_scale_m=unit_scale_m,
+        )
+        georef_source = (
+            f"applied_localization:{localization.requested_anchor_source}"
+            if localization.requested_anchor_source
+            else "applied_localization"
+        )
+    elif coordinate_reference.has_authoritative_operation and geom_space == "local":
+        stage_origin_projected_m = _source_point_to_projected_m(
+            (0.0, 0.0, 0.0),
+            geom_space=geom_space,
+            map_conv=map_conv,
+            unit_scale_m=unit_scale_m,
+        )
+        georef_source = "coordinate_operation_stage_origin"
+    elif coordinate_reference.projected_crs is not None and geom_space == "global":
+        stage_origin_projected_m = (0.0, 0.0, 0.0)
+        georef_source = "declared_global_origin"
+
+    if (
+        stage_origin_projected_m is not None
+        and coordinate_reference.has_authoritative_operation
+    ):
+        status = "authoritative"
+    elif (
+        stage_origin_projected_m is not None
+        and coordinate_reference.projected_crs is not None
+    ):
+        status = "declared"
+    else:
+        status = "unknown"
+
+    if (
+        coordinate_reference.has_authoritative_operation
+        and coordinate_reference.projected_crs is None
+    ):
+        warnings.append("coordinate_operation_missing_projected_crs")
+    if (
+        stage_origin_projected_m is None
+        and localization.requested_anchor_world_m is not None
+    ):
+        warnings.append("requested_anchor_did_not_resolve_stage_origin")
+
+    return StageGeoreference(
+        projected_crs=coordinate_reference.projected_crs,
+        projected_crs_source=coordinate_reference.projected_crs_source,
+        stage_origin_projected_m=stage_origin_projected_m,
+        georef_source=georef_source,
+        status=status,
+        coordinate_operation_origin_world_m=coordinate_reference.coordinate_operation_origin_world_m,
+        warnings=tuple(warnings),
+    )
+
+
 def decide_georeference_plan(
     *,
     localization: LocalizationPlan,
@@ -580,10 +833,16 @@ def build_ifc_georeferencing_plan(
     anchor_mode: Optional[str],
     default_pbp_world_m: Optional[tuple[float, float, float]],
     default_shared_site_world_m: Optional[tuple[float, float, float]],
+    external_projected_crs: Optional[str],
     map_conv: Optional[MapConversionData],
 ) -> IfcGeoreferencingPlan:
     projected_crs_label = _ifc_projected_crs_label(ifc)
     has_projected_crs = bool(projected_crs_label) or _ifc_projected_crs_present(ifc)
+    coordinate_reference = resolve_coordinate_reference(
+        ifc,
+        map_conv=map_conv,
+        external_projected_crs=external_projected_crs,
+    )
 
     ifc_site_raw = ifc_site_placement_raw(ifc)
     ifc_site_authored_m = (
@@ -667,6 +926,13 @@ def build_ifc_georeferencing_plan(
         coordinate_operation_localization=coordinate_operation_localization,
         coordinate_operation_origin_world_m=coordinate_operation_world_m,
     )
+    stage_georef = derive_stage_georeference(
+        coordinate_reference=coordinate_reference,
+        localization=localization,
+        geom_space=geom_space,
+        map_conv=map_conv,
+        unit_scale_m=unit_scale_m,
+    )
 
     return IfcGeoreferencingPlan(
         projected_crs_label=projected_crs_label,
@@ -686,5 +952,7 @@ def build_ifc_georeferencing_plan(
         rotation=rotation,
         localization=localization,
         coordinate_operation_localization=coordinate_operation_localization,
+        coordinate_reference=coordinate_reference,
         georef=georef,
+        stage_georef=stage_georef,
     )

@@ -134,6 +134,139 @@ def _derive_lonlat_from_base_point(
         return None
 
 
+def _derive_lonlat_from_projected_m(
+    projected_xyz_m: Tuple[float, float, float], projected_crs: Optional[str]
+) -> Optional[GeodeticCoordinate]:
+    if not _HAVE_PYPROJ:
+        return None
+    if not projected_crs:
+        return None
+    try:
+        key = (projected_crs, "EPSG:4326")
+        transformer = _TRANSFORMER_CACHE.get(key)
+        if transformer is None:
+            src = CRS.from_user_input(projected_crs)
+            dst = CRS.from_epsg(4326)
+            transformer = Transformer.from_crs(src, dst, always_xy=True)
+            _TRANSFORMER_CACHE[key] = transformer
+        longitude, latitude = transformer.transform(
+            float(projected_xyz_m[0]),
+            float(projected_xyz_m[1]),
+        )
+        return GeodeticCoordinate(
+            longitude=float(longitude),
+            latitude=float(latitude),
+            height=float(projected_xyz_m[2]),
+        )
+    except Exception as exc:  # pragma: no cover - logging only
+        LOG.debug(
+            "Unable to derive lon/lat from projected coordinate for CRS %s: %s",
+            projected_crs,
+            exc,
+        )
+        return None
+
+
+def _safe_geospatial_root_paths(stage) -> list[str]:
+    try:
+        paths: list[str] = []
+        for path in _geospatial_root_paths(stage):
+            if hasattr(path, "pathString"):
+                paths.append(path.pathString)
+            else:
+                paths.append(str(path))
+        return paths
+    except Exception:
+        if stage is None:
+            return []
+        paths: list[str] = []
+        world_path = "/World"
+        world_geo = "/World/Geospatial"
+        default_prim = stage.GetDefaultPrim()
+        default_path = default_prim.GetPath().pathString if default_prim else None
+        default_geo = f"{default_path}/Geospatial" if default_path else None
+
+        def _add(path: Optional[str]) -> None:
+            if path and path not in paths:
+                paths.append(path)
+
+        if default_geo and stage.GetPrimAtPath(default_geo):
+            _add(default_geo)
+        if stage.GetPrimAtPath(world_geo):
+            _add(world_geo)
+        if not paths:
+            if default_geo:
+                _add(default_geo)
+            elif stage.GetPrimAtPath(world_path):
+                _add(world_geo)
+        return paths
+
+
+def _safe_get_or_define_geospatial_prim(stage, path: str):
+    try:
+        return ensure_geospatial_root(stage, path).GetPrim()
+    except Exception:
+        try:
+            return stage.DefinePrim(path, "Xform")
+        except Exception:
+            prim = stage.GetPrimAtPath(path)
+            if prim:
+                return prim
+            raise
+
+
+def _safe_author_wgs84_reference_attrs_on_prim(
+    prim,
+    *,
+    latitude: float,
+    longitude: float,
+    altitude_m: float,
+    tangent_plane: str = "ENU",
+    orientation_ypr: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> None:
+    try:
+        _author_wgs84_reference_attrs_on_prim(
+            prim,
+            latitude=latitude,
+            longitude=longitude,
+            altitude_m=altitude_m,
+            tangent_plane=tangent_plane,
+            orientation_ypr=orientation_ypr,
+        )
+    except Exception:
+        pass
+    ref_attr = prim.GetAttribute("omni:geospatial:wgs84:reference:referencePosition")
+    if ref_attr and ref_attr.HasAuthoredValueOpinion():
+        return
+    try:
+        from pxr import Sdf as RawSdf
+
+        value_types = RawSdf.ValueTypeNames
+    except Exception:
+        value_types = Sdf.ValueTypeNames
+    prim.CreateAttribute(
+        "omni:geospatial:wgs84:reference:referencePosition",
+        value_types.Double3,
+        custom=True,
+    ).Set((float(latitude), float(longitude), float(altitude_m)))
+    prim.CreateAttribute(
+        "omni:geospatial:wgs84:reference:tangentPlane",
+        value_types.Token,
+        custom=True,
+    ).Set(str(tangent_plane))
+    prim.CreateAttribute(
+        "omni:geospatial:wgs84:reference:orientation",
+        value_types.Double3,
+        custom=True,
+    ).Set(
+        (
+            float(orientation_ypr[0]),
+            float(orientation_ypr[1]),
+            float(orientation_ypr[2]),
+        )
+    )
+
+
 # ---------------- Name helpers ----------------
 
 
@@ -5401,6 +5534,11 @@ def assign_world_geolocation(
     model_offset: Optional[Tuple[float, float, float]] = None,
     model_offset_type: Optional[str] = None,
     anchor_mode: Optional[str] = None,
+    source_crs: Optional[str] = None,
+    coordinate_operation_kind: Optional[str] = None,
+    stage_origin_projected_m: Optional[Tuple[float, float, float]] = None,
+    georef_source: Optional[str] = None,
+    georef_status: Optional[str] = None,
 ) -> Optional[Tuple[float, float, float]]:
     """
     Author lightweight geospatial metadata on the root prim/layer.
@@ -5442,6 +5580,24 @@ def assign_world_geolocation(
         "epsg": str(getattr(base_point, "epsg", None) or projected_crs or ""),
         "unit": "m",
     }
+    stage_origin_projected = {
+        "easting": float(
+            stage_origin_projected_m[0] if stage_origin_projected_m else anchor_e
+        ),
+        "northing": float(
+            stage_origin_projected_m[1] if stage_origin_projected_m else anchor_n
+        ),
+        "height": float(
+            stage_origin_projected_m[2] if stage_origin_projected_m else anchor_h
+        ),
+        "epsg": str(getattr(base_point, "epsg", None) or projected_crs or ""),
+        "unit": "m",
+    }
+    stage_origin_projected_xyz = (
+        float(stage_origin_projected["easting"]),
+        float(stage_origin_projected["northing"]),
+        float(stage_origin_projected["height"]),
+    )
 
     # Normalise units/up-axis for downstream consumers even when lon/lat reprojection is unavailable.
     meters_per_unit = _unit_factor(unit_hint or getattr(base_point, "unit", None))
@@ -5464,8 +5620,21 @@ def assign_world_geolocation(
         world_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
         world_prim.SetCustomDataByKey("ifc:projectedCRS", projected_crs)
         world_prim.SetCustomDataByKey("ifc:anchorProjected", anchor_projected)
+        world_prim.SetCustomDataByKey(
+            "ifc:stageOriginProjected", stage_origin_projected
+        )
         if anchor_mode:
             world_prim.SetCustomDataByKey("ifc:anchorMode", str(anchor_mode))
+        if source_crs:
+            world_prim.SetCustomDataByKey("ifc:sourceCRS", str(source_crs))
+        if coordinate_operation_kind:
+            world_prim.SetCustomDataByKey(
+                "ifc:coordinateOperationKind", str(coordinate_operation_kind)
+            )
+        if georef_source:
+            world_prim.SetCustomDataByKey("ifc:georefSource", str(georef_source))
+        if georef_status:
+            world_prim.SetCustomDataByKey("ifc:georefStatus", str(georef_status))
         if model_offset:
             world_prim.SetCustomDataByKey(
                 "ifc:modelOffset",
@@ -5490,10 +5659,37 @@ def assign_world_geolocation(
         world_prim.CreateAttribute(
             "ifc:anchorProjectedMeters", Sdf.ValueTypeNames.Double3, custom=True
         ).Set((float(anchor_e), float(anchor_n), float(anchor_h)))
+        world_prim.CreateAttribute(
+            "ifc:stageOriginProjectedMeters",
+            Sdf.ValueTypeNames.Double3,
+            custom=True,
+        ).Set(
+            (
+                float(stage_origin_projected["easting"]),
+                float(stage_origin_projected["northing"]),
+                float(stage_origin_projected["height"]),
+            )
+        )
         if anchor_mode:
             world_prim.CreateAttribute(
                 "ifc:anchorMode", Sdf.ValueTypeNames.Token, custom=True
             ).Set(str(anchor_mode))
+        if source_crs:
+            world_prim.CreateAttribute(
+                "ifc:sourceCRS", Sdf.ValueTypeNames.String, custom=True
+            ).Set(str(source_crs))
+        if coordinate_operation_kind:
+            world_prim.CreateAttribute(
+                "ifc:coordinateOperationKind", Sdf.ValueTypeNames.Token, custom=True
+            ).Set(str(coordinate_operation_kind))
+        if georef_source:
+            world_prim.CreateAttribute(
+                "ifc:georefSource", Sdf.ValueTypeNames.Token, custom=True
+            ).Set(str(georef_source))
+        if georef_status:
+            world_prim.CreateAttribute(
+                "ifc:georefStatus", Sdf.ValueTypeNames.Token, custom=True
+            ).Set(str(georef_status))
         if model_offset:
             world_prim.CreateAttribute(
                 "ifc:modelOffset", Sdf.ValueTypeNames.Double3, custom=True
@@ -5520,10 +5716,19 @@ def assign_world_geolocation(
                 "geodeticCRS": geodetic_crs,
                 "projectedCRS": projected_crs,
                 "anchorProjected": anchor_projected,
+                "stageOriginProjected": stage_origin_projected,
             }
         )
         if anchor_mode:
             data["anchorMode"] = str(anchor_mode)
+        if source_crs:
+            data["sourceCRS"] = str(source_crs)
+        if coordinate_operation_kind:
+            data["coordinateOperationKind"] = str(coordinate_operation_kind)
+        if georef_source:
+            data["georefSource"] = str(georef_source)
+        if georef_status:
+            data["georefStatus"] = str(georef_status)
         if model_offset:
             data["modelOffset"] = {
                 "easting": float(model_offset[0]),
@@ -5537,8 +5742,8 @@ def assign_world_geolocation(
         pass
 
     # Resolve lon/lat/height
-    geo_coord = lonlat_override or _derive_lonlat_from_base_point(
-        base_point, projected_crs
+    geo_coord = lonlat_override or _derive_lonlat_from_projected_m(
+        stage_origin_projected_xyz, projected_crs
     )
     if lonlat_override:
         LOG.debug(
@@ -5549,11 +5754,12 @@ def assign_world_geolocation(
         )
     elif geo_coord:
         LOG.debug(
-            "Derived geospatial reference: lon=%s lat=%s height=%s from projected_crs=%s",
+            "Derived stage-origin geospatial reference: lon=%s lat=%s height=%s from projected_crs=%s projected_origin=%s",
             geo_coord.longitude,
             geo_coord.latitude,
             geo_coord.height,
             projected_crs,
+            stage_origin_projected_xyz,
         )
     if geo_coord is None:
         LOG.debug(
@@ -5571,6 +5777,7 @@ def assign_world_geolocation(
             "height": float(geo_coord.height) if geo_coord.height is not None else 0.0,
         }
         world_prim.SetCustomDataByKey("ifc:geodeticCoordinates", coords_payload)
+        world_prim.SetCustomDataByKey("ifc:stageOriginGeodetic", coords_payload)
     except Exception:
         pass
 
@@ -5588,6 +5795,15 @@ def assign_world_geolocation(
                 float(geo_coord.height) if geo_coord.height is not None else 0.0,
             )
         )
+        world_prim.CreateAttribute(
+            "ifc:stageOriginGeodetic", Sdf.ValueTypeNames.Double3, custom=True
+        ).Set(
+            (
+                float(geo_coord.longitude),
+                float(geo_coord.latitude),
+                float(geo_coord.height) if geo_coord.height is not None else 0.0,
+            )
+        )
     except Exception:
         pass
 
@@ -5598,6 +5814,7 @@ def assign_world_geolocation(
             {
                 "geodeticCRS": geodetic_crs,
                 "geodeticCoordinates": coords_payload,
+                "stageOriginGeodetic": coords_payload,
             }
         )
         layer.customLayerData = data
@@ -5608,18 +5825,12 @@ def assign_world_geolocation(
     # Even in "usd" mode/offline conversion we author the canonical attribute names so Kit consumers can
     # discover the stage georeference without relying on customData keys.
     try:
-        root_layer = stage.GetRootLayer() if stage is not None else None
-        context = (
-            Usd.EditContext(stage, root_layer)
-            if root_layer is not None
-            else nullcontext()
-        )
+        context = nullcontext()
         with context:
-            for geo_path in _geospatial_root_paths(stage):
+            for geo_path in _safe_geospatial_root_paths(stage):
                 try:
-                    geo_xf = ensure_geospatial_root(stage, geo_path.pathString)
-                    geo_prim = geo_xf.GetPrim()
-                    _author_wgs84_reference_attrs_on_prim(
+                    geo_prim = _safe_get_or_define_geospatial_prim(stage, geo_path)
+                    _safe_author_wgs84_reference_attrs_on_prim(
                         geo_prim,
                         latitude=float(geo_coord.latitude),
                         longitude=float(geo_coord.longitude),
@@ -5632,6 +5843,15 @@ def assign_world_geolocation(
                     geo_prim.SetCustomDataByKey("ifc:projectedCRS", projected_crs)
                     geo_prim.SetCustomDataByKey("ifc:geodeticCRS", geodetic_crs)
                     geo_prim.SetCustomDataByKey("ifc:anchorProjected", anchor_projected)
+                    geo_prim.SetCustomDataByKey(
+                        "ifc:stageOriginProjected", stage_origin_projected
+                    )
+                    geo_prim.SetCustomDataByKey(
+                        "ifc:stageOriginGeodetic", coords_payload
+                    )
+                    geo_prim.SetCustomDataByKey(
+                        "ifc:geodeticCoordinates", coords_payload
+                    )
                     if anchor_mode:
                         geo_prim.SetCustomDataByKey("ifc:anchorMode", str(anchor_mode))
                     LOG.debug(
