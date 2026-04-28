@@ -1,0 +1,103 @@
+# Python-generated files
+__pycache__/
+**/__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv_*/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Local Development files
+src/dev/*.py
+src/dev/__pycache__/*.pyc
+src/dev/__pycache__/*.pyo
+src/buildusd/config/manifest.yaml
+/scripts/
+
+# Ignore heavy BIM sample files
+/output/*.usd*
+
+/data/input/rvt/
+/data/input/*.rvt
+/data/input/*.usda
+/data/input/*.ifc
+
+# Generated USD artifacts
+output/
+data/output/
+local_output/
+out_test/
+
+# Heavy test fixtures/golden outputs are kept outside normal Git history.
+/tests/data/ifc/
+/tests/data/usd/
+/tests/**/__pycache__/
+
+# Local git worktrees
+/_worktree_*/
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Debugging files
+/debug
+*debug*.py
+*debug*
+_debug_bbox.py
+_debug_components.py
+_debug_container.py
+_debug_counts.py
+_debug_counts2.py
+_debug_mapping.py
+_debug_matcolors.py
+_debug_material_colors.py
+_debug_materials.py
+_debug_normals.py
+_debug_regions.py
+_debug_style_area.py
+_debug_style_normals.py
+_debug_suelo_components.py
+_debug_*.py
+_tmp*
+container_material_debug.log
+patch/
+run_*.txt
+*.zip
+
+# Log Files
+*.log
+logs/
+logs/*
+logs/**/*
+*logs*.txt
+
+# Temp and local run artifacts
+*.tmp
+*_log.txt
+run_local.txt
+run_log.txt
+code-review.csv
+_tmp_update_ifc.py
+tmp_patch.diff
+build_log.txt
+todo/
+todo/**
+.pytest_tmp/
+
+# Empty or misnamed files
+python
+conda
+
+#media files
+media/media/*
+media/**/*
+media/*/*
+*.mp4

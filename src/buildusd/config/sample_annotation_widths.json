@@ -1,0 +1,18 @@
+{
+  "default": "0.015",
+  "layers": {
+    "Survey*": "12mm",
+    "Alignment*": {"width": 18, "unit": "mm"}
+  },
+  "curves": {
+    "*Centerline*": "0.02"
+  },
+  "layer_curves": {
+    "Alignment*": {
+      "Offset*": "0.01"
+    }
+  },
+  "hierarchies": {
+    "*Level 01*": "0.012"
+  }
+}

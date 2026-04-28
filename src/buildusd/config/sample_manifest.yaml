@@ -1,0 +1,65 @@
+# Sample conversion manifest demonstrating defaults, master routes, and per-file overrides.
+# Coordinates are generic Melbourne-area examples.
+defaults:
+  # Optional default federated master id (must match a master.id below).
+  master: ARCH
+  master_name: Federated Model
+  projected_crs: EPSG:7855
+  geodetic_crs: EPSG:4326
+  file_revision: REV-DEFAULT
+  base_point:
+    # Easting/northing/height in the projected unit (meters here).
+    easting: 320447.054
+    northing: 5812195.56
+    height: 0.0
+    unit: m
+
+masters:
+  - id: ARCH
+    # Architectural master referenced by defaults.master.
+    name: Architecture_Master
+    projected_crs: EPSG:7855
+    geodetic_crs: EPSG:4326
+    file_revision: REV-ARCH
+
+  - id: CIVIL
+    # Civil discipline master with its own base point and lon/lat anchor.
+    name: Civil_Master
+    projected_crs: EPSG:7855
+    geodetic_crs: EPSG:4326
+    file_revision: REV-CIVIL
+    base_point:
+      easting: 320618.263
+      northing: 5812421.336
+      height: 2.0
+      unit: m
+    lonlat:
+      longitude: 144.962
+      latitude: -37.818
+      height: 2.0
+
+files:
+  - pattern: "CIV_*"
+    # Glob-matched IFCs are routed to the CIVIL master with a specific revision and base point.
+    master: CIVIL
+    file_revision: REV-CIV-BATCH-1
+    base_point:
+      easting: 320625.0
+      northing: 5812428.0
+      height: 1.8
+      unit: m
+
+  - name: bridge.ifc
+    # Direct file override specifying CRS, base point, and geographic coordinates.
+    projected_crs: EPSG:7855
+    geodetic_crs: EPSG:4979
+    file_revision: REV-BRIDGE-2025Q4
+    base_point:
+      easting: 320878.72
+      northing: 5812593.543
+      height: 4.5
+      unit: m
+    lonlat:
+      longitude: 144.965
+      latitude: -37.8165
+      height: 4.5
