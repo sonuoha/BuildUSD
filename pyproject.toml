@@ -1,6 +1,6 @@
 [project]
 name = "buildusd"
-version = "0.1.5"
+version = "0.2.0"
 description = "Convert IFC building models into USD stages with materials, metadata, georeferencing, and federation support."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"

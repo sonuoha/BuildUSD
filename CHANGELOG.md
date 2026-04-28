@@ -4,14 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.1.5] - 2026-04-20
+## [0.2.0] - 2026-04-28
+- First curated public release of BuildUSD.
 - Initial public readiness checklist (docs, CI, packaging).
 - Detail pipeline refinements (`detail_mode`, `detail_scope`, `detail_engine`).
 - Geometry override safety and texture path hardening.
 - 2D annotation extraction is now opt-in (`--include-2d` / `include_2d`).
 
-## [0.1.0] - Historical
-- First tagged release of BuildUSD using semantic versioning (SemVer).
+## [Pre-public History]
+- Private development line before the scrubbed public repository.
 - IFC → USD conversion CLI and Python API.
 - Federation tooling and manifest-driven base-point handling.
 - Optional OCC detail meshing and semantic subcomponents.
