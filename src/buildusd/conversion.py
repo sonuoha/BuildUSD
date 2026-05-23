@@ -56,6 +56,7 @@ from .process_usd import (
     create_usd_stage,
     persist_instance_cache,
 )
+from .semantic_graph import persist_semantic_graph
 from .geospatial import resolve_geospatial_mode, maybe_stream_omnigeospatial
 from .usd_context import initialize_usd, shutdown_usd_context
 
@@ -427,6 +428,7 @@ class _OutputLayout:
     instances: PathLike
     geometry2d: PathLike
     cache_dir: PathLike
+    graph_dir: PathLike
 
 
 def _normalize_stage_unit_target(path: PathLike) -> str:
@@ -1138,12 +1140,14 @@ def _build_output_layout(
     instances_dir = join_path(output_root, "instances")
     geometry2d_dir = join_path(output_root, "geometry2d")
     caches_dir = join_path(output_root, "caches")
+    graphs_dir = join_path(output_root, "graphs")
     for directory in (
         prototypes_dir,
         materials_dir,
         instances_dir,
         geometry2d_dir,
         caches_dir,
+        graphs_dir,
     ):
         ensure_directory(directory)
     ext = _normalise_usd_format(usd_format)
@@ -1167,6 +1171,7 @@ def _build_output_layout(
         instances=join_path(instances_dir, f"{base_name}_instances.{ext}"),
         geometry2d=join_path(geometry2d_dir, f"{base_name}_geometry2d.{ext}"),
         cache_dir=caches_dir,
+        graph_dir=graphs_dir,
     )
 
 
@@ -2021,6 +2026,17 @@ def _process_single_ifc(
         }
         if geometry2d_layer:
             layers["annotation"] = str(layout.geometry2d)
+        semantic_graph_path = persist_semantic_graph(
+            layout.graph_dir,
+            base_name,
+            caches,
+            ifc_path=ifc_path,
+            stage_path=layout.stage,
+            layers=layers,
+            projected_crs=projected_crs,
+            geodetic_crs=geodetic_crs,
+        )
+        layers["semantic_graph"] = str(semantic_graph_path)
         coordinates = tuple(geodetic_result) if geodetic_result else None
         close_stage = getattr(stage, "Close", None)
         if callable(close_stage):

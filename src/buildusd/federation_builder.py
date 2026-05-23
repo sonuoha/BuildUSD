@@ -568,6 +568,10 @@ def build_federated_stage(
     if not parent_path:
         parent_path = Sdf.Path("/World")
     world = UsdGeom.Xform.Define(stage, parent_path).GetPrim()
+    try:
+        Usd.ModelAPI(world).SetKind("assembly")
+    except Exception:
+        pass
     stage.SetDefaultPrim(world)
 
     geo = ensure_geospatial_root(stage, f"{parent_path.pathString}/Geospatial")
@@ -847,6 +851,10 @@ def build_federated_stage(
 
         payload_prim_path = parent_path.AppendChild(payload_name)
         payload_xf = UsdGeom.Xform.Define(stage, payload_prim_path)
+        try:
+            Usd.ModelAPI(payload_xf.GetPrim()).SetKind("group")
+        except Exception:
+            pass
         payload_op = payload_xf.AddTranslateOp()
         payload_op.Set(Gf.Vec3d(*delta))
         try:

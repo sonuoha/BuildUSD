@@ -1,0 +1,73 @@
+# BuildUSD manifest for Autodesk Snowdon Towers architectural sample.
+#
+# Native IFC georeferencing:
+# - IfcProjectedCRS.Name: EPSG:2272
+# - CRS description: NAD83 Pennsylvania State Planes, South Zone, US Foot
+# - IfcMapConversion origin: Eastings=0, Northings=0, OrthogonalHeight=0
+# - Project/site is authored in projected/global coordinates.
+defaults:
+  master: SNOWDON_ARCH
+  master_name: Snowdon_Towers_Master
+  projected_crs: EPSG:2272
+  geodetic_crs: EPSG:4326
+  file_revision: SNOWDON-AUTODESK-SAMPLE
+  base_point:
+    # Site RefLatitude/RefLongitude projected to EPSG:2272 and converted to meters.
+    # Lon/lat: -79.88666526944445, 40.02237193833333
+    easting: 417621.5868413142
+    northing: 78713.55271455598
+    height: 0.0
+    unit: m
+    epsg: EPSG:2272
+  shared_site_base_point:
+    # IfcSite.ObjectPlacement converted from IFC feet to meters.
+    easting: 417622.26721960434
+    northing: 78713.98314877761
+    height: 237.89639999999991
+    unit: m
+    epsg: EPSG:2272
+
+masters:
+  - id: SNOWDON_ARCH
+    name: Snowdon_Towers_Architecture_Master
+    projected_crs: EPSG:2272
+    geodetic_crs: EPSG:4326
+    base_point:
+      easting: 417621.5868413142
+      northing: 78713.55271455598
+      height: 0.0
+      unit: m
+      epsg: EPSG:2272
+    shared_site_base_point:
+      easting: 417622.26721960434
+      northing: 78713.98314877761
+      height: 237.89639999999991
+      unit: m
+      epsg: EPSG:2272
+    lonlat:
+      longitude: -79.88666526944445
+      latitude: 40.02237193833333
+      height: 0.0
+
+files:
+  - name: Snowdon Towers Sample Architectural.ifc
+    master: SNOWDON_ARCH
+    projected_crs: EPSG:2272
+    geodetic_crs: EPSG:4326
+    file_revision: SNOWDON-AUTODESK-ARCH
+    base_point:
+      easting: 417621.5868413142
+      northing: 78713.55271455598
+      height: 0.0
+      unit: m
+      epsg: EPSG:2272
+    shared_site_base_point:
+      easting: 417622.26721960434
+      northing: 78713.98314877761
+      height: 237.89639999999991
+      unit: m
+      epsg: EPSG:2272
+    lonlat:
+      longitude: -79.88666526944445
+      latitude: 40.02237193833333
+      height: 0.0

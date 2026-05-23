@@ -12,12 +12,13 @@ Requirements
   - `ifcopenshell>=0.8.3.post2,<0.9`
   - `pyproj>=3.7` (for CRS transforms)
   - `numpy`, `polars`, `PyYAML`, `shapely`, `webcolors`
-- **Kit mode (default)** - no standalone `usd-core` wheel required. Install Omniverse Kit (`pip install --extra-index-url https://pypi.nvidia.com "buildusd[kit]"`) so `omni.client` and Kit's pxr are available.
+- **Kit mode (default)** - Python 3.12 only for the current Omniverse Kit wheels. No standalone `usd-core` wheel is required. Install Omniverse Kit (`pip install --extra-index-url https://pypi.nvidia.com "buildusd[kit]"`) so `omni.client` and Kit's pxr are available.
 - **Offline mode (`--offline`)** - install a standalone USD build (`pip install "buildusd[offline]"`). All paths must be local; `omniverse://` URIs are rejected and checkpointing is skipped.
 
 Support matrix (tested)
 - OS: Windows 10/11, Ubuntu 22.04 (headless OK).
 - Python: 3.11, 3.12.
+- Kit mode: Python 3.12 only, due to current `omniverse-kit` wheel metadata.
 - IfcOpenShell: 0.8.3.post2.
 - USD bindings: Omniverse Kit pxr, usd-core 25.8.
 - pythonocc: optional; OCC detail requires an OCC-enabled ifcopenshell build.
@@ -48,6 +49,10 @@ Install
   - The converter auto-starts a headless Kit session whenever an `omniverse://` path is encountered.
 - **Offline mode**
   - Install `usd-core` (or another pxr build) alongside ifcopenshell via `pip install -e ".[offline]"`.
+- **Optional USD validation**
+  - Install NVIDIA OpenUSD Exchange validation tooling with `pip install -e ".[usd-validation]"`.
+  - Run validator tests with `python -m pytest -m usd_validation --basetemp .pytest_tmp_usd_validation`.
+  - This is currently a test-only quality gate for generated USD assets, not a runtime conversion dependency.
 - Run ``python -m buildusd ...`` from the repo root, or ``pip install -e .`` for a global CLI.
 - Legacy invocations like ``python -m ifc_converter`` continue to work via a compatibility shim.
 - INFO logs show which directory or Nucleus path is scanned and each IFC file as it starts processing (`PYTHONUNBUFFERED=1` for unbuffered output).
@@ -237,6 +242,7 @@ Outputs
     - /World/<file>_Instances preserves the IFC spatial hierarchy (Project/Site/Storey/Class).
     - Optional grouping variants (see src/buildusd/process_usd.py:author_instance_grouping_variant) can reorganize instances on demand without losing the canonical hierarchy.
   - caches/<name>.json stores serialized instance metadata for later regrouping sessions.
+  - graphs/<name>.semantic_graph.json stores a semantic graph sidecar with IFC/USD identity links, source material evidence, decomposition quality, logical composite parts, and targeted enrichment requests for objects that need part-level geometry.
 - Optional federated masters (run `python -m buildusd.federate --manifest ...` after conversion):
   - Creates master stage(s) defined in the manifest without overwriting per-file outputs.
   - Each converted stage is referenced beneath `/World/<safe_name>` so you can compose projects on demand.
@@ -350,6 +356,7 @@ Programmatic Use
 - Anchor modes accept `"local"`, `"basepoint"`, or `None`/`"none"`; `none` skips model offsets and only stamps geospatial metadata when a lon/lat override is supplied.
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
 - Use `ConversionSettings(include_2d=True)` or `ConversionOptions(include_2d=True)` to opt into 2D annotation extraction.
+- `api.build_targeted_enrichment_plan()` reads a semantic graph sidecar and returns object-scope detail options for unresolved composite elements, preferring IFC GUIDs and falling back to STEP ids.
 
 ```python
 from buildusd import api
