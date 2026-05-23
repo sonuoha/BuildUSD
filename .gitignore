@@ -36,7 +36,10 @@ local_output/
 out_test/
 
 # Heavy test fixtures/golden outputs are kept outside normal Git history.
-/tests/data/ifc/
+/tests/data/ifc/*
+!/tests/data/ifc/buildingSMART/
+/tests/data/ifc/buildingSMART/*
+!/tests/data/ifc/buildingSMART/column-straight-rectangle-tessellation.ifc
 /tests/data/usd/
 /tests/**/__pycache__/
 
@@ -91,6 +94,7 @@ build_log.txt
 todo/
 todo/**
 .pytest_tmp/
+.pytest_tmp*/
 
 # Empty or misnamed files
 python

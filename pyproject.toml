@@ -37,8 +37,9 @@ Source = "https://github.com/sonuoha/BuildUSD"
 
 [project.optional-dependencies]
 offline = ["usd-core>=25.8"]
-kit = ["omniverse-kit>=108.1"]
+kit = ["omniverse-kit>=108.1; python_version >= '3.12' and python_version < '3.13'"]
 test = ["pytest>=8", "usd-core>=25.8"]
+usd-validation = ["pytest>=8", "usd-exchange[test]"]
 dev = [
     "build>=1.2",
     "mypy>=1.11",
@@ -71,6 +72,7 @@ exclude = ["buildusd.debug*"]
 addopts = "-m \"not slow\""
 markers = [
     "slow: Slow integration/golden snapshot conversions (run in CI or explicitly)",
+    "usd_validation: Optional NVIDIA Asset Validator checks for generated USD assets",
 ]
 testpaths = ["tests"]
 norecursedirs = [

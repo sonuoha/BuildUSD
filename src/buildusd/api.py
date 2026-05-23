@@ -25,6 +25,12 @@ from .conversion import (
     OPTIONS as DEFAULT_CONVERSION_OPTIONS,
 )
 from .process_usd import apply_stage_anchor_transform
+from .semantic_enrichment import (
+    EnrichmentTarget,
+    TargetedEnrichmentPlan,
+    build_targeted_enrichment_plan,
+    load_semantic_graph,
+)
 
 PathLike = Union[str, Path]
 AnchorMode = Literal["local", "basepoint"]
@@ -53,6 +59,10 @@ __all__ = [
     "DEFAULT_GEODETIC_CRS",
     "DEFAULT_MASTER_STAGE",
     "DEFAULT_CONVERSION_OPTIONS",
+    "EnrichmentTarget",
+    "TargetedEnrichmentPlan",
+    "build_targeted_enrichment_plan",
+    "load_semantic_graph",
 ]
 
 

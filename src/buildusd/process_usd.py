@@ -430,6 +430,10 @@ def create_usd_stage(usd_path, meters_per_unit=1.0):
     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
     stage.SetMetadata("metersPerUnit", float(meters_per_unit))
     world = UsdGeom.Xform.Define(stage, "/World")
+    try:
+        Usd.ModelAPI(world.GetPrim()).SetKind("assembly")
+    except Exception:
+        pass
     stage.SetDefaultPrim(world.GetPrim())
     return stage
 
@@ -2252,13 +2256,29 @@ def write_usd_mesh(
         Vt.IntArray([int(c) for c in payload["face_vertex_counts"]])
     )
 
+    points_np = np.asarray(payload["points"], dtype=np.float32)
+    if points_np.size:
+        min_bounds = points_np.min(axis=0)
+        max_bounds = points_np.max(axis=0)
+        extent = Vt.Vec3fArray(2)
+        extent[0] = Gf.Vec3f(*(float(v) for v in min_bounds[:3]))
+        extent[1] = Gf.Vec3f(*(float(v) for v in max_bounds[:3]))
+        mesh.CreateExtentAttr(extent)
+
     normals_values = payload.get("normals")
-    if normals_values:
+    normals_interp = payload.get("normals_interpolation")
+    if normals_values is None or len(normals_values) == 0:
+        normals_values = _compute_face_varying_normals(
+            points_np,
+            payload["face_vertex_counts"],
+            payload["face_vertex_indices"],
+        )
+        normals_interp = UsdGeom.Tokens.faceVarying
+    if normals_values is not None and len(normals_values) > 0:
         normals_attr = Vt.Vec3fArray(len(normals_values))
         for i, (nx, ny, nz) in enumerate(normals_values):
             normals_attr[i] = Gf.Vec3f(float(nx), float(ny), float(nz))
         mesh.CreateNormalsAttr(normals_attr)
-        normals_interp = payload.get("normals_interpolation")
         if normals_interp:
             mesh.SetNormalsInterpolation(normals_interp)
 
@@ -2360,6 +2380,38 @@ def write_usd_mesh(
         pass
 
     return mesh
+
+
+def _compute_face_varying_normals(
+    points: np.ndarray,
+    face_vertex_counts: Sequence[int],
+    face_vertex_indices: Sequence[int],
+) -> list[tuple[float, float, float]]:
+    """Compute one flat normal per face corner for validator-friendly meshes."""
+    normals: list[tuple[float, float, float]] = []
+    cursor = 0
+    fallback = (0.0, 0.0, 1.0)
+    for count_raw in face_vertex_counts:
+        count = int(count_raw)
+        face_indices = [int(i) for i in face_vertex_indices[cursor : cursor + count]]
+        cursor += count
+        if count < 3:
+            normals.extend([fallback] * max(count, 0))
+            continue
+        try:
+            p0 = points[face_indices[0]]
+            p1 = points[face_indices[1]]
+            p2 = points[face_indices[2]]
+            normal = np.cross(p1 - p0, p2 - p0)
+            length = float(np.linalg.norm(normal))
+            if length <= 1e-12:
+                normal_tuple = fallback
+            else:
+                normal_tuple = tuple(float(v) for v in (normal / length))
+        except Exception:
+            normal_tuple = fallback
+        normals.extend([normal_tuple] * count)
+    return normals
 
 
 def _author_occ_detail_meshes(
@@ -2523,6 +2575,24 @@ def _prepare_writable_layer(layer_path: PathLike) -> Sdf.Layer:
     return Sdf.Layer.CreateNew(identifier)
 
 
+def _author_layer_metadata(stage: Usd.Stage, layer: Sdf.Layer) -> None:
+    """Author standalone stage metadata for sublayers that may be opened directly."""
+    meters_per_unit = float(stage.GetMetadata("metersPerUnit") or 1.0)
+    with Usd.EditContext(stage, layer):
+        world = UsdGeom.Xform.Define(stage, "/World")
+        try:
+            Usd.ModelAPI(world.GetPrim()).SetKind("assembly")
+        except Exception:
+            pass
+    world_spec = layer.GetPrimAtPath("/World")
+    if world_spec is not None:
+        world_spec.specifier = Sdf.SpecifierDef
+        world_spec.typeName = "Xform"
+    layer.defaultPrim = "World"
+    layer.pseudoRoot.SetInfo("upAxis", "Z")
+    layer.pseudoRoot.SetInfo("metersPerUnit", meters_per_unit)
+
+
 def _sublayer_identifier(parent_layer: Sdf.Layer, child_path: PathLike) -> str:
     """
     Compute a stable asset path to author into `parent_layer.subLayerPaths`.
@@ -2627,6 +2697,7 @@ def author_prototype_layer(
     root_sub_path = _sublayer_identifier(root_layer, layer_path)
     if root_sub_path not in root_layer.subLayerPaths:
         root_layer.subLayerPaths.append(root_sub_path)
+    _author_layer_metadata(stage, proto_layer)
 
     proto_root = Sdf.Path("/World/__Prototypes")
     proto_root_detail = Sdf.Path("/World/__PrototypesDetail")
@@ -4399,6 +4470,7 @@ def author_material_layer(
     root_sub_path = _sublayer_identifier(root_layer, layer_path)
     if root_sub_path not in root_layer.subLayerPaths:
         root_layer.subLayerPaths.append(root_sub_path)
+    _author_layer_metadata(stage, material_layer)
 
     proto_sub_path = _sublayer_identifier(proto_layer, layer_path)
     if proto_sub_path not in proto_layer.subLayerPaths:
@@ -4523,6 +4595,7 @@ def author_instance_layer(
     root_sub_path = _sublayer_identifier(root_layer, layer_path)
     if root_sub_path not in root_layer.subLayerPaths:
         root_layer.subLayerPaths.append(root_sub_path)
+    _author_layer_metadata(stage, inst_layer)
 
     inst_root_name = _sanitize_identifier(
         f"{base_name}_Instances", fallback="Instances"
@@ -4622,6 +4695,7 @@ def author_instance_layer(
             xform.ClearXformOpOrder()
             inst_prim = xform.GetPrim()
             Usd.ModelAPI(inst_prim).SetKind("component")
+            record.usd_path = inst_path.pathString
 
             # ✅ Make the INSTANCE prim instanceable (per your requirement)
             inst_prim.SetInstanceable(bool(options.enable_instancing))
@@ -4686,6 +4760,7 @@ def author_instance_layer(
             # Case: semantic sub-parts (no OCC detail mesh)
             if semantic_parts and not has_detail_mesh:
                 geom_root = inst_path.AppendChild("Geom")
+                record.semantic_part_prim_paths = {}
                 for label, part in semantic_parts.items():
                     mesh_name = sanitize_name(label, fallback="Part")
                     part_mesh_dict = {
@@ -4703,6 +4778,9 @@ def author_instance_layer(
                         materials=list(getattr(record, "materials", []) or []),
                         stage_meters_per_unit=stage_meters_per_unit,
                         style_groups=part.get("style_groups") or {},
+                    )
+                    record.semantic_part_prim_paths[str(label)] = (
+                        mesh_geom.GetPath().pathString
                     )
                     if resolved_materials:
                         _apply_material_bindings_to_prim(
@@ -4789,6 +4867,7 @@ def author_instance_layer(
             proto_path = proto_paths.get(record.prototype)
             if proto_path is None:
                 continue
+            record.prototype_path = proto_path.pathString
 
             proto_detail = _prototype_from_key(caches, record.prototype)
             proto_detail_mesh = (
@@ -4806,6 +4885,20 @@ def author_instance_layer(
             refs = ref_prim.GetReferences()
             refs.ClearReferences()
             refs.AddReference("", proto_path)
+            proto_semantic_parts = (
+                getattr(proto_detail, "semantic_parts", {}) if proto_detail else {}
+            ) or {}
+            if proto_semantic_parts:
+                record.semantic_parts = proto_semantic_parts
+                record.semantic_part_prim_paths = {
+                    str(label): ref_path.AppendChild("Geom")
+                    .AppendChild(sanitize_name(label, fallback="Part"))
+                    .pathString
+                    for label in proto_semantic_parts
+                }
+                record.decomposition_quality_hint = "semantic_mesh_parts"
+            elif proto_has_detail:
+                record.decomposition_quality_hint = "occ_detail_parts"
 
             ref_xf = UsdGeom.Xform(ref_prim)
             ref_xf.ClearXformOpOrder()
@@ -5065,6 +5158,7 @@ def author_geometry2d_layer(
     root_sub_path = _sublayer_identifier(root_layer, layer_path)
     if root_sub_path not in root_layer.subLayerPaths:
         root_layer.subLayerPaths.append(root_sub_path)
+    _author_layer_metadata(stage, geom_layer)
 
     name_counters: Dict[Sdf.Path, Dict[str, int]] = defaultdict(dict)
     hierarchy_nodes: Dict[Tuple[Sdf.Path, str, Optional[int]], Sdf.Path] = {}

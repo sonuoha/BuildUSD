@@ -1518,6 +1518,7 @@ class InstanceRecord:
     prototype: Optional[PrototypeKey]
     name: str
     transform: Optional[Tuple[float, ...]]
+    ifc_class: Optional[str] = None
     material_ids: List[int] = field(default_factory=list)
     materials: List[Any] = field(default_factory=list)
     attributes: Dict[str, Any] = field(default_factory=dict)
@@ -1530,6 +1531,10 @@ class InstanceRecord:
     detail_mesh: Optional["OCCDetailMesh"] = None
     semantic_parts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     ifc_path: Optional[str] = None
+    usd_path: Optional[str] = None
+    prototype_path: Optional[str] = None
+    semantic_part_prim_paths: Dict[str, str] = field(default_factory=dict)
+    decomposition_quality_hint: Optional[str] = None
 
 
 @dataclass
@@ -4343,6 +4348,7 @@ def build_prototypes(
             prototype=primary_key,
             name=name,
             transform=instance_transform_tuple,
+            ifc_class=product.is_a() if hasattr(product, "is_a") else None,
             material_ids=list(material_ids),
             materials=_clone_materials(materials),
             attributes=attributes,
