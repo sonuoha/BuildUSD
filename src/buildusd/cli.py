@@ -12,6 +12,16 @@ class _JoinPathAction(argparse.Action):
         setattr(namespace, self.dest, joined or None)
 
 
+def _non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
 def parse_args(
     argv: Sequence[str] | None = None,
     *,
@@ -39,6 +49,84 @@ def parse_args(
         action=_JoinPathAction,
         default=str(default_input_root),
         help="Path to an IFC file or a directory containing IFC files",
+    )
+    parser.add_argument(
+        "--forma-project-id",
+        default=None,
+        help="Autodesk Forma/ACC Data Management project ID",
+    )
+    parser.add_argument(
+        "--forma-project-url",
+        "--base-url",
+        dest="forma_project_url",
+        default=None,
+        help="Base ACC Docs project, folder, or file URL",
+    )
+    parser.add_argument(
+        "--forma-folder-id",
+        default=None,
+        help="Set the base folder using an ACC folder URN",
+    )
+    parser.add_argument(
+        "--forma-version-id",
+        default=None,
+        help="Immutable Autodesk Forma/ACC Data Management file version ID",
+    )
+    parser.add_argument(
+        "--forma-browse",
+        action="store_true",
+        help="Crawl project folders, show RVT/IFC files, and prompt for a selection",
+    )
+    parser.add_argument(
+        "--subfolder",
+        dest="forma_subfolders",
+        action="store_true",
+        help="Include descendants of the folder supplied by the base URL",
+    )
+    parser.add_argument(
+        "--depth",
+        dest="forma_depth",
+        type=_non_negative_int,
+        default=None,
+        metavar="N",
+        help=(
+            "Maximum folder depth below the base folder; 0 is the base folder only, "
+            "1 includes its immediate subfolders"
+        ),
+    )
+    parser.add_argument(
+        "--forma-file",
+        dest="forma_files",
+        action="append",
+        default=[],
+        help="Select a discovered RVT/IFC by name or project-relative glob (repeatable)",
+    )
+    parser.add_argument(
+        "--forma-cache-dir",
+        default=None,
+        help="Local cache for downloaded or translated Forma IFC files",
+    )
+    parser.add_argument(
+        "--forma-ifc-export-setting",
+        default="IFC4 Reference View",
+        help="APS RVT-to-IFC export setting (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--forma-force-translation",
+        action="store_true",
+        help="Ask APS Model Derivative to regenerate an RVT-to-IFC derivative",
+    )
+    parser.add_argument(
+        "--forma-translation-timeout-seconds",
+        type=float,
+        default=1800.0,
+        help="Maximum wait for RVT-to-IFC translation (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--forma-poll-interval-seconds",
+        type=float,
+        default=5.0,
+        help="APS translation polling interval (default: %(default)s)",
     )
     parser.add_argument(
         "--output",
@@ -74,7 +162,7 @@ def parse_args(
         "--all",
         dest="process_all",
         action="store_true",
-        help="Process all .ifc files in the input directory",
+        help="Process every eligible local file or discovered ACC model",
     )
     parser.add_argument(
         "--checkpoint",
@@ -185,6 +273,18 @@ def parse_args(
         choices=("projected", "geodetic"),
         default="projected",
         help="Federation frame for --federate (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--unanchored",
+        "--missing-anchor-policy",
+        dest="missing_anchor_policy",
+        choices=("skip", "same-origin"),
+        default="skip",
+        help=(
+            "With --federate, handle stages without anchor metadata by skipping them "
+            "or by placing them at zero offset when all payloads share one local origin "
+            "(default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--geospatial-mode",

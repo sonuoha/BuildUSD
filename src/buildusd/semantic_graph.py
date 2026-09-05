@@ -178,7 +178,9 @@ def build_semantic_graph(
                         "decomposition_quality": decomposition_quality,
                         "source_materials": source_materials,
                         "semantic_parts": semantic_parts,
-                        "attributes": _json_safe(getattr(record, "attributes", {}) or {}),
+                        "attributes": _json_safe(
+                            getattr(record, "attributes", {}) or {}
+                        ),
                         "material_evidence": material_evidence,
                     }
                 ),
@@ -188,7 +190,11 @@ def build_semantic_graph(
 
         previous_spatial_id = model_id
         for label, step_id in getattr(record, "hierarchy", ()) or ():
-            spatial_id = f"spatial:{step_id}" if step_id is not None else f"spatial:{_slug(label)}"
+            spatial_id = (
+                f"spatial:{step_id}"
+                if step_id is not None
+                else f"spatial:{_slug(label)}"
+            )
             if spatial_id not in spatial_nodes:
                 spatial_nodes[spatial_id] = label
                 nodes.append(
@@ -327,7 +333,9 @@ def _source_materials(record: Any) -> list[str]:
         if name:
             names.append(name)
     for entry in (getattr(record, "style_face_groups", None) or {}).values():
-        name = _material_name(entry.get("material") if isinstance(entry, dict) else entry)
+        name = _material_name(
+            entry.get("material") if isinstance(entry, dict) else entry
+        )
         if name:
             names.append(name)
     style_material = getattr(record, "style_material", None)
@@ -388,7 +396,11 @@ def _part_nodes_and_request(
     template = COMPOSITE_TEMPLATES.get(ifc_class)
     semantic_parts = getattr(record, "semantic_parts", {}) or {}
     semantic_part_paths = getattr(record, "semantic_part_prim_paths", {}) or {}
-    labels = tuple(semantic_parts.keys()) if semantic_parts else (template.parts if template else ())
+    labels = (
+        tuple(semantic_parts.keys())
+        if semantic_parts
+        else (template.parts if template else ())
+    )
     nodes: list[Dict[str, Any]] = []
 
     for label in labels:
@@ -431,7 +443,10 @@ def _part_nodes_and_request(
         "requested_parts": list(template.parts),
         "suggested_detail_objects": [
             value
-            for value in (getattr(record, "guid", None), getattr(record, "step_id", None))
+            for value in (
+                getattr(record, "guid", None),
+                getattr(record, "step_id", None),
+            )
             if value is not None
         ],
     }

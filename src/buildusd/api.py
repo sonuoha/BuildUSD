@@ -16,6 +16,13 @@ from .federation_orchestrator import (
     federate_stages as _federate_stages,
 )
 from .io_utils import is_omniverse_path
+from .forma import (
+    FormaClient,
+    FormaProjectFile,
+    FormaProjectLocator,
+    FormaSource,
+    parse_acc_project_url,
+)
 from .conversion import (
     ConversionOptions,
     ConversionResult,
@@ -31,16 +38,26 @@ from .semantic_enrichment import (
     build_targeted_enrichment_plan,
     load_semantic_graph,
 )
+from .jobs import (
+    BuildUSDJobResult,
+    TargetedDetailJob,
+    TargetedDetailTarget,
+    read_job,
+    run_job,
+    write_job,
+)
 
 PathLike = Union[str, Path]
 AnchorMode = Literal["local", "basepoint"]
 AnchorModeSetting = Optional[AnchorMode]
 FederationFrame = Literal["projected", "geodetic"]
+MissingAnchorPolicy = Literal["skip", "same-origin"]
 
 __all__ = [
     "AnchorMode",
     "AnchorModeSetting",
     "FederationFrame",
+    "MissingAnchorPolicy",
     "ConversionDefaults",
     "ConversionSettings",
     "FederationDefaults",
@@ -59,10 +76,21 @@ __all__ = [
     "DEFAULT_GEODETIC_CRS",
     "DEFAULT_MASTER_STAGE",
     "DEFAULT_CONVERSION_OPTIONS",
+    "FormaClient",
+    "FormaProjectFile",
+    "FormaProjectLocator",
+    "FormaSource",
+    "parse_acc_project_url",
     "EnrichmentTarget",
     "TargetedEnrichmentPlan",
     "build_targeted_enrichment_plan",
     "load_semantic_graph",
+    "BuildUSDJobResult",
+    "TargetedDetailJob",
+    "TargetedDetailTarget",
+    "read_job",
+    "run_job",
+    "write_job",
 ]
 
 
@@ -107,7 +135,7 @@ CONVERSION_DEFAULTS = ConversionDefaults()
 class ConversionSettings:
     """Inputs that drive a conversion run via :func:`convert`."""
 
-    input_path: PathLike
+    input_path: PathLike | FormaSource
     output_dir: Optional[PathLike] = None
     map_coordinate_system: str = CONVERSION_DEFAULTS.map_coordinate_system
     manifest: Optional[ConversionManifest] = None
@@ -133,6 +161,7 @@ def convert(
     *,
     options: Optional[ConversionOptions] = None,
     cancel_event: Any | None = None,
+    forma_client: FormaClient | None = None,
 ) -> list[ConversionResult]:
     """Convert IFC inputs described by ``settings``."""
 
@@ -168,6 +197,7 @@ def convert(
         anchor_mode=normalized_anchor_mode,
         geospatial_mode=settings.geospatial_mode,
         cancel_event=cancel_event,
+        forma_client=forma_client,
     )
 
 
@@ -207,6 +237,7 @@ class FederationDefaults:
     parent_prim: str = "/World"
     anchor_mode: AnchorModeSetting = None
     frame: FederationFrame = "projected"
+    missing_anchor_policy: MissingAnchorPolicy = "skip"
     offline: bool = False
 
 
@@ -233,6 +264,9 @@ class FederationSettings:
     fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS
     anchor_mode: AnchorModeSetting = FEDERATION_DEFAULTS.anchor_mode
     frame: FederationFrame = FEDERATION_DEFAULTS.frame
+    missing_anchor_policy: MissingAnchorPolicy = (
+        FEDERATION_DEFAULTS.missing_anchor_policy
+    )
     offline: bool = FEDERATION_DEFAULTS.offline
 
     def ensure_masters_root(self) -> PathLike:
@@ -292,6 +326,7 @@ def federate_stages(settings: FederationSettings) -> Sequence[FederationTask]:
         fallback_geodetic_crs=settings.fallback_geodetic_crs,
         anchor_mode=_normalize_anchor_mode(settings.anchor_mode),
         frame=settings.frame,
+        missing_anchor_policy=settings.missing_anchor_policy,
         offline=settings.offline,
     )
 
@@ -308,6 +343,9 @@ def federate_into_stage(
     fallback_geodetic_crs: str = DEFAULT_GEODETIC_CRS,
     anchor_mode: AnchorModeSetting = FEDERATION_DEFAULTS.anchor_mode,
     frame: FederationFrame = FEDERATION_DEFAULTS.frame,
+    missing_anchor_policy: MissingAnchorPolicy = (
+        FEDERATION_DEFAULTS.missing_anchor_policy
+    ),
     offline: bool = FEDERATION_DEFAULTS.offline,
     rebuild: bool = False,
 ) -> Optional[str]:
@@ -332,6 +370,7 @@ def federate_into_stage(
         fallback_geodetic_crs=fallback_geodetic_crs,
         anchor_mode=_normalize_anchor_mode(anchor_mode),
         frame=frame,
+        missing_anchor_policy=missing_anchor_policy,
         offline=offline,
         rebuild=rebuild,
     )

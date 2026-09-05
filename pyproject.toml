@@ -51,6 +51,7 @@ dev = [
 
 [project.scripts]
 buildusd = "buildusd.main:main"
+buildusd-worker = "buildusd.worker:main"
 ifc-convert = "buildusd.main:main"
 
 [build-system]

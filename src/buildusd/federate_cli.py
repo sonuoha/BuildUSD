@@ -88,6 +88,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Federation frame for delta computation: projected or geodetic (default: %(default)s).",
     )
     parser.add_argument(
+        "--unanchored",
+        "--missing-anchor-policy",
+        dest="missing_anchor_policy",
+        choices=("skip", "same-origin"),
+        default="skip",
+        help=(
+            "How to handle payload stages without anchor metadata: skip them, or "
+            "place them at zero offset when all payloads already share one local origin "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
         "--offline",
         dest="offline",
         action="store_true",
@@ -139,6 +151,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
             anchor_mode=cli_anchor_mode,
             frame=args.frame,
+            missing_anchor_policy=args.missing_anchor_policy,
             offline=args.offline,
             rebuild=args.rebuild,
         )
@@ -170,6 +183,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             parent_prim=args.parent_prim,
             rebuild=args.rebuild,
             frame=args.frame,
+            missing_anchor_policy=args.missing_anchor_policy,
         )
         from .federation_orchestrator import _apply_overall_master
 
@@ -184,6 +198,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             rebuild=args.rebuild,
             frame=args.frame,
             anchor_mode=cli_anchor_mode,
+            missing_anchor_policy=args.missing_anchor_policy,
         )
     finally:
         shutdown_usd_context()
