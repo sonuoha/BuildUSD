@@ -3,6 +3,7 @@
 # ===============================
 from __future__ import annotations
 import argparse
+import fnmatch
 import json
 import logging
 import tempfile
@@ -58,6 +59,13 @@ from .process_usd import (
 )
 from .semantic_graph import persist_semantic_graph
 from .geospatial import resolve_geospatial_mode, maybe_stream_omnigeospatial
+from .forma import (
+    FormaClient,
+    FormaIntegrationError,
+    FormaProjectFile,
+    FormaSource,
+    parse_acc_project_url,
+)
 from .usd_context import initialize_usd, shutdown_usd_context
 
 __all__ = [
@@ -681,7 +689,7 @@ def _gather_annotation_width_rules(
 
 # ------------- core convert -------------
 def convert(
-    input_path: PathLike,
+    input_path: PathLike | FormaSource,
     *,
     output_dir: PathLike | None = None,
     map_coordinate_system: str = "EPSG:7855",
@@ -699,10 +707,18 @@ def convert(
     geospatial_mode: str = "auto",
     cancel_event: Any | None = None,
     anchor_mode: Optional[str] = None,
+    forma_client: FormaClient | None = None,
 ) -> list[ConversionResult]:
     """Programmatic API for running the converter inside another application."""
     log = logger or LOG
     _ensure_not_cancelled(cancel_event)
+    if isinstance(input_path, FormaSource):
+        client = forma_client or FormaClient.from_environment(logger=log)
+        input_path = client.materialize_ifc(
+            input_path,
+            cancel_check=lambda: _ensure_not_cancelled(cancel_event),
+        )
+        log.info("Materialized Autodesk Forma version as %s", input_path)
     if manifest_path and manifest is not None:
         raise ValueError("Provide either manifest or manifest_path, not both.")
     exclude = normalize_exclusions(exclude_names)
@@ -2089,6 +2105,231 @@ def _process_single_ifc(
 
 
 # ------------- entrypoint -------------
+def _parse_forma_selection(value: str, file_count: int) -> list[int]:
+    """Parse an interactive selection such as ``1,3-5`` into zero-based indices."""
+
+    text = value.strip().casefold()
+    if text == "all":
+        return list(range(file_count))
+    if not text:
+        return []
+    selected: list[int] = []
+    for token in text.replace(" ", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_text, end_text = token.split("-", 1)
+            try:
+                start = int(start_text)
+                end = int(end_text)
+            except ValueError as exc:
+                raise ValueError(f"Invalid Forma selection range: {token!r}") from exc
+            if start > end:
+                start, end = end, start
+            numbers = range(start, end + 1)
+        else:
+            try:
+                numbers = (int(token),)
+            except ValueError as exc:
+                raise ValueError(f"Invalid Forma selection: {token!r}") from exc
+        for number in numbers:
+            if number < 1 or number > file_count:
+                raise ValueError(f"Forma selection {number} is outside 1-{file_count}.")
+            index = number - 1
+            if index not in selected:
+                selected.append(index)
+    return selected
+
+
+def _select_forma_files(
+    files: Sequence[FormaProjectFile], args: argparse.Namespace
+) -> list[FormaProjectFile]:
+    patterns = tuple(getattr(args, "forma_files", None) or ())
+    if patterns:
+        selected = [
+            entry
+            for entry in files
+            if any(
+                fnmatch.fnmatchcase(entry.relative_path.casefold(), pattern.casefold())
+                or fnmatch.fnmatchcase(
+                    entry.display_name.casefold(), pattern.casefold()
+                )
+                for pattern in patterns
+            )
+        ]
+        if not selected:
+            raise ValueError("No discovered Forma RVT/IFC files matched --forma-file.")
+        return selected
+    if getattr(args, "process_all", False):
+        return list(files)
+    if not sys.stdin.isatty():
+        raise ValueError(
+            "Interactive Forma selection requires a terminal. Use --forma-file "
+            "PATTERN or --all for a non-interactive run."
+        )
+    print(f"\nDiscovered {len(files)} RVT/IFC file(s):")
+    for index, entry in enumerate(files, start=1):
+        version = entry.version_number
+        version_label = f"v{version}" if version is not None else "tip"
+        print(f"  [{index:>3}] {entry.relative_path} ({version_label})")
+        print(f"        {entry.web_url}")
+    selection = input("\nSelect files (for example 1,3-5 or all; blank cancels): ")
+    indices = _parse_forma_selection(selection, len(files))
+    if not indices:
+        raise ValueError("No Forma files were selected.")
+    return [files[index] for index in indices]
+
+
+def _forma_source_from_file(
+    entry: FormaProjectFile,
+    args: argparse.Namespace,
+    *,
+    local_name: Optional[str] = None,
+) -> FormaSource:
+    return entry.as_source(
+        cache_dir=(
+            Path(args.forma_cache_dir).expanduser()
+            if getattr(args, "forma_cache_dir", None)
+            else None
+        ),
+        local_name=local_name,
+        ifc_export_setting=getattr(
+            args, "forma_ifc_export_setting", "IFC4 Reference View"
+        ),
+        force_translation=getattr(args, "forma_force_translation", False),
+        translation_timeout_seconds=getattr(
+            args, "forma_translation_timeout_seconds", 1800.0
+        ),
+        poll_interval_seconds=getattr(args, "forma_poll_interval_seconds", 5.0),
+    )
+
+
+def _resolve_forma_cli_sources(
+    args: argparse.Namespace,
+) -> tuple[list[PathLike | FormaSource], Optional[FormaClient]]:
+    """Resolve direct, URL-based, and browsed Forma CLI inputs."""
+
+    project_id = getattr(args, "forma_project_id", None)
+    if project_id:
+        project_id = project_id if project_id.startswith("b.") else f"b.{project_id}"
+    project_url = getattr(args, "forma_project_url", None)
+    locator = parse_acc_project_url(project_url) if project_url else None
+    if locator:
+        if project_id and project_id != locator.project_id:
+            raise ValueError(
+                "--forma-project-id does not match the project in --forma-project-url."
+            )
+        project_id = locator.project_id
+    folder_id = getattr(args, "forma_folder_id", None)
+    if locator and locator.folder_id:
+        if folder_id and folder_id != locator.folder_id:
+            raise ValueError(
+                "--forma-folder-id does not match the folder in --forma-project-url."
+            )
+        folder_id = locator.folder_id
+
+    version_id = getattr(args, "forma_version_id", None)
+    browse = bool(getattr(args, "forma_browse", False))
+    include_subfolders = bool(getattr(args, "forma_subfolders", False))
+    depth = getattr(args, "forma_depth", None)
+    if depth is not None and depth < 0:
+        raise ValueError("--depth must be zero or greater.")
+    patterns = tuple(getattr(args, "forma_files", None) or ())
+    remote_requested = bool(
+        project_id
+        or folder_id
+        or version_id
+        or project_url
+        or browse
+        or include_subfolders
+        or depth is not None
+        or patterns
+    )
+    if not remote_requested:
+        return [args.input_path], None
+    if not project_id:
+        raise ValueError(
+            "Forma discovery requires --forma-project-id or --forma-project-url."
+        )
+    if version_id:
+        if browse or include_subfolders or depth is not None or patterns:
+            raise ValueError(
+                "--forma-version-id cannot be combined with discovery or selection flags."
+            )
+        return [
+            FormaSource(
+                project_id=project_id,
+                version_id=version_id,
+                cache_dir=(
+                    Path(args.forma_cache_dir).expanduser()
+                    if getattr(args, "forma_cache_dir", None)
+                    else None
+                ),
+                ifc_export_setting=getattr(
+                    args, "forma_ifc_export_setting", "IFC4 Reference View"
+                ),
+                force_translation=getattr(args, "forma_force_translation", False),
+                translation_timeout_seconds=getattr(
+                    args, "forma_translation_timeout_seconds", 1800.0
+                ),
+                poll_interval_seconds=getattr(args, "forma_poll_interval_seconds", 5.0),
+            )
+        ], None
+
+    client = FormaClient.from_environment(logger=LOG)
+    direct_url_item = bool(
+        locator
+        and locator.item_id
+        and not browse
+        and not include_subfolders
+        and depth is None
+        and not patterns
+        and not getattr(args, "process_all", False)
+    )
+    if direct_url_item:
+        selected = [
+            client.get_item_tip(
+                project_id,
+                locator.item_id,
+                folder_id=locator.folder_id,
+            )
+        ]
+    else:
+        max_depth = depth
+        if folder_id and not include_subfolders and depth is None:
+            max_depth = 0
+        scope_label = folder_id or "the project top-level folders"
+        depth_label = "unlimited" if max_depth is None else str(max_depth)
+        LOG.info(
+            "Discovering Forma RVT/IFC files from %s (subfolder depth: %s)",
+            scope_label,
+            depth_label,
+        )
+        discovered = client.list_project_files(
+            project_id,
+            start_folder_id=folder_id,
+            max_depth=max_depth,
+        )
+        if not discovered:
+            raise ValueError("No RVT or IFC files were found in the Forma project.")
+        selected = _select_forma_files(discovered, args)
+
+    stem_counts: dict[str, int] = {}
+    for entry in selected:
+        stem = Path(entry.display_name).stem.casefold()
+        stem_counts[stem] = stem_counts.get(stem, 0) + 1
+    sources: list[PathLike | FormaSource] = []
+    for entry in selected:
+        stem = Path(entry.display_name).stem.casefold()
+        local_name = None
+        if stem_counts[stem] > 1:
+            local_name = entry.relative_path.replace("/", "__")
+        sources.append(_forma_source_from_file(entry, args, local_name=local_name))
+        LOG.info("Selected Forma file: %s", entry.relative_path)
+    return sources, client
+
+
 def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv)
@@ -2243,22 +2484,31 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
             shutdown_usd_context()
             raise SystemExit(2) from exc
     try:
-        results = convert(
-            args.input_path,
-            output_dir=args.output_dir,
-            map_coordinate_system=args.map_coordinate_system,
-            manifest_path=args.manifest_path,
-            ifc_names=args.ifc_names,
-            process_all=args.process_all,
-            exclude_names=args.exclude,
-            checkpoint=args.checkpoint,
-            offline=args.offline,
-            options=options_override,
-            usd_format=args.usd_format,
-            usd_auto_binary_threshold_mb=args.usd_auto_binary_threshold_mb,
-            anchor_mode=cli_anchor_mode,
-            geospatial_mode=getattr(args, "geospatial_mode", "auto"),
-        )
+        input_sources, forma_client = _resolve_forma_cli_sources(args)
+        results: list[ConversionResult] = []
+        for input_source in input_sources:
+            results.extend(
+                convert(
+                    input_source,
+                    output_dir=args.output_dir,
+                    map_coordinate_system=args.map_coordinate_system,
+                    manifest_path=args.manifest_path,
+                    ifc_names=args.ifc_names,
+                    process_all=args.process_all,
+                    exclude_names=args.exclude,
+                    checkpoint=args.checkpoint,
+                    offline=args.offline,
+                    options=options_override,
+                    usd_format=args.usd_format,
+                    usd_auto_binary_threshold_mb=args.usd_auto_binary_threshold_mb,
+                    anchor_mode=cli_anchor_mode,
+                    geospatial_mode=getattr(args, "geospatial_mode", "auto"),
+                    forma_client=forma_client,
+                )
+            )
+    except (FormaIntegrationError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
     finally:
         shutdown_usd_context()
     if getattr(args, "federate", False):
@@ -2305,6 +2555,9 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
                             fallback_geodetic_crs=DEFAULT_GEODETIC_CRS,
                             anchor_mode=cli_anchor_mode,
                             frame=getattr(args, "frame", "projected"),
+                            missing_anchor_policy=getattr(
+                                args, "missing_anchor_policy", "skip"
+                            ),
                             offline=args.offline,
                         )
                     elif manifest is not None:
@@ -2315,6 +2568,9 @@ def main(argv: Sequence[str] | None = None) -> list[ConversionResult]:
                             map_coordinate_system=args.map_coordinate_system,
                             anchor_mode=cli_anchor_mode,
                             frame=getattr(args, "frame", "projected"),
+                            missing_anchor_policy=getattr(
+                                args, "missing_anchor_policy", "skip"
+                            ),
                             offline=args.offline,
                         )
                     else:

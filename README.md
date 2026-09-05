@@ -40,6 +40,21 @@ Quick start (Nucleus / Kit)
   `python -m buildusd --input omniverse://server/Projects/IFC/Duplex_A.ifc --checkpoint`
 - Expected: authored layers on Nucleus; headless Kit session auto-starts.
 
+Quick start (Autodesk Forma / ACC)
+- This initial integration is read-only. It resolves an immutable Autodesk Data Management file version, downloads hosted IFC directly, or asks APS Model Derivative to translate a hosted RVT version to IFC. The local IFC then enters the normal BuildUSD pipeline.
+- Provision the APS application in the relevant Forma hub. Configure either `APS_ACCESS_TOKEN` (for an existing access token) or both `APS_CLIENT_ID` and `APS_CLIENT_SECRET`; credentials are intentionally not accepted as CLI arguments.
+- Convert a hosted version:
+  `python -m buildusd --offline --forma-project-id "b.PROJECT_ID" --forma-version-id "urn:adsk.wipprod:fs.file:vf.VERSION?version=1"`
+- Browse an entire project interactively from an ACC Docs URL:
+  `python -m buildusd --offline --forma-project-url "https://acc.autodesk.com/docs/files/projects/PROJECT_ID" --forma-browse --output data/output`
+- Supply a base folder with `--base-url` (an alias of `--forma-project-url`) using an ACC URL containing `folderUrn`, or combine `--forma-project-id` with `--forma-folder-id "urn:adsk.wipprod:fs.folder:co..."`.
+- For a base folder URL, discovery reads only that folder by default. Add `--subfolder` for unlimited descendant traversal, or `--depth N` to cap traversal (`--depth 0` is the base folder only; `--depth 1` includes immediate child folders). `--depth` implies subfolder traversal.
+- Project browsing prints discovered RVT/IFC paths and ACC links, then accepts a numbered selection such as `1,3-5`. Use `--all` to convert every discovered model or repeat `--forma-file "Folder/*.rvt"` for non-interactive filtering.
+- A pasted ACC file URL containing `entityId` can be converted directly without supplying a version URN; BuildUSD resolves and pins the item's current tip version before acquisition.
+- Acquired IFC files are content-cached by project, immutable version, and IFC export setting. Override the cache with `--forma-cache-dir` or `BUILDUSD_FORMA_CACHE_DIR`.
+- RVT defaults to the `IFC4 Reference View` export setting. Use `--forma-ifc-export-setting`, `--forma-force-translation`, and the Forma timeout/polling options when required.
+- This slice does not yet browse hubs/projects, subscribe to version events, or upload generated USD artifacts back to Autodesk.
+
 Install
 - Create/activate venv and install dependencies per your workflow (e.g., `pip install -e ".[offline]"` for local USD use, `pip install -e ".[dev]"` for development, or `uv sync` if you use uv).
 - **Kit mode**
@@ -71,6 +86,9 @@ Mode selection & environment variables
   - `OMNI_KIT_ACCEPT_EULA` – set to `yes` to suppress Kit's interactive EULA prompt during headless launches.
   - `PYTHONUNBUFFERED` – optional; keep at `1` to stream logs without buffering during long conversions.
   - `USD_FORCE_MODULE_NAME` – honoured by pxr when present; useful if your USD distribution installs under a different module alias.
+  - `APS_ACCESS_TOKEN` – existing Autodesk Platform Services access token for Forma/ACC acquisition. RVT translation requires `data:read`, `data:write`, and `bucket:read` scopes.
+  - `APS_CLIENT_ID` / `APS_CLIENT_SECRET` – OAuth client credentials for a provisioned APS server application.
+  - `BUILDUSD_FORMA_CACHE_DIR` – optional local cache root for Forma/ACC source materialization.
 
 Usage (CLI)
 - Single IFC file:
@@ -97,9 +115,15 @@ Usage (CLI)
   - python -m buildusd --input C:\\path\\to\\dir --all --federate --federate-into data/federated/ProjectMaster.usdc
   - python -m buildusd.federate --stage-root data/output --stage A.usdc B.usdc --federate-into data/federated/ProjectMaster.usdc
 - Federation CLI options (`python -m buildusd.federate`):
-  - `--stage-root`, `--stage`, `--masters-root`, `--manifest`, `--federate-into`, `--parent-prim`, `--map-coordinate-system`, `--anchor-mode`, `--frame`, `--offline`, `--rebuild`
+  - `--stage-root`, `--stage`, `--masters-root`, `--manifest`, `--federate-into`, `--parent-prim`, `--map-coordinate-system`, `--anchor-mode`, `--frame`, `--unanchored`, `--offline`, `--rebuild`
 - Nucleus (omniverse://) paths work for files or directories:
   - python -m buildusd --input omniverse://server/Projects/IFC --all
+- Autodesk Forma/ACC immutable file version:
+  - python -m buildusd --offline --forma-project-id b.PROJECT_ID --forma-version-id "urn:adsk.wipprod:fs.file:vf.VERSION?version=1"
+- Browse and select Autodesk Forma/ACC project models:
+  - python -m buildusd --offline --forma-project-url "https://acc.autodesk.com/docs/files/projects/PROJECT_ID" --forma-browse --output D:\BuildUSD_Output
+  - python -m buildusd --offline --base-url "https://acc.autodesk.com/docs/files/projects/PROJECT_ID?folderUrn=FOLDER_URN" --subfolder --depth 1 --all --output D:\BuildUSD_Output
+  - python -m buildusd --offline --forma-project-id b.PROJECT_ID --forma-file "Project Files/Architecture/*.rvt" --forma-file "Project Files/Civil/*.ifc" --output D:\BuildUSD_Output
 - Detail routing examples:
   - python -m buildusd --detail-mode --detail-engine default   # IFC subcomponents first, OCC fallback for all products
   - python -m buildusd --detail-mode --detail-engine occ       # OCC only for all products (skip subcomponents)
@@ -113,6 +137,10 @@ Usage (CLI)
   - `--detail-objects`: space-separated STEP ids and/or GUIDs; implies `--detail-mode` and `--detail-scope object` when supplied.
   - `--detail-engine`: `default` (semantic first, OCC fallback), `occ|opencascade` (OCC only), `semantic|ifc-subcomponents|ifc-parts` (semantic only). If OCC is unavailable, the engine falls back to semantic with a warning.
   - Shell quoting: in PowerShell, `$` expands variables; wrap GUIDs in single quotes or escape `$` with a backtick.
+- File-backed targeted detail worker:
+  - python -m buildusd.worker --jobs ./jobs --limit 1
+  - buildusd-worker --jobs ./jobs --results ./jobs/results --limit 4
+  - The worker reads generic `buildusd.job.v1` JSON files from `./jobs/pending` when that folder exists, otherwise from `./jobs`, runs object-scope detail conversion outside any host application, writes `*.result.json`, and archives jobs into `completed` or `failed`.
 - Update meters-per-unit metadata on an existing USD stage/layer (no IFC conversion):
   - python -m buildusd --set-stage-unit "omniverse://server/Projects/file.usdc" --stage-unit-value 0.001
 - Update up-axis metadata on an existing USD stage/layer (no IFC conversion):
@@ -132,11 +160,12 @@ python -m buildusd.federate --stage-root PATH --manifest MANIFEST [options]
 ```
 
 CLI options (summary)
-- Input/output: `--input`, `--output`, `--ifc-names`, `--exclude`, `--all`, `--manifest`
+- Input/output: `--input`, `--output`, `--ifc-names`, `--exclude`, `--all`, `--manifest`, `--base-url`, `--forma-project-id`, `--forma-project-url`, `--forma-folder-id`, `--subfolder`, `--depth`, `--forma-version-id`, `--forma-browse`, `--forma-file`, `--forma-cache-dir`
 - Execution: `--offline`, `--checkpoint`, `--usd-format`, `--usd-auto-binary-threshold-mb`, `--map-coordinate-system`, `--geospatial-mode`
 - 2D: `--include-2d`, `--annotation-width-default`, `--annotation-width-rule`, `--annotation-width-config`
-- Anchoring/federation: `--anchor-mode`, `--federate`, `--federate-into`, `--frame` (federation only)
+- Anchoring/federation: `--anchor-mode`, `--federate`, `--federate-into`, `--frame`, `--unanchored` (federation only)
 - Detail: `--detail-mode`, `--detail-scope`, `--detail-objects`, `--detail-engine`, `--enable-semantic-subcomponents`, `--semantic-tokens`
+- Worker: `python -m buildusd.worker --jobs PATH [--results PATH] [--limit N]`
 - Utilities: `--set-stage-unit`, `--stage-unit-value`, `--set-stage-up-axis`, `--stage-up-axis`
 
 CLI reference (full)
@@ -144,11 +173,25 @@ CLI reference (full)
 python -m buildusd
   --map-coordinate-system, --map-epsg   EPSG code or CRS string for map eastings/northings
   --input PATH                          IFC file or directory (default: repo root)
+  --forma-project-id ID                Autodesk Forma/ACC Data Management project ID
+  --forma-project-url, --base-url URL  Base ACC project, folder, or file URL
+  --forma-folder-id ID                 Set the base folder by its ACC folder URN
+  --subfolder                          Include descendants of the base folder
+  --depth N                            Maximum depth below the base folder
+  --forma-version-id ID                Immutable Autodesk Forma/ACC file version ID
+  --forma-browse                       Recursively list project RVT/IFC files and prompt for a selection
+  --forma-file GLOB                    Select discovered project-relative files (repeatable)
+  --forma-cache-dir PATH               Local cache for acquired Forma IFC files
+  --forma-ifc-export-setting NAME      RVT-to-IFC export setting
+  --forma-force-translation            Regenerate the RVT-to-IFC derivative
+  --forma-translation-timeout-seconds FLOAT
+                                       Maximum wait for RVT translation
+  --forma-poll-interval-seconds FLOAT  RVT translation polling interval
   --output PATH                         Output directory for USD artifacts
   --manifest PATH                       Manifest (YAML/JSON) for base points and masters
   --ifc-names NAMES...                  Specific IFC files to process in a directory
   --exclude NAMES...                    IFC file names to skip
-  --all                                 Process all .ifc files in the input directory
+  --all                                 Process every eligible local file or discovered ACC model
   --checkpoint                          Create Nucleus checkpoints (omniverse:// only)
   --offline                             Force standalone USD (no Kit); local paths only
   --set-stage-unit PATH                 Update metersPerUnit on an existing layer/stage
@@ -163,6 +206,8 @@ python -m buildusd
   --federate                            Run federation after conversion
   --federate-into PATH                  Explicit target stage for append-only federation
   --frame {projected|geodetic}          Federation frame (used with --federate)
+  --unanchored {skip|same-origin}
+                                          Skip unanchored payloads, or place them at zero offset when all payloads share one local origin
   --geospatial-mode {auto|usd|omni|none} Geospatial metadata mode
   --usd-format {usdc|usda|usd|auto}     Output USD format
   --usd-auto-binary-threshold-mb FLOAT  Re-export as usdc above this size (MB)
@@ -186,6 +231,8 @@ python -m buildusd.federate
   --map-coordinate-system EPSG          Fallback CRS when manifest omits projected_crs
   --anchor-mode {local|basepoint|none}  Match anchoring used by converted stages
   --frame {projected|geodetic}          Federation frame for delta computation
+  --unanchored {skip|same-origin}
+                                          Skip unanchored payloads, or place them at zero offset when all payloads share one local origin
   --offline                             Standalone USD mode (no Kit)
   --rebuild                             Rebuild masters from scratch
 ```
@@ -275,6 +322,46 @@ Detail / remesh
   - PowerShell quoting: use single quotes or escape `$` in GUIDs (e.g. `'0jNViHeUb9$QjXG30GXDQy'` or ``0jNViHeUb9`$QjXG30GXDQy``).
   - Env caps: `OCC_DETAIL_FACE_CAP` skips OCC detail when face count exceeds the cap; `OCC_CANONICAL_MAP_FACE_CAP` skips canonical map building when faces exceed the cap or the mesh is single-material with no item ids.
 
+File-backed enrichment jobs
+- BuildUSD can run targeted detail work from JSON job files so host applications do not need to block while conversion runs.
+- The first public job type is `targeted_detail`. It reuses the same object-scope detail conversion path as the CLI and writes a generic replacement manifest for downstream composition tools.
+- Job queues are local directories. If `<jobs>/pending` exists, pending jobs are read from that folder; otherwise `*.json` files directly under `<jobs>` are treated as pending jobs.
+- A completed job writes:
+  - `<results>/<job_id>.result.json`
+  - `<output_dir>/<job_id>.targeted_detail.manifest.json`
+  - `<output_dir>/.buildusd_cache/targeted_detail/<cache_key>/cache.json` when caching is enabled
+  - archived job JSON under `<jobs>/completed`
+- A failed job writes `<results>/<job_id>.result.json` and archives the job under `<jobs>/failed`.
+- Cache reuse is enabled by default. The cache key includes BuildUSD version, source IFC identity/hash for local files, target GUIDs/STEP ids, detail engine, geometry overrides, CRS, unit/output settings, and detail-relevant options. Set `"use_cache": false` on a job to force a fresh run, or set `"cache_dir"` to share a cache outside the output directory.
+- Result JSON includes `cache_key` and `cache_hit` so host applications can distinguish fresh conversion from artifact reuse.
+- The worker does not mutate source IFC or USD layers. It produces portable USD/JSON artifacts; downstream tools decide how to hide coarse prims, reference replacement layers, and preserve presentation state.
+
+Example targeted-detail job:
+
+```json
+{
+  "schema": "buildusd.job.v1",
+  "job_type": "targeted_detail",
+  "job_id": "kitchen_casework_detail",
+  "source_ifc": "data/input/model.ifc",
+  "source_stage": "data/output/model.usdc",
+  "semantic_graph": "data/output/graphs/model.semantic_graph.json",
+  "output_dir": "data/output/detail_jobs/kitchen_casework_detail",
+  "detail_engine": "default",
+  "use_cache": true,
+  "targets": [
+    {
+      "guid": "0jNViHeUb9$QjXG30GXDQy",
+      "source_usd_prim": "/World/Model/IfcFurniture/KITCHEN_TYPE_TYPICAL",
+      "reason": "Composite object needs part-level material assignment"
+    }
+  ],
+  "metadata": {
+    "requested_by": "downstream_scene_manager"
+  }
+}
+```
+
 Annotation Curve Width Overrides
 - 2D curve widths are only evaluated when 2D extraction is enabled (`--include-2d` or API option).
 - Control the `UsdGeom.BasisCurves` widths authored in geometry2d layers via `--annotation-width-default`, repeated `--annotation-width-rule`, or config files supplied with `--annotation-width-config`.
@@ -344,16 +431,18 @@ IFC Metadata as USD Attributes
 Federated Stage Behavior (via `buildusd.federate`)
 - Each converted USD stage is referenced as a payload under `/World/<safe_name>` in the manifest-selected master stage.
 - The payload targets the stage's default prim so additional `/World` nesting is avoided when possible.
+- By default, payloads without anchor metadata are skipped to avoid silently mixing coordinate frames. Use `--unanchored same-origin` only for datasets where every payload is already authored in the same local coordinate system; those unanchored payloads are placed at zero offset.
 - The federation output is idempotent: re-running adds missing payloads; use `--rebuild` to recreate the master stage from scratch.
 - `--federate-into` supports append-only payloading into one explicit target stage while preserving previously-authored payloads and per-payload edits that are not part of the new input list.
 - For `--federate-into`, an existing target stage is authoritative for origin/CRS resolution when metadata is present; manifest/default values are treated as fallback hints.
 - If `defaults.overall_master_name` is set, a top-level overall master is built by payloading the per-site master stages.
-- Running `python -m buildusd --federate` after conversion uses the same routing logic as `buildusd.federate`, including explicit `--federate-into`, and respects `--anchor-mode`/`--frame` for alignment.
+- Running `python -m buildusd --federate` after conversion uses the same routing logic as `buildusd.federate`, including explicit `--federate-into`, and respects `--anchor-mode`/`--frame`/`--unanchored` for alignment.
 
 Programmatic Use
 - `from buildusd import api` exposes structured helpers. `api.ConversionSettings` and `api.convert()` mirror the CLI; `api.FederationSettings` and `api.federate_stages()` do the same for manifest-routed master assembly; `api.federate_into_stage()` appends specific stage payloads into one explicit target; `api.apply_stage_anchor_transform()` anchors custom USD stages consistently.
 - `api.CONVERSION_DEFAULTS` / `api.FEDERATION_DEFAULTS` expose the packaged defaults, and `api.DEFAULT_CONVERSION_OPTIONS` offers a ready-to-clone baseline for geometry harvesting.
 - Anchor modes accept `"local"`, `"basepoint"`, or `None`/`"none"`; `none` skips model offsets and only stamps geospatial metadata when a lon/lat override is supplied.
+- Federation missing-anchor policy defaults to `"skip"`; set `"same-origin"` when unanchored stages already share the same local origin and should be payloaded at zero offset.
 - main(argv=None) and parse_args(argv=None) accept a list of tokens to drive from scripts/notebooks.
 - Use `ConversionSettings(include_2d=True)` or `ConversionOptions(include_2d=True)` to opt into 2D annotation extraction.
 - `api.build_targeted_enrichment_plan()` reads a semantic graph sidecar and returns object-scope detail options for unresolved composite elements, preferring IFC GUIDs and falling back to STEP ids.

@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1120" viewBox="0 0 1800 1120" role="img" aria-labelledby="title desc">
+<title id="title">BuildUSD functional architecture</title>
+<desc id="desc">Three aligned function-flow lanes for IFC conversion, USD federation, and targeted enrichment.</desc>
+<rect x="0" y="0" width="1800" height="1120" fill="#FFFFFF" stroke="none" stroke-width="1.0"/>
+<text x="55" y="58" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="27" font-weight="500" text-anchor="start">BuildUSD functional architecture</text>
+<text x="55" y="88" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="400" text-anchor="start">SysML v2 action and information-flow view derived from the validated textual model</text>
+<rect x="1220" y="42" width="525" height="63" rx="7" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1.0"/>
+<rect x="1236" y="57" width="70" height="30" rx="4" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="1271" y="77" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="9" font-weight="500" text-anchor="middle">function</text>
+<line x1="1325" y1="72" x2="1400" y2="72" stroke="#9B2C3B" stroke-width="2.0"/>
+<text x="1410" y="76" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="9" font-weight="400" text-anchor="start">primary state flow</text>
+<line x1="1540" y1="72" x2="1610" y2="72" stroke="#6B7280" stroke-width="1.2" stroke-dasharray="7 6"/>
+<text x="1620" y="76" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="9" font-weight="400" text-anchor="start">auxiliary information</text>
+<rect x="55" y="125" width="1690" height="260" rx="10" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2"/>
+<rect x="55" y="125" width="8" height="260" fill="#2563EB" stroke="none" stroke-width="1.0"/>
+<text x="77" y="153" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="500" text-anchor="start">F1  Convert IFC assets</text>
+<line x1="145" y1="183" x2="1688" y2="183" stroke="#6B7280" stroke-width="1.2" stroke-dasharray="7 6"/>
+<polygon points="133,175 147,175 155,183 147,191 133,191" fill="#6B7280" stroke="#6B7280" stroke-width="1.0"/>
+<text x="165" y="174" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="400" text-anchor="start">manifest + options + cancellation + runtime mode</text>
+<polygon points="74,289 88,289 96,297 88,305 74,305" fill="#2563EB" stroke="#2563EB" stroke-width="1.0"/>
+<line x1="96" y1="297" x2="127.0" y2="297" stroke="#9B2C3B" stroke-width="2.0"/>
+<text x="86" y="214" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="500" text-anchor="start">INPUT  IFC source set + conversion request</text>
+<line x1="230.0" y1="183" x2="230.0" y2="226" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="224.0,220 236.0,220 230.0,228" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="139.0" y="232" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="135.0" y="227" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="135.0" y="227" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="147.0" y="250" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Interpret intent</text>
+<polygon points="128.0,290 137.0,297 128.0,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="323.0,290 332.0,297 323.0,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="147.0" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">request</text>
+<text x="313.0" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">intent</text>
+<text x="147.0" y="328" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">api.py | cli.py | conversion.py</text>
+<line x1="332.0" y1="297" x2="350.33333333333337" y2="297" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="341.1666666666667" cy="297" r="3.0" fill="#9B2C3B"/>
+<line x1="453.33333333333337" y1="183" x2="453.33333333333337" y2="226" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="447.33333333333337,220 459.33333333333337,220 453.33333333333337,228" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="362.33333333333337" y="232" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="358.33333333333337" y="227" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="358.33333333333337" y="227" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="370.33333333333337" y="250" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Discover sources</text>
+<polygon points="351.33333333333337,290 360.33333333333337,297 351.33333333333337,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="546.3333333333334,290 555.3333333333334,297 546.3333333333334,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="370.33333333333337" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">source set</text>
+<text x="536.3333333333334" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">selected IFC</text>
+<text x="370.33333333333337" y="328" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">conversion.py | io_utils.py</text>
+<line x1="555.3333333333334" y1="297" x2="573.6666666666667" y2="297" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="564.5" cy="297" r="3.0" fill="#9B2C3B"/>
+<rect x="585.6666666666667" y="232" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="581.6666666666667" y="227" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="581.6666666666667" y="227" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="593.6666666666667" y="250" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Load IFC models</text>
+<polygon points="574.6666666666667,290 583.6666666666667,297 574.6666666666667,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="769.6666666666667,290 778.6666666666667,297 769.6666666666667,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="593.6666666666667" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">selected IFC</text>
+<text x="759.6666666666667" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">parsed model</text>
+<text x="593.6666666666667" y="328" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">io_utils.py | ifcopenshell</text>
+<line x1="778.6666666666667" y1="297" x2="797.0" y2="297" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="787.8333333333334" cy="297" r="3.0" fill="#9B2C3B"/>
+<line x1="900.0" y1="183" x2="900.0" y2="226" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="894.0,220 906.0,220 900.0,228" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="809.0" y="232" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="805.0" y="227" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="805.0" y="227" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="817.0" y="250" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Resolve georeference</text>
+<polygon points="798.0,290 807.0,297 798.0,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="993.0,290 1002.0,297 993.0,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="817.0" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">parsed model</text>
+<text x="983.0" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">resolved model</text>
+<text x="817.0" y="328" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">georef_resolution.py | resolve_frame.py</text>
+<line x1="1002.0" y1="297" x2="1020.3333333333335" y2="297" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="1011.1666666666667" cy="297" r="3.0" fill="#9B2C3B"/>
+<rect x="1032.3333333333335" y="232" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="1028.3333333333335" y="227" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="1028.3333333333335" y="227" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="1040.3333333333335" y="250" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Build prototypes</text>
+<polygon points="1021.3333333333335,290 1030.3333333333335,297 1021.3333333333335,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1216.3333333333335,290 1225.3333333333335,297 1216.3333333333335,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="1040.3333333333335" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">resolved model</text>
+<text x="1206.3333333333335" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">prototype cache</text>
+<text x="1040.3333333333335" y="328" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">process_ifc.py | detail processors</text>
+<line x1="1225.3333333333335" y1="297" x2="1243.6666666666667" y2="297" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="1234.5" cy="297" r="3.0" fill="#9B2C3B"/>
+<line x1="1346.6666666666667" y1="183" x2="1346.6666666666667" y2="226" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="1340.6666666666667,220 1352.6666666666667,220 1346.6666666666667,228" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="1255.6666666666667" y="232" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="1251.6666666666667" y="227" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="1251.6666666666667" y="227" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="1263.6666666666667" y="250" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Author USD layers</text>
+<polygon points="1244.6666666666667,290 1253.6666666666667,297 1244.6666666666667,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1439.6666666666667,290 1448.6666666666667,297 1439.6666666666667,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="1263.6666666666667" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">prototype cache</text>
+<text x="1429.6666666666667" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">layer set</text>
+<text x="1263.6666666666667" y="328" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">process_usd.py</text>
+<line x1="1448.6666666666667" y1="297" x2="1467.0" y2="297" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="1457.8333333333335" cy="297" r="3.0" fill="#9B2C3B"/>
+<line x1="1570.0" y1="183" x2="1570.0" y2="226" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="1564.0,220 1576.0,220 1570.0,228" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="1479.0" y="232" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="1475.0" y="227" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="1475.0" y="227" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="1487.0" y="250" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Anchor and publish</text>
+<polygon points="1468.0,290 1477.0,297 1468.0,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1663.0,290 1672.0,297 1663.0,304" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="1487.0" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">layer set</text>
+<text x="1653.0" y="302" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">published assets</text>
+<text x="1487.0" y="328" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">process_usd.py | semantic_graph.py</text>
+<line x1="1672.0" y1="297" x2="1698" y2="297" stroke="#9B2C3B" stroke-width="2.0"/>
+<polygon points="1700,297 1708,289 1722,289 1722,305 1708,305" fill="#2563EB" stroke="#2563EB" stroke-width="1.0"/>
+<text x="1710" y="214" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="500" text-anchor="end">OUTPUT  USD stages + semantic graph + result</text>
+<rect x="55" y="420" width="1690" height="260" rx="10" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2"/>
+<rect x="55" y="420" width="8" height="260" fill="#15803D" stroke="none" stroke-width="1.0"/>
+<text x="77" y="448" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="500" text-anchor="start">F2  Federate USD stages</text>
+<line x1="145" y1="478" x2="1688" y2="478" stroke="#6B7280" stroke-width="1.2" stroke-dasharray="7 6"/>
+<polygon points="133,470 147,470 155,478 147,486 133,486" fill="#6B7280" stroke="#6B7280" stroke-width="1.0"/>
+<text x="165" y="469" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="400" text-anchor="start">manifest + frame + anchor policy + existing-target hints</text>
+<polygon points="74,584 88,584 96,592 88,600 74,600" fill="#15803D" stroke="#15803D" stroke-width="1.0"/>
+<line x1="96" y1="592" x2="127.0" y2="592" stroke="#9B2C3B" stroke-width="2.0"/>
+<text x="86" y="509" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="500" text-anchor="start">INPUT  converted USD stage set + federation request</text>
+<line x1="230.0" y1="478" x2="230.0" y2="521" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="224.0,515 236.0,515 230.0,523" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="139.0" y="527" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="135.0" y="522" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="135.0" y="522" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="147.0" y="545" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Plan federation</text>
+<polygon points="128.0,585 137.0,592 128.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="323.0,585 332.0,592 323.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="147.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">stages</text>
+<text x="313.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">routed stages</text>
+<text x="147.0" y="623" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">federation_orchestrator.py</text>
+<line x1="332.0" y1="592" x2="395.0" y2="592" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="363.5" cy="592" r="3.0" fill="#9B2C3B"/>
+<rect x="407.0" y="527" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="403.0" y="522" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="403.0" y="522" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="415.0" y="545" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Inspect anchors</text>
+<polygon points="396.0,585 405.0,592 396.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="591.0,585 600.0,592 591.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="415.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">routed stages</text>
+<text x="581.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">anchor evidence</text>
+<text x="415.0" y="623" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">federation_builder.py</text>
+<line x1="600.0" y1="592" x2="663.0" y2="592" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="631.5" cy="592" r="3.0" fill="#9B2C3B"/>
+<line x1="766.0" y1="478" x2="766.0" y2="521" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="760.0,515 772.0,515 766.0,523" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="675.0" y="527" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="671.0" y="522" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="671.0" y="522" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="683.0" y="545" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Align payloads</text>
+<polygon points="664.0,585 673.0,592 664.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="859.0,585 868.0,592 859.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="683.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">anchor evidence</text>
+<text x="849.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">aligned payloads</text>
+<text x="683.0" y="623" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">federation_builder.py | geodetic_federation.py</text>
+<line x1="868.0" y1="592" x2="931.0" y2="592" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="899.5" cy="592" r="3.0" fill="#9B2C3B"/>
+<rect x="943.0" y="527" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="939.0" y="522" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="939.0" y="522" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="951.0" y="545" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Compose site masters</text>
+<polygon points="932.0,585 941.0,592 932.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1127.0,585 1136.0,592 1127.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="951.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">aligned payloads</text>
+<text x="1117.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">site masters</text>
+<text x="951.0" y="623" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">federation_builder.py</text>
+<line x1="1136.0" y1="592" x2="1199.0" y2="592" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="1167.5" cy="592" r="3.0" fill="#9B2C3B"/>
+<line x1="1302.0" y1="478" x2="1302.0" y2="521" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="1296.0,515 1308.0,515 1302.0,523" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="1211.0" y="527" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="1207.0" y="522" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="1207.0" y="522" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="1219.0" y="545" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Compose project master</text>
+<polygon points="1200.0,585 1209.0,592 1200.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1395.0,585 1404.0,592 1395.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="1219.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">site masters</text>
+<text x="1385.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">project master</text>
+<text x="1219.0" y="623" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">federation_orchestrator.py</text>
+<line x1="1404.0" y1="592" x2="1467.0" y2="592" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="1435.5" cy="592" r="3.0" fill="#9B2C3B"/>
+<line x1="1570.0" y1="478" x2="1570.0" y2="521" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="1564.0,515 1576.0,515 1570.0,523" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="1479.0" y="527" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="1475.0" y="522" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="1475.0" y="522" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="1487.0" y="545" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Validate federation</text>
+<polygon points="1468.0,585 1477.0,592 1468.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1663.0,585 1672.0,592 1663.0,599" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="1487.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">project master</text>
+<text x="1653.0" y="597" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">validated project</text>
+<text x="1487.0" y="623" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">federation_builder.py</text>
+<line x1="1672.0" y1="592" x2="1698" y2="592" stroke="#9B2C3B" stroke-width="2.0"/>
+<polygon points="1700,592 1708,584 1722,584 1722,600 1708,600" fill="#15803D" stroke="#15803D" stroke-width="1.0"/>
+<text x="1710" y="509" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="500" text-anchor="end">OUTPUT  validated federated project stage</text>
+<rect x="55" y="715" width="1690" height="260" rx="10" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.2"/>
+<rect x="55" y="715" width="8" height="260" fill="#7E22CE" stroke="none" stroke-width="1.0"/>
+<text x="77" y="743" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="500" text-anchor="start">F3  Run targeted enrichment job</text>
+<line x1="145" y1="773" x2="1688" y2="773" stroke="#6B7280" stroke-width="1.2" stroke-dasharray="7 6"/>
+<polygon points="133,765 147,765 155,773 147,781 133,781" fill="#6B7280" stroke="#6B7280" stroke-width="1.0"/>
+<text x="165" y="764" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="400" text-anchor="start">semantic graph + detail options + cache policy</text>
+<polygon points="74,879 88,879 96,887 88,895 74,895" fill="#7E22CE" stroke="#7E22CE" stroke-width="1.0"/>
+<line x1="96" y1="887" x2="127.0" y2="887" stroke="#9B2C3B" stroke-width="2.0"/>
+<text x="86" y="804" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="500" text-anchor="start">INPUT  pending job + semantic graph</text>
+<rect x="139.0" y="822" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="135.0" y="817" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="135.0" y="817" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="147.0" y="840" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Claim job</text>
+<polygon points="128.0,880 137.0,887 128.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="323.0,880 332.0,887 323.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="147.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">pending job</text>
+<text x="313.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">claimed job</text>
+<text x="147.0" y="918" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">worker.py</text>
+<line x1="332.0" y1="887" x2="395.0" y2="887" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="363.5" cy="887" r="3.0" fill="#9B2C3B"/>
+<line x1="498.0" y1="773" x2="498.0" y2="816" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="492.0,810 504.0,810 498.0,818" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="407.0" y="822" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="403.0" y="817" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="403.0" y="817" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="415.0" y="840" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Resolve targets</text>
+<polygon points="396.0,880 405.0,887 396.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="591.0,880 600.0,887 591.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="415.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">claimed job</text>
+<text x="581.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">detail plan</text>
+<text x="415.0" y="918" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">semantic_enrichment.py | jobs.py</text>
+<line x1="600.0" y1="887" x2="663.0" y2="887" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="631.5" cy="887" r="3.0" fill="#9B2C3B"/>
+<line x1="766.0" y1="773" x2="766.0" y2="816" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="760.0,810 772.0,810 766.0,818" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="675.0" y="822" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="671.0" y="817" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="671.0" y="817" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="683.0" y="840" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Check detail cache</text>
+<polygon points="664.0,880 673.0,887 664.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="859.0,880 868.0,887 859.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="683.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">detail plan</text>
+<text x="849.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">cache decision</text>
+<text x="683.0" y="918" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">jobs.py</text>
+<line x1="868.0" y1="887" x2="931.0" y2="887" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="899.5" cy="887" r="3.0" fill="#9B2C3B"/>
+<line x1="1034.0" y1="773" x2="1034.0" y2="816" stroke="#6B7280" stroke-width="1.0" stroke-dasharray="7 6"/>
+<polygon points="1028.0,810 1040.0,810 1034.0,818" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.0"/>
+<rect x="943.0" y="822" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="939.0" y="817" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="939.0" y="817" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="951.0" y="840" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Convert targeted detail</text>
+<polygon points="932.0,880 941.0,887 932.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1127.0,880 1136.0,887 1127.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="951.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">cache miss</text>
+<text x="1117.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">detail artifacts</text>
+<text x="951.0" y="918" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">jobs.py -&gt; conversion pipeline</text>
+<line x1="1136.0" y1="887" x2="1199.0" y2="887" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="1167.5" cy="887" r="3.0" fill="#9B2C3B"/>
+<rect x="1211.0" y="822" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="1207.0" y="817" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="1207.0" y="817" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="1219.0" y="840" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Publish manifest</text>
+<polygon points="1200.0,880 1209.0,887 1200.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1395.0,880 1404.0,887 1395.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="1219.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">detail artifacts</text>
+<text x="1385.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">replacement manifest</text>
+<text x="1219.0" y="918" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">jobs.py</text>
+<line x1="1404.0" y1="887" x2="1467.0" y2="887" stroke="#9B2C3B" stroke-width="2.0"/>
+<circle cx="1435.5" cy="887" r="3.0" fill="#9B2C3B"/>
+<rect x="1479.0" y="822" width="190" height="115" rx="6" fill="#E2E8F0" stroke="#E2E8F0" stroke-width="0"/>
+<rect x="1475.0" y="817" width="190" height="115" rx="6" fill="#F8FAFC" stroke="#9CA3AF" stroke-width="1.4"/>
+<rect x="1475.0" y="817" width="190" height="35" fill="#E5E7EB" stroke="#9CA3AF" stroke-width="1.0"/>
+<text x="1487.0" y="840" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="500" text-anchor="start">Archive outcome</text>
+<polygon points="1468.0,880 1477.0,887 1468.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<polygon points="1663.0,880 1672.0,887 1663.0,894" fill="#FFFFFF" stroke="#9CA3AF" stroke-width="1.3"/>
+<text x="1487.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">manifest</text>
+<text x="1653.0" y="892" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="end">job result</text>
+<text x="1487.0" y="918" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="8.5" font-weight="400" text-anchor="start">worker.py</text>
+<line x1="1672.0" y1="887" x2="1698" y2="887" stroke="#9B2C3B" stroke-width="2.0"/>
+<polygon points="1700,887 1708,879 1722,879 1722,895 1708,895" fill="#7E22CE" stroke="#7E22CE" stroke-width="1.0"/>
+<text x="1710" y="804" fill="#1F2937" font-family="Arial, Helvetica, sans-serif" font-size="9.5" font-weight="500" text-anchor="end">OUTPUT  detail artifacts + job result + archive</text>
+<polyline points="766.0,932 766.0,952 1302.0,952 1302.0,932" fill="none" stroke="#6B7280" stroke-width="1.2" stroke-linejoin="round" stroke-dasharray="7 6"/>
+<text x="1034.0" y="944" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="9" font-weight="400" text-anchor="middle">cache hit - reuse detail artifacts</text>
+<text x="55" y="1028" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="11" font-weight="500" text-anchor="start">System boundary</text>
+<rect x="45" y="108" width="1710" height="900" rx="12" fill="none" stroke="#64748B" stroke-width="1.6"/>
+<text x="55" y="1065" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="10" font-weight="400" text-anchor="start">Port labels name the information state at each function boundary. Module paths show current implementation allocation.</text>
+<text x="1745" y="1085" fill="#64748B" font-family="Arial, Helvetica, sans-serif" font-size="9" font-weight="400" text-anchor="end">BuildUSD v0.2.0</text>
+</svg>

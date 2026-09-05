@@ -394,6 +394,18 @@ def _normalize_frame(value: Optional[str]) -> str:
     return "projected"
 
 
+def _normalize_missing_anchor_policy(value: Optional[str]) -> str:
+    if value is None:
+        return "skip"
+    text = str(value).strip().lower().replace("_", "-")
+    if text in ("skip", "strict"):
+        return "skip"
+    if text in ("same-origin", "sameorigin", "identity", "zero"):
+        return "same-origin"
+    LOG.debug("Unknown missing-anchor policy '%s'; defaulting to skip.", value)
+    return "skip"
+
+
 def _is_wgs84_crs(value: Optional[str]) -> bool:
     if not value:
         return False
@@ -518,18 +530,21 @@ def build_federated_stage(
     rebuild: bool = False,
     frame: str = "projected",
     anchor_mode: Optional[str] = None,
+    missing_anchor_policy: str = "skip",
 ) -> None:
     if not payload_paths:
         raise ValueError("No payload paths provided for federation.")
 
     frame_mode = _normalize_frame(frame)
+    missing_anchor_mode = _normalize_missing_anchor_policy(missing_anchor_policy)
     LOG.info(
-        "build_federated_stage start: out=%s, payloads=%d, frame=%s, rebuild=%s, anchor_mode=%s",
+        "build_federated_stage start: out=%s, payloads=%d, frame=%s, rebuild=%s, anchor_mode=%s, missing_anchor_policy=%s",
         out_stage_path,
         len(payload_paths),
         frame_mode,
         rebuild,
         anchor_mode or "none",
+        missing_anchor_mode,
     )
     stage: Optional[Usd.Stage] = None
     opened_existing = False
@@ -769,6 +784,7 @@ def build_federated_stage(
     skipped_geodetic_anchor_count = 0
     skipped_reproject_count = 0
     skipped_missing_crs_count = 0
+    same_origin_fallback_count = 0
 
     for payload_path in payload_paths:
         normalized_payload = _normalize_payload_path(payload_path)
@@ -788,17 +804,32 @@ def build_federated_stage(
             skipped_no_anchor_count += 1
             continue
         anchor = extract_payload_anchor(payload_stage)
+        same_origin_fallback = False
         if not anchor or anchor.anchor_e is None or anchor.anchor_n is None:
-            LOG.warning("Skipping %s: no anchor metadata found.", payload_path)
-            skipped_no_anchor_count += 1
-            continue
+            if missing_anchor_mode == "same-origin":
+                LOG.warning(
+                    "Federating %s at zero offset: no anchor metadata found and missing_anchor_policy=same-origin.",
+                    payload_path,
+                )
+                anchor_e = origin_e
+                anchor_n = origin_n
+                anchor_h = origin_h
+                anchor_crs = origin_epsg or federation_projected_crs
+                same_origin_fallback = True
+                same_origin_fallback_count += 1
+            else:
+                LOG.warning("Skipping %s: no anchor metadata found.", payload_path)
+                skipped_no_anchor_count += 1
+                continue
+        else:
+            anchor_e = float(anchor.anchor_e)
+            anchor_n = float(anchor.anchor_n)
+            anchor_h = float(anchor.anchor_h or 0.0)
+            anchor_crs = anchor.projected_crs
 
-        anchor_e = float(anchor.anchor_e)
-        anchor_n = float(anchor.anchor_n)
-        anchor_h = float(anchor.anchor_h or 0.0)
-        anchor_crs = anchor.projected_crs
-
-        if use_geodetic_frame:
+        if same_origin_fallback:
+            delta = (0.0, 0.0, 0.0)
+        elif use_geodetic_frame:
             anchor_wgs84 = _anchor_to_wgs84(
                 anchor, fallback_crs=origin_epsg or federation_projected_crs
             )
@@ -823,9 +854,9 @@ def build_federated_stage(
         else:
             if anchor_crs and anchor_crs != (origin_epsg or federation_projected_crs):
                 reproj = _reproject(
-                    anchor.anchor_e,
-                    anchor.anchor_n,
-                    anchor.anchor_h or 0.0,
+                    anchor_e,
+                    anchor_n,
+                    anchor_h,
                     anchor_crs,
                     origin_epsg or federation_projected_crs,
                 )
@@ -872,6 +903,10 @@ def build_federated_stage(
             payload_xf.GetPrim().SetCustomDataByKey(
                 "ifc:federation:projectedCRS", federation_projected_crs
             )
+            if same_origin_fallback:
+                payload_xf.GetPrim().SetCustomDataByKey(
+                    "ifc:federation:anchorSource", "same-origin-fallback"
+                )
         except Exception:
             pass
         payload_prim = payload_xf.GetPrim()
@@ -886,7 +921,8 @@ def build_federated_stage(
     LOG.info(
         "Federation update %s: added=%d, skipped_existing=%d, "
         "skipped_duplicate_input=%d, skipped_no_anchor=%d, "
-        "skipped_geodetic_anchor=%d, skipped_reproject=%d, skipped_missing_crs=%d",
+        "skipped_geodetic_anchor=%d, skipped_reproject=%d, skipped_missing_crs=%d, "
+        "same_origin_fallback=%d",
         out_stage_path,
         added_count,
         skipped_existing_count,
@@ -895,6 +931,7 @@ def build_federated_stage(
         skipped_geodetic_anchor_count,
         skipped_reproject_count,
         skipped_missing_crs_count,
+        same_origin_fallback_count,
     )
 
 

@@ -46,7 +46,7 @@ def _load_validator() -> _Validator:
 
     pytest.skip(
         "NVIDIA USD validation dependencies are unavailable. "
-        "Install with `python -m pip install -e \".[usd-validation]\"`. "
+        'Install with `python -m pip install -e ".[usd-validation]"`. '
         + "; ".join(import_errors)
     )
 

@@ -58,7 +58,9 @@ class TargetedEnrichmentPlan:
 
         from .process_ifc import ConversionOptions
 
-        options = replace(base_options) if base_options is not None else ConversionOptions()
+        options = (
+            replace(base_options) if base_options is not None else ConversionOptions()
+        )
         return replace(
             options,
             detail_mode=True,

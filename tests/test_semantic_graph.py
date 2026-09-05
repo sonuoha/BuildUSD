@@ -33,9 +33,7 @@ def test_composite_window_without_part_geometry_requests_targeted_enrichment():
     graph = build_semantic_graph(_cache(record), base_name="Model")
 
     element = next(node for node in graph["nodes"] if node["id"] == "element:guid:2abc")
-    assert (
-        element["properties"]["decomposition_quality"] == DECOMPOSITION_LOGICAL_ONLY
-    )
+    assert element["properties"]["decomposition_quality"] == DECOMPOSITION_LOGICAL_ONLY
     assert graph["enrichment_requests"] == [
         {
             "kind": "targeted_decomposition",
@@ -50,9 +48,7 @@ def test_composite_window_without_part_geometry_requests_targeted_enrichment():
     ]
 
     part_labels = {
-        node["label"]
-        for node in graph["nodes"]
-        if node["type"] == "LogicalPart"
+        node["label"] for node in graph["nodes"] if node["type"] == "LogicalPart"
     }
     assert part_labels == {"Frame", "Glazing", "Hardware"}
 

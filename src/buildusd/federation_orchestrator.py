@@ -94,6 +94,18 @@ def _normalize_frame(value: Optional[str]) -> str:
     return "projected"
 
 
+def _normalize_missing_anchor_policy(value: Optional[str]) -> str:
+    if value is None:
+        return "skip"
+    normalized = value.strip().lower().replace("_", "-")
+    if normalized in ("skip", "strict"):
+        return "skip"
+    if normalized in ("same-origin", "sameorigin", "identity", "zero"):
+        return "same-origin"
+    LOG.debug("Unknown missing_anchor_policy '%s'; defaulting to skip", value)
+    return "skip"
+
+
 def _geodetic_tuple(value: Optional[object]) -> Optional[tuple[float, float, float]]:
     if value is None:
         return None
@@ -555,6 +567,7 @@ def _apply_federation(
     parent_prim: str,
     rebuild: bool,
     frame: Optional[str],
+    missing_anchor_policy: Optional[str],
 ) -> list[str]:
     grouped: dict[str, list[FederationTask]] = {}
     for task in tasks:
@@ -619,6 +632,9 @@ def _apply_federation(
                 rebuild=rebuild,
                 frame=_normalize_frame(frame),
                 anchor_mode=group[0].anchor_mode,
+                missing_anchor_policy=_normalize_missing_anchor_policy(
+                    missing_anchor_policy
+                ),
             )
         built_master_paths.append(str(master_stage_path))
     return built_master_paths
@@ -654,6 +670,7 @@ def _apply_overall_master(
     rebuild: bool,
     frame: Optional[str],
     anchor_mode: Optional[str],
+    missing_anchor_policy: Optional[str],
 ) -> None:
     overall_name = _resolve_overall_master_name(manifest)
     if not overall_name:
@@ -717,6 +734,9 @@ def _apply_overall_master(
             rebuild=rebuild,
             frame=_normalize_frame(frame),
             anchor_mode=anchor_mode,
+            missing_anchor_policy=_normalize_missing_anchor_policy(
+                missing_anchor_policy
+            ),
         )
 
 
@@ -733,6 +753,7 @@ def federate_into_stage(
     frame: Optional[str] = None,
     offline: bool = False,
     rebuild: bool = False,
+    missing_anchor_policy: Optional[str] = None,
 ) -> Optional[str]:
     """Append the provided payload stages into one target federated stage."""
 
@@ -774,13 +795,15 @@ def federate_into_stage(
         )
 
     frame_mode = _normalize_frame(frame)
+    missing_anchor_mode = _normalize_missing_anchor_policy(missing_anchor_policy)
     LOG.info(
-        "Federate-into start: target=%s, payloads=%d, frame=%s, rebuild=%s, anchor_mode=%s",
+        "Federate-into start: target=%s, payloads=%d, frame=%s, rebuild=%s, anchor_mode=%s, missing_anchor_policy=%s",
         out_stage,
         len(normalized_payloads),
         frame_mode,
         rebuild,
         resolved_anchor_mode or "none",
+        missing_anchor_mode,
     )
 
     initialize_usd(offline=offline)
@@ -841,6 +864,7 @@ def federate_into_stage(
                 rebuild=rebuild,
                 frame=frame_mode,
                 anchor_mode=resolved_anchor_mode,
+                missing_anchor_policy=missing_anchor_mode,
             )
     finally:
         shutdown_usd_context()
@@ -864,6 +888,7 @@ def federate_stages(
     frame: Optional[str] = None,
     offline: bool = False,
     rebuild: bool = False,
+    missing_anchor_policy: Optional[str] = None,
 ) -> Sequence[FederationTask]:
     """Federate the supplied stage files according to the provided manifest."""
 
@@ -908,6 +933,7 @@ def federate_stages(
             parent_prim=parent_prim,
             rebuild=rebuild,
             frame=frame,
+            missing_anchor_policy=missing_anchor_policy,
         )
         _apply_overall_master(
             master_stage_paths,
@@ -920,6 +946,7 @@ def federate_stages(
             rebuild=rebuild,
             frame=frame,
             anchor_mode=resolved_anchor_mode,
+            missing_anchor_policy=missing_anchor_policy,
         )
     finally:
         shutdown_usd_context()
